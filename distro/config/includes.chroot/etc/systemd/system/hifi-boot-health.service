@@ -1,0 +1,33 @@
+[Unit]
+Description=Osmium Sound — mark this boot as good (rauc status mark-good)
+ConditionPathExists=/etc/rauc/system.conf
+# 🚨 DefaultDependencies=no, and so the ordering below is stated by hand.
+# This unit spends its whole life waiting for Flask to answer on localhost
+# (14.7 s measured), and pulled in by WantedBy=multi-user.target it inherited
+# an implicit Before=multi-user.target — so the entire boot counted as
+# unfinished for that wait, graphical.target included. It still runs at the
+# same point and still marks the slot good; it just stops holding the target.
+# Same recipe as OS migration 0032 uses for smbd, tailscaled and ssh.
+DefaultDependencies=no
+After=basic.target network.target hifi-api.service hifi-rauc-config.service
+Wants=hifi-rauc-config.service
+# DefaultDependencies=no drops these two as well, and mark-good must not be
+# caught half-way through a shutdown.
+Conflicts=shutdown.target
+Before=shutdown.target
+# A live session has nothing to configure and nothing to watch over: the
+# single-filesystem ISO boots the very same image the appliances run, so
+# without this line these units would start there too.
+ConditionKernelCommandLine=!boot=live
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/hifi-boot-health.sh
+# 🚨 No time limit: the script keeps trying until the boot is good (it used
+# to give up after 300 s, and with it the slot). Whether a late boot is
+# abandoned is hifi-boot-watchdog's decision. Nothing is ordered after this
+# unit, so a long wait holds nothing up.
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target

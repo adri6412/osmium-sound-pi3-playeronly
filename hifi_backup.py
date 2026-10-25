@@ -1,0 +1,1458 @@
+#!/usr/bin/env python3
+"""
+HiFi Player — backup/restore core (shared library).
+
+Imported by BOTH the HTTP layer (`sources_server.py`, which exposes the routes)
+and the async worker (`/usr/local/sbin/hifi-backup-run.py`, which builds a
+generation on-device). Keeping the manifest in one place is the whole point:
+the set of paths that may be written by a restore MUST be exactly the set that
+a backup can produce, and two copies of that table would drift.
+
+WHAT THIS BACKS UP — and what it deliberately does not
+------------------------------------------------------
+This is a *profile* backup: user configuration and user-created state. It is
+NOT a rootfs image, and that is a design decision, not a limitation. The OS on
+this appliance is already reproducible from the install ISO plus the cumulative,
+idempotent OS-update migrations, so restoring OS files would only ever fight the
+updater: `OS_VERSION`/`SYSTEM_VERSION` are the updater's own bookkeeping, and
+rolling them back would make a device claim to be running a release it isn't.
+(A rootfs restore is also what forces DietPi's dietpi-backup to reconcile fstab
+UUIDs and re-run update-grub on restore — a class of risk this appliance has no
+reason to take on, and one its OTA rules forbid outright.)
+
+Everything is organised into CATEGORIES, and each category is flagged secret or
+not. Secret categories (Wi-Fi PSKs, SMB passwords, the web-admin account, the
+Bluetooth link keys) are only ever written into an archive when the user has
+supplied a passphrase — a plaintext `.tar.gz` sitting in a Downloads folder must
+not be a copy of the household's credentials. Two exceptions are handled file
+by file inside a non-secret category instead: the SMB logins in the source
+list (`_transform_sources`) and the streaming-service logins Lyrion plugins
+keep in their prefs (`_transform_lyrion_prefs`).
+
+INTEGRITY MODEL
+---------------
+A generation on disk is a directory containing the archive plus a
+`manifest.json` that is written LAST. A generation without a manifest is
+incomplete by definition — it is never listed, never restorable, and is pruned
+on the next run. This is what makes an interrupted or power-cut backup
+self-evident instead of silently passing as a good one.
+
+The manifest carries a sha256 for every member, verified before that member is
+written back during a restore, and (when encrypted) an HMAC over the ciphertext
+that is checked BEFORE decryption is attempted.
+
+TESTABILITY
+-----------
+Every path constant here is absolute and anchored at "/", but every function
+that touches the filesystem takes a `root` prefix. Tests point `root` at a temp
+directory and exercise the real code paths without needing a live appliance —
+archive member names are always root-relative, so an archive built under a fake
+root restores identically under the real one.
+"""
+import gzip
+import hashlib
+import hmac
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import tarfile
+import tempfile
+from datetime import datetime, timezone
+
+try:                        # only used to validate Lyrion's YAML prefs
+    import yaml             # python3-yaml ships on the appliance
+except Exception:           # pragma: no cover - dev machines may lack it
+    yaml = None
+
+if yaml is not None:
+    class _LyrionLoader(yaml.SafeLoader):
+        """SafeLoader that also takes the Perl tags Lyrion writes.
+
+        🚨 Lyrion is Perl and its YAML carries Perl types: Qobuz keeps its
+        booleans as `!!perl/scalar:JSON::XS::Boolean`. Plain safe_load refuses
+        any unknown tag, so qobuz.prefs (account, login and every setting) was
+        dropped as "unparsable" from every backup, encrypted ones included.
+        A tagged node is read as the plain value under it: nothing is built
+        from the tag, and the file goes into the archive byte for byte."""
+
+    def _untagged(loader, _suffix, node):
+        if isinstance(node, yaml.MappingNode):
+            return loader.construct_mapping(node, deep=True)
+        if isinstance(node, yaml.SequenceNode):
+            return loader.construct_sequence(node, deep=True)
+        return loader.construct_scalar(node)
+
+    _LyrionLoader.add_multi_constructor("tag:yaml.org,2002:perl/", _untagged)
+    _LyrionLoader.add_multi_constructor("!", _untagged)
+
+
+def _load_lyrion_yaml(text):
+    return yaml.load(text, Loader=_LyrionLoader)
+
+
+# ── layout ───────────────────────────────────────────────────────────
+SCHEMA = 1
+STORE_DIR = "/var/lib/hifi-player/backups"
+STATUS_FILE = "/run/hifi-backup-status.json"
+SETTINGS_FILE = "/etc/hifi-player/backup.json"
+ARCHIVE_NAME = "backup.tar.gz"
+ENC_NAME = "backup.tar.gz.enc"
+MANIFEST_NAME = "manifest.json"
+HISTORY_NAME = "history"
+# The manifest is also carried INSIDE the flat archive, as its last member.
+# That is what lets a downloaded file be restored on a different device (or
+# after a reinstall) without the generation directory it came from — and the
+# dotted name keeps it out of every category's allow-list, so a restore can
+# never mistake it for a file to write somewhere.
+MANIFEST_MEMBER = ".hifi-manifest.json"
+DEFAULT_KEEP = 5
+# Headroom demanded on top of the estimated archive size before anything is
+# written. Same spirit as the free-space guard in hifi-ota-update.sh: a full
+# disk mid-tar silently truncates, and a truncated backup that looks fine is
+# worse than no backup at all.
+FREE_SPACE_MARGIN = 64 * 1024 * 1024
+# The "trigger" a restore's own safety snapshot is filed under. Those are kept
+# apart from the owner's backups: at most PRE_RESTORE_KEEP of them, and they do
+# not count against the owner's "keep" — a restore used to push the oldest real
+# backup out to make room for its snapshot (and when that oldest one was the
+# very backup being restored, delete it before it was read).
+PRE_RESTORE_TRIGGER = "pre-restore"
+PRE_RESTORE_KEEP = 1
+# The generation a restore is reading, written for as long as the restore runs.
+# rotate() never removes it, whoever calls it (the restore's own snapshot, the
+# weekly timer firing mid-restore). On tmpfs, so a stale pin left by a crash
+# lasts until the next boot at most.
+RESTORE_PIN_FILE = "/run/hifi-restore-pin"
+
+# ── size limits, the same on both sides ──────────────────────────────
+# A backup never writes a member a restore would refuse, and a restore refuses
+# anything above these — what used to happen instead was a backup that held
+# the album/artist archive and a restore that skipped it as "too large".
+# Generous for config, a FIR filter or the web-admin database.
+MAX_MEMBER_SIZE = 32 * 1024 * 1024
+# The album/artist archive (METADATA_DB, below) is the one big thing in a
+# profile: hundreds of MB on a large library.
+MAX_METADATA_DB_SIZE = 1024 * 1024 * 1024
+# Everything else together: thousands of small Lyrion prefs, the installed
+# plugins, filters, the Wi-Fi profiles.
+_OTHER_MEMBERS_ALLOWANCE = 256 * 1024 * 1024
+# Ceiling on the bytes a restore will ever decompress from one archive (each
+# gzip layer is measured BEFORE tarfile walks it — see payload_size), and on
+# the size of an upload. Without it a small, maliciously well-compressed upload
+# could keep the CPU busy for hours or fill the disk while being unpacked.
+# Free disk space is the other, tighter, limit — checked at each step.
+MAX_RESTORE_PAYLOAD = MAX_METADATA_DB_SIZE + _OTHER_MEMBERS_ALLOWANCE
+# Archives are built and unpacked here, on disk: /run and /tmp are tmpfs, i.e.
+# RAM, which a big archive used to fill. Dotted names are never a valid
+# generation id, so these are never listed, restored or rotated; a leftover of
+# a crash is removed by prune_incomplete once it is clearly stale.
+WORKDIR_PREFIX = ".work-"
+WORKDIR_STALE_SECS = 6 * 3600
+
+
+# ── never, under any circumstances ───────────────────────────────────
+# Checked on the way IN (nothing here is ever archived) and on the way OUT
+# (nothing here is ever written by a restore, even if a crafted archive
+# contains it). Two independent chances to catch a mistake.
+DENY_FILES = frozenset((
+    # OTA bookkeeping — restoring these desyncs the updater's view of reality.
+    "/etc/hifi-player/OS_VERSION",
+    "/etc/hifi-player/SYSTEM_VERSION",
+    "/etc/hifi-player/UI_VERSION",
+    # Trust root for the signed OS channel. An archive must never be able to
+    # swap the key that decides which OS payloads are allowed to run as root.
+    "/etc/hifi-player/ota-pubkey.pem",
+    # Per-device identity: cookie signing key. Cloning it across devices would
+    # let one box's session cookies work on another. A restored webui.db is
+    # enough to get the account back.
+    "/etc/hifi-player/webui-secret.key",
+    # The key the network-share logins are sealed with (see seal_login). An
+    # archive carries those logins decrypted, inside its own encryption, so
+    # the key has no business travelling — and a restore must never swap it.
+    "/etc/hifi-player/credential.secret",
+    # The sealed backup passphrase (see save_passphrase): it only opens with
+    # the key above, and a backup carrying the key to itself protects nothing.
+    "/etc/hifi-player/backup-passphrase",
+    # Support/provisioning state that is re-derived, not user config.
+    "/etc/hifi-player/github-support-pat",
+    "/etc/hifi-player/shell-account",
+    "/etc/hifi-player/provisioning-pending",
+    "/etc/hifi-player/provisioning-state.json",
+    "/etc/machine-id",
+    "/var/lib/dbus/machine-id",
+    # The OS migration ledger is history, not configuration.
+    "/var/lib/hifi-player/os-migrations",
+    # The album/artist archive IS backed up (see "core"), but only as the
+    # snapshot SQLite itself takes: its write-ahead log belongs to the
+    # database file it was written beside, and restoring a stale one over a
+    # fresh snapshot is how a database gets corrupted.
+    "/var/lib/hifi-player/metadata/metadata.db-wal",
+    "/var/lib/hifi-player/metadata/metadata.db-shm",
+    # Same for Lyrion's ratings and play counts (persist.db, taken as a
+    # snapshot): a write-ahead log copied beside it was a torn pair.
+    "/var/lib/squeezeboxserver/prefs/persist.db-wal",
+    "/var/lib/squeezeboxserver/prefs/persist.db-shm",
+    "/var/lib/lyrionmusicserver/prefs/persist.db-wal",
+    "/var/lib/lyrionmusicserver/prefs/persist.db-shm",
+))
+DENY_PREFIXES = (
+    "/var/lib/hifi-player/backups/",   # no backups inside backups
+    "/etc/ssh/",                       # host keys are machine identity
+)
+
+
+# The archive's canonical home. The owner may keep it on a disk of their
+# own instead (hifi_metadata.py's meta-cache-dir, which holds the mount point
+# and puts the database in `osmium-metadata` inside it) — a backup reads it
+# from there and still files it under this name, so a restore always knows
+# where to put it back.
+METADATA_DB = "/var/lib/hifi-player/metadata/metadata.db"
+META_CACHE_DIR_SETTING = "/etc/hifi-player/meta-cache-dir"
+META_CACHE_FOLDER = "osmium-metadata"
+
+
+def _metadata_db_real(root="/"):
+    """The file to read for METADATA_DB: the disk the owner picked when it is
+    there and holds the archive, the canonical path otherwise."""
+    try:
+        with open(_abs(root, META_CACHE_DIR_SETTING)) as f:
+            where = f.read().strip()
+    except OSError:
+        where = ""
+    if where.startswith("/"):
+        moved = _abs(root, os.path.join(where.rstrip("/"), META_CACHE_FOLDER, "metadata.db"))
+        if os.path.isfile(moved):
+            return moved
+    return _abs(root, METADATA_DB)
+
+
+def is_denied(logical):
+    """True if this "/"-anchored path may never be archived or restored."""
+    if logical in DENY_FILES:
+        return True
+    return any(logical.startswith(p) for p in DENY_PREFIXES)
+
+
+def member_size_limit(logical):
+    """Largest size this "/"-anchored path may have in an archive — the same
+    number decides what a backup leaves out and what a restore refuses."""
+    # Lyrion's persist.db grows with the library (a row per track ever seen),
+    # past the small-file limit on a big one.
+    if logical == METADATA_DB or logical in _LYRION_PERSIST_DBS:
+        return MAX_METADATA_DB_SIZE
+    return MAX_MEMBER_SIZE
+
+
+# ── the manifest ─────────────────────────────────────────────────────
+# Kept in sync with hifi-factory-reset.sh, which enumerates the same "this is
+# user state" surface from the opposite direction (it deletes what this saves).
+# When one changes, check the other.
+#
+# entry kinds:
+#   ("file", "/abs/path")                    a single regular file
+#   ("dir",  "/abs/dir", (excluded names,))  a directory, non-recursive on the
+#                                            excluded top-level names
+CATEGORIES = {
+    "core": {
+        "secret": False,
+        "entries": [
+            ("file", "/etc/hifi-player/pointer-enabled"),
+            # Which key of a remote control does what, when the owner has
+            # changed one from the standard (native-ui-qt/src/remote.cpp).
+            ("file", "/etc/hifi-player/remote-keys.json"),
+            ("file", "/etc/hifi-player/dsp.json"),
+            ("file", "/etc/hifi-player/dsp-presets.json"),
+            ("file", "/etc/hifi-player/ota-channel"),
+            ("file", "/etc/hifi-player/display-mode"),
+            ("file", "/etc/hifi-player/ui-resolution"),
+            ("file", "/etc/hifi-player/ui-screens"),
+            # Settings -> Display -> Rotation. A restore also turns the boot
+            # splash again (sources_server._restore_apply_side_effects).
+            ("file", "/etc/hifi-player/ui-rotation"),
+            ("file", "/etc/hifi-player/lyrion-channel"),
+            ("file", "/etc/hifi-player/lms-skin"),
+            # The standard Debian file, not a custom /etc/hifi-player/ one —
+            # same reasoning as /etc/timezone below. Every appliance ships
+            # with the same hardcoded "hifiplayer" (0100-system-setup.hook.
+            # chroot), so two units on a LAN collide on hifiplayer.local until
+            # the owner picks a name in the setup wizard (api_server.py's
+            # set_device_name). That chosen name is exactly the kind of user
+            # state this profile exists to protect, unlike /etc/machine-id or
+            # the SSH host keys (DENY_FILES/DENY_PREFIXES above), which are
+            # per-installation identity and must never travel between boxes.
+            # A restore only writes this file back -- it does NOT itself
+            # re-run `hostnamectl set-hostname`, so sources_server.py's
+            # _restore_apply_side_effects re-applies it from the restored
+            # value, the same pattern used for /etc/timezone below.
+            ("file", "/etc/hostname"),
+            # The standard Debian file (not a custom /etc/hifi-player/ one).
+            # It holds only the IANA name: /etc/localtime, the symlink every
+            # clock on the box actually resolves against, is a separate
+            # artifact (api_server.py's set_timezone writes both, precisely
+            # because systemd's timedated does not maintain this one on
+            # trixie). A restore only writes this file back -- it does NOT
+            # re-derive /etc/localtime, so sources_server.py's
+            # _restore_apply_side_effects re-applies the restored name through
+            # api_server's /timezone to bring the symlink along with it. Keep
+            # that in mind if this entry ever moves/renames.
+            ("file", "/etc/timezone"),
+            # The settings the file below is rendered from (hifi_squeezelite.py).
+            # A backup made before the JSON existed has only the file: the
+            # restore then drops the live JSON so the file gets imported again
+            # (sources_server._restore_apply_side_effects).
+            ("file", "/etc/hifi-player/squeezelite.json"),
+            # Settings → Audio zones (hifi_squeezelite.py); the PCM to DSD
+            # map and Lyrion's rules are rendered from these at the next boot.
+            ("file", "/etc/hifi-player/zones.json"),
+            # Settings → CD ripping (hifi_cdrip.py)
+            ("file", "/etc/hifi-player/cdrip.json"),
+            ("file", "/etc/default/squeezelite"),
+            ("file", "/etc/camilladsp/config.yml"),
+            ("file", "/var/lib/hifi-player/dsp-target"),
+            ("file", "/var/lib/hifi-player/roomcorr-result.json"),
+            ("dir", "/etc/camilladsp/filters", ()),
+            # What the owner corrected by hand in the Library editor: edition
+            # and artist choices, credit corrections (hifi_metadata.py) and the
+            # journal that lets a tag change be undone (hifi_tags.py). Unlike
+            # the web information cache next to it (denied above), none of it
+            # can be downloaded again.
+            ("dir", "/var/lib/hifi-player/metadata-edits", ()),
+            # The album and artist information downloaded from MusicBrainz and
+            # Wikipedia. It used to be left out as "re-downloadable", and on
+            # paper it still is — but nothing expires it any more, it is the
+            # work of days of slow, rate-limited, often-503 look-ups over a
+            # whole library, and a restore that hands it back is the whole
+            # point of having it. Read from wherever the owner keeps it
+            # (_metadata_db_real), archived under this one name, and taken as
+            # a proper SQLite snapshot while the service goes on using it.
+            ("file", METADATA_DB),
+        ],
+    },
+    "sources": {
+        # NOT flagged secret: the source list is the single most valuable thing
+        # to get back, and losing it from every unencrypted backup would be a
+        # regression against the current behaviour. The credentials inside are
+        # handled by redaction instead — see _transform_sources.
+        "secret": False,
+        "entries": [("file", "/etc/hifi-sources.json")],
+    },
+    "lyrion": {
+        "secret": False,
+        "entries": [
+            # Both package layouts: squeezeboxserver is the Debian package
+            # name, lyrionmusicserver the newer .debs. Whichever exists wins;
+            # having both listed costs nothing.
+            # prefs/ holds the favourites (favorites.opml), the ratings and
+            # play counts (persist.db) and every plugin's settings and login.
+            # .osmium-good is hifi-lyrion-prefs-guard.py's spare copy of the
+            # same files, rebuilt at every start of Lyrion.
+            ("dir", "/var/lib/squeezeboxserver/prefs", (".osmium-good",)),
+            ("dir", "/var/lib/squeezeboxserver/playlists", ()),
+            ("dir", "/var/lib/lyrionmusicserver/prefs", (".osmium-good",)),
+            ("dir", "/var/lib/lyrionmusicserver/playlists", ()),
+            # cache/ as a whole is deliberately absent: it is the scanned
+            # library database, it is large, and Lyrion rebuilds it from the
+            # music itself. Backing it up would dominate the archive size
+            # while restoring nothing the user would miss. InstalledPlugins/
+            # is the one exception carved out of it below: it is small (just
+            # which plugins are installed/enabled, not any scanned data) and
+            # losing it means every plugin — including a non-default default
+            # skin like Material — has to be reinstalled by hand after a
+            # restore, which is a much worse first impression than the extra
+            # few KB cost.
+            ("dir", "/var/lib/squeezeboxserver/cache/InstalledPlugins/Plugins", ()),
+            ("dir", "/var/lib/lyrionmusicserver/cache/InstalledPlugins/Plugins", ()),
+        ],
+    },
+    "network": {
+        "secret": True,
+        "entries": [("dir", "/etc/NetworkManager/system-connections", ())],
+    },
+    "accounts": {
+        "secret": True,
+        "entries": [
+            ("file", "/etc/hifi-player/webui.db"),
+            ("file", "/etc/hifi-player/samba-cred.json"),
+            ("file", "/etc/hifi-pairing-tokens.json"),
+        ],
+    },
+    "bluetooth": {
+        "secret": True,
+        "entries": [
+            ("file", "/etc/hifi-player/bluetooth.json"),
+            ("dir", "/var/lib/bluetooth", ()),
+        ],
+    },
+}
+
+# What an archive without encryption may carry. New backups are always
+# encrypted (save_passphrase); this is still the content of a backup made
+# before that, and of the safety snapshot a restore takes on a device whose
+# owner has not chosen a passphrase yet (first-boot setup).
+UNATTENDED_CATEGORIES = tuple(k for k, v in CATEGORIES.items() if not v["secret"])
+ALL_CATEGORIES = tuple(CATEGORIES.keys())
+SECRET_CATEGORIES = tuple(k for k, v in CATEGORIES.items() if v["secret"])
+
+
+def selected_categories(requested, encrypted):
+    """Normalise a requested category list.
+
+    Unknown names are dropped. Secret categories are dropped unless the archive
+    is going to be encrypted — this is the single chokepoint that decides
+    whether credentials may be written out, so it is enforced here rather than
+    at each call site.
+    """
+    if not requested:
+        requested = ALL_CATEGORIES
+    out = [c for c in ALL_CATEGORIES if c in set(requested)]
+    if not encrypted:
+        out = [c for c in out if not CATEGORIES[c]["secret"]]
+    return out
+
+
+# ── per-entry transforms ─────────────────────────────────────────────
+# A transform returns the bytes to archive for a given source file, or None to
+# skip it. This is where formats that cannot simply be copied get handled.
+
+class _FileMember:
+    """A member whose bytes stay on disk until tar takes them.
+
+    Everything else here is small enough to hold in memory, but the album and
+    artist archive can run to hundreds of megabytes on a big library, and this
+    box has neither the RAM to spare for a copy of it nor a `/tmp` (tmpfs, so
+    RAM again) to stage it in. The snapshot is written next to the archive
+    being built and read back in chunks."""
+
+    CHUNK = 1024 * 1024
+
+    def __init__(self, path):
+        self.path = path
+
+    def discard(self):
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+    def add_to(self, tar, arc, mtime=None):
+        """Write it as `arc` and return its sha256; the file goes either way."""
+        try:
+            digest = hashlib.sha256()
+            with open(self.path, "rb") as f:
+                for block in iter(lambda: f.read(self.CHUNK), b""):
+                    digest.update(block)
+            info = tarfile.TarInfo(arc)
+            info.size = os.path.getsize(self.path)
+            info.mode = 0o600
+            if mtime is not None:
+                info.mtime = mtime
+            with open(self.path, "rb") as f:
+                tar.addfile(info, f)
+            return digest.hexdigest()
+        finally:
+            try:
+                os.unlink(self.path)
+            except OSError:
+                pass
+
+
+def _transform_sqlite(src, ctx):
+    """Consistent snapshot of a live SQLite file without stopping its daemon.
+
+    webui.db is open and possibly mid-transaction in hifi-webui, and so is the
+    album/artist archive in the metadata service; a byte copy can catch a torn
+    WAL state. sqlite3's own backup API takes a proper snapshot, which is why
+    nothing here has to be stopped for the backup to be safe. The snapshot
+    lands beside the archive being built (`ctx["tmpdir"]`), never in tmpfs.
+    """
+    with sqlite3.connect(f"file:{src}?mode=ro", uri=True) as srccon:
+        fd, tmp = tempfile.mkstemp(suffix=".db.part", dir=ctx.get("tmpdir") or None)
+        os.close(fd)
+        try:
+            with sqlite3.connect(tmp) as dstcon:
+                srccon.backup(dstcon)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return _FileMember(tmp)
+
+
+# ── network-share logins at rest ─────────────────────────────────────
+# 🚨 The username and password of an SMB source used to sit in the clear in
+# /etc/hifi-sources.json, and an owner found them in a support bundle. They
+# are now one systemd-creds blob per source (AES-256-GCM, name-bound), under
+# the "login" key, and the clear text exists only in memory and in the 0600
+# credentials file mount.cifs reads from /run for the length of one mount.
+#
+# The key is NOT systemd's usual /var/lib/systemd/credential.secret: the A/B
+# conversion seeds /data/var with a fixed list of folders and that one is not
+# among them, so every login would turn unreadable the moment a device
+# converted. /etc/hifi-player is copied whole (hifi-ab-seed.sh), so the key
+# lives there. systemd-creds creates it on first use, root-only.
+#
+# With a TPM2 chip the blob is also sealed to it ("auto"), so the disk read on
+# another computer is not enough. No PCRs (--tpm2-pcrs=): bound to the boot
+# state, turning Secure Boot on or off would lose every password. A BIOS
+# update that clears the firmware TPM still does — the owner then adds the
+# share again, which replaces the entry (same id) — see api_add_smb.
+LOGIN_KEY_FILE = "/etc/hifi-player/credential.secret"
+_LOGIN_CRED_NAME = "hifi-smb-login"
+
+
+class LoginUnreadable(Exception):
+    """A sealed login that cannot be opened (key gone, TPM cleared, tampered)."""
+
+
+def _creds(args, data, name=_LOGIN_CRED_NAME):
+    env = dict(os.environ, SYSTEMD_CREDENTIAL_SECRET=LOGIN_KEY_FILE)
+    try:
+        r = subprocess.run(["systemd-creds"] + args + ["--name=" + name, "-", "-"],
+                           input=data, capture_output=True, env=env, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, str(e)
+    if r.returncode != 0:
+        return None, (r.stderr or b"").decode("utf-8", "replace").strip()[:300]
+    return r.stdout, ""
+
+
+def seal_login(username, password):
+    """Username + password -> printable blob. Raises LoginUnreadable if it
+    cannot be sealed: the caller must refuse, never store the clear text."""
+    payload = json.dumps({"u": username or "", "p": password or ""}).encode("utf-8")
+    out, err = _creds(["encrypt", "--with-key=auto", "--tpm2-pcrs="], payload)
+    if not out:
+        raise LoginUnreadable(err or "systemd-creds encrypt failed")
+    return "".join(out.decode("ascii").split())
+
+
+def open_login(blob):
+    """Blob -> (username, password). Raises LoginUnreadable."""
+    out, err = _creds(["decrypt"], (blob or "").encode("ascii"))
+    if out is None:
+        raise LoginUnreadable(err or "systemd-creds decrypt failed")
+    try:
+        d = json.loads(out.decode("utf-8"))
+        return d.get("u") or "", d.get("p") or ""
+    except Exception as e:
+        raise LoginUnreadable(str(e))
+
+
+def seal_plain_logins(state):
+    """Move any clear-text username/password of a source into a sealed
+    "login". Returns True when something changed. A source that cannot be
+    sealed is left as it is: losing the owner's password is not the fix."""
+    changed = False
+    for entry in (state or {}).get("sources", []):
+        if not isinstance(entry, dict):
+            continue
+        if "username" not in entry and "password" not in entry:
+            continue
+        user, pw = entry.get("username") or "", entry.get("password") or ""
+        if user or pw:
+            try:
+                entry["login"] = seal_login(user, pw)
+            except LoginUnreadable:
+                continue
+        entry.pop("username", None)
+        entry.pop("password", None)
+        changed = True
+    return changed
+
+
+# ── the backup passphrase, kept on the device ────────────────────────
+# Every backup is encrypted. The owner picks the passphrase once and the
+# device keeps it, sealed exactly like the share logins above, so the weekly
+# timer can encrypt too (it has nobody to ask) and a backup stored here can be
+# restored without typing it again. The owner still has to remember it: it is
+# what opens a downloaded backup on another device, and this file never
+# travels in one (DENY_FILES).
+PASSPHRASE_FILE = "/etc/hifi-player/backup-passphrase"
+_PASSPHRASE_CRED_NAME = "hifi-backup-passphrase"
+PASSPHRASE_MIN_LEN = 8
+
+
+def passphrase_set(path=None):
+    return os.path.isfile(path or PASSPHRASE_FILE)
+
+
+def save_passphrase(passphrase, path=None):
+    """Seal and store the passphrase. Raises LoginUnreadable if it cannot be
+    sealed: it is never written in the clear."""
+    path = path or PASSPHRASE_FILE
+    out, err = _creds(["encrypt", "--with-key=auto", "--tpm2-pcrs="],
+                      passphrase.encode("utf-8"), name=_PASSPHRASE_CRED_NAME)
+    if not out:
+        raise LoginUnreadable(err or "systemd-creds encrypt failed")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(out)
+    os.replace(tmp, path)
+
+
+def load_passphrase(path=None):
+    """The stored passphrase, or "" when none was ever chosen. Raises
+    LoginUnreadable when the file is there but cannot be opened (key gone,
+    TPM cleared): the owner then chooses it again."""
+    path = path or PASSPHRASE_FILE
+    try:
+        with open(path, "rb") as f:
+            blob = f.read()
+    except FileNotFoundError:
+        return ""
+    except OSError as e:
+        raise LoginUnreadable(str(e))
+    out, err = _creds(["decrypt"], blob, name=_PASSPHRASE_CRED_NAME)
+    if out is None:
+        raise LoginUnreadable(err or "systemd-creds decrypt failed")
+    return out.decode("utf-8")
+
+
+def _transform_sources(src, ctx):
+    """Music sources, with SMB logins taken out of unencrypted archives.
+
+    The source list itself is not a secret and is the thing users most want
+    back, so it stays in every backup. The logins inside it are a secret:
+    an encrypted archive carries them opened (the sealed form only opens on
+    this very device, and the archive has encryption of its own), while an
+    unencrypted one gets them removed and the manifest records that the file
+    was redacted. On restore, a source without a login is treated as "keep
+    whatever this device already has" (see merge_sources_state), so
+    re-restoring onto the same box loses nothing at all.
+    """
+    with open(src, "rb") as f:
+        raw = f.read()
+    try:
+        state = json.loads(raw.decode("utf-8"))
+    except Exception:
+        # Never ship what could not be looked at: it may hold a clear login.
+        return raw if ctx.get("encrypted") else None
+    redacted = False
+    for entry in state.get("sources", []):
+        if not isinstance(entry, dict):
+            continue
+        blob = entry.pop("login", None)
+        if ctx.get("encrypted"):
+            if blob:
+                try:
+                    entry["username"], entry["password"] = open_login(blob)
+                except LoginUnreadable:
+                    ctx.setdefault("notes", []).append("sources:login-unreadable")
+            continue
+        if blob or entry.get("password") or entry.get("username"):
+            redacted = True
+        entry.pop("username", None)
+        if "password" in entry or blob:
+            entry["password"] = ""
+    if redacted:
+        ctx.setdefault("notes", []).append("sources:redacted")
+    return json.dumps(state, indent=2).encode("utf-8")
+
+
+def _transform_nm_connection(src, _ctx):
+    """Only Wi-Fi profiles. Ethernet profiles carry no secret and no value —
+    they are just "get an IP over this cable", which any device recreates by
+    itself. Same reasoning hifi-factory-reset.sh uses when it deletes Wi-Fi
+    profiles but deliberately leaves Ethernet alone."""
+    with open(src, "rb") as f:
+        raw = f.read()
+    if b"type=wifi" in raw or b"802-11-wireless" in raw:
+        return raw
+    return None
+
+
+# Lyrion plugins that sign in to a streaming service keep that login — a
+# password hash, an OAuth or session token, an API key — in their own prefs
+# file, next to settings that are no secret at all. Like the SMB logins in the
+# source list (_transform_sources), those files only travel in an encrypted
+# archive: an unencrypted one leaves them out, and since a restore never
+# deletes what an archive does not carry, restoring it onto the same device
+# keeps the logins that are already there. The names below always count as
+# holding a login; any other plugin file does when one of its keys looks like
+# one (_holds_credentials) — plugins come and go, and new ones are not listed.
+_CREDENTIAL_PLUGIN_PREFS = frozenset((
+    "tidal.prefs", "qobuz.prefs", "spotty.prefs", "deezer.prefs", "youtube.prefs",
+    "squeezecloud.prefs", "mixcloud.prefs", "audioscrobbler.prefs",
+))
+_CREDENTIAL_KEY_HINTS = ("password", "passwd", "token", "secret", "apikey", "api_key",
+                         "credential", "cookie")
+_CREDENTIAL_KEYS = frozenset(("arl",))   # Deezer's login cookie
+
+
+def _holds_credentials(data):
+    """True if a parsed prefs file has a non-empty value under a key that
+    names a login, at any depth (TIDAL nests its tokens per account)."""
+    if isinstance(data, dict):
+        for key, value in data.items():
+            k = str(key).lower()
+            if (k in _CREDENTIAL_KEYS or any(h in k for h in _CREDENTIAL_KEY_HINTS)) \
+                    and value not in (None, "", [], {}):
+                return True
+            if _holds_credentials(value):
+                return True
+    elif isinstance(data, list):
+        return any(_holds_credentials(v) for v in data)
+    return False
+
+
+def _transform_lyrion_prefs(src, ctx):
+    """Lyrion rewrites its YAML prefs while running, so a copy can catch a
+    half-written file. Rather than stopping the music to avoid that (which is
+    what a whole-system backup tool has to do), read it and check it parses —
+    retry once, and if it still does not, skip that one file and say so in the
+    manifest. Nothing is silently archived broken.
+
+    server.prefs also gets its server_uuid dropped: it identifies this
+    specific Lyrion instance on the LAN (SqueezeCenter/SB discovery), so a
+    backup that still carried it would hand a second server — set up from
+    this same backup, e.g. a spare box — a duplicate UUID and confuse
+    discovery for both. Lyrion just mints a fresh one on next start if the
+    key is missing, so dropping it costs nothing on a normal same-device
+    restore either.
+
+    A plugin's prefs holding a streaming-service login are left out of an
+    unencrypted archive (see _CREDENTIAL_PLUGIN_PREFS)."""
+    plugin = "/prefs/plugin/" in src.replace(os.sep, "/")
+    if plugin and not ctx.get("encrypted") and os.path.basename(src).lower() in _CREDENTIAL_PLUGIN_PREFS:
+        ctx.setdefault("notes", []).append(f"lyrion-login-left-out:{src}")
+        return None
+    for attempt in (1, 2):
+        with open(src, "rb") as f:
+            raw = f.read()
+        if yaml is None:
+            return raw
+        try:
+            data = _load_lyrion_yaml(raw.decode("utf-8", "replace"))
+        except Exception:
+            if attempt == 2:
+                ctx.setdefault("notes", []).append(f"skipped-unparsable:{src}")
+                return None
+            continue
+        if plugin and not ctx.get("encrypted") and _holds_credentials(data):
+            ctx.setdefault("notes", []).append(f"lyrion-login-left-out:{src}")
+            return None
+        if os.path.basename(src) == "server.prefs" and isinstance(data, dict) and "server_uuid" in data:
+            # Only that line goes. Dumping the parsed data again used to
+            # rewrite the whole file through Python's YAML, which turns
+            # Lyrion's on/off/yes/no strings into booleans.
+            out = _SERVER_UUID_LINE.sub(b"", raw)
+            ctx.setdefault("notes", []).append(f"stripped-server-uuid:{src}")
+            return out
+        return raw
+    return None
+
+
+_SERVER_UUID_LINE = re.compile(rb"^server_uuid:[^\n]*(?:\n|$)", re.M)
+
+
+# Lyrion's ratings, play counts and "added" dates (tracks_persistent): a live
+# SQLite file in WAL mode, so a snapshot like the other databases.
+_LYRION_PERSIST_DBS = frozenset((
+    "/var/lib/squeezeboxserver/prefs/persist.db",
+    "/var/lib/lyrionmusicserver/prefs/persist.db",
+))
+
+
+def _transform_for(logical):
+    if logical in ("/etc/hifi-player/webui.db", METADATA_DB) or logical in _LYRION_PERSIST_DBS:
+        return _transform_sqlite
+    if logical == "/etc/hifi-sources.json":
+        return _transform_sources
+    if logical.startswith("/etc/NetworkManager/system-connections/"):
+        return _transform_nm_connection
+    if "/prefs/" in logical and logical.endswith(".prefs"):
+        return _transform_lyrion_prefs
+    return None
+
+
+# ── enumeration ──────────────────────────────────────────────────────
+def _abs(root, logical):
+    """Map a "/"-anchored logical path onto the (possibly faked) filesystem."""
+    return os.path.join(root, logical.lstrip("/")) if root != "/" else logical
+
+
+def iter_members(categories, root="/"):
+    """Yield (logical_path, real_path) for everything the given categories
+    cover and that actually exists. Order is stable so archives are diffable."""
+    for cat in categories:
+        spec = CATEGORIES.get(cat)
+        if not spec:
+            continue
+        for entry in spec["entries"]:
+            if entry[0] == "file":
+                logical = entry[1]
+                if is_denied(logical):
+                    continue
+                real = _metadata_db_real(root) if logical == METADATA_DB else _abs(root, logical)
+                if os.path.isfile(real) and not os.path.islink(real):
+                    yield logical, real
+            else:
+                _, logical_dir, excluded = entry
+                real_dir = _abs(root, logical_dir)
+                if not os.path.isdir(real_dir):
+                    continue
+                for dirpath, dirnames, filenames in os.walk(real_dir):
+                    rel_dir = os.path.relpath(dirpath, real_dir)
+                    if rel_dir == ".":
+                        dirnames[:] = [d for d in dirnames if d not in excluded]
+                    for name in sorted(filenames):
+                        real = os.path.join(dirpath, name)
+                        if os.path.islink(real) or not os.path.isfile(real):
+                            continue
+                        rel = os.path.relpath(real, real_dir).replace(os.sep, "/")
+                        logical = f"{logical_dir}/{rel}"
+                        if is_denied(logical):
+                            continue
+                        yield logical, real
+
+
+def estimate_size(categories, root="/"):
+    """Sum of the bytes we are about to read. Used for the free-space guard —
+    an over-estimate (compression is ignored) is exactly what we want here."""
+    total = 0
+    for _logical, real in iter_members(categories, root):
+        try:
+            total += os.path.getsize(real)
+        except OSError:
+            pass
+    return total
+
+
+def estimate_peak(categories, root="/", encrypted=False):
+    """Most disk space building an archive of `categories` takes at once.
+
+    estimate_size() alone undercounts: while the archive grows, the SQLite
+    snapshot it is copying from (as big as the database, write-ahead log
+    included) sits beside it, and an encrypted backup holds the plaintext
+    archive and its ciphertext together before the plaintext goes. Compression
+    is ignored, so this stays an over-estimate. Members build_archive leaves
+    out for size are not counted."""
+    total, count, snapshot = 0, 0, 0
+    for logical, real in iter_members(categories, root):
+        try:
+            size = os.path.getsize(real)
+        except OSError:
+            continue
+        if size > member_size_limit(logical):
+            continue
+        if _transform_for(logical) is _transform_sqlite:
+            try:
+                size += os.path.getsize(real + "-wal")
+            except OSError:
+                pass
+            snapshot = max(snapshot, size)
+        total += size
+        count += 1
+    # tar header + padding per member, plus the manifest
+    archive = total + count * 1024 + 64 * 1024
+    if encrypted:
+        return max(archive + snapshot, 2 * archive)
+    return archive + snapshot
+
+
+# ── archive construction ─────────────────────────────────────────────
+def build_archive(dest_path, categories, root="/", encrypted=False, extra=None):
+    """Write a .tar.gz of `categories` to `dest_path`; return its manifest.
+
+    The manifest is appended as the archive's LAST member, which is possible in
+    a single streaming pass because tar is sequential — the per-member digests
+    are known by the time the last member is written. That last member is also
+    the archive's completeness marker: a truncated file simply has no manifest.
+
+    Nothing here writes the generation's own `manifest.json`; the caller does
+    that, after any encryption step, so an aborted build can never leave behind
+    a directory that looks complete.
+    """
+    ctx = {"encrypted": encrypted, "notes": [], "tmpdir": os.path.dirname(dest_path) or "."}
+    members = {}
+    manifest = dict(extra or {})
+    tmp = dest_path + ".part"
+    with tarfile.open(tmp, "w:gz") as tar:
+        for logical, real in iter_members(categories, root):
+            transform = _transform_for(logical)
+            limit = member_size_limit(logical)
+            try:
+                if os.path.getsize(real) > limit:
+                    # Never archive what a restore would refuse (and never
+                    # read or snapshot it to find out). Checked again below on
+                    # what is actually archived: a snapshot also carries the
+                    # write-ahead log, a transform may change the size.
+                    ctx["notes"].append(f"too-large:{logical}")
+                    continue
+                if transform:
+                    data = transform(real, ctx)
+                    if data is None:
+                        continue
+                else:
+                    with open(real, "rb") as f:
+                        data = f.read()
+            except Exception as e:
+                ctx["notes"].append(f"unreadable:{logical}:{e.__class__.__name__}")
+                continue
+            arc = logical.lstrip("/")
+            mtime = int(os.path.getmtime(real))
+            size = (os.path.getsize(data.path) if isinstance(data, _FileMember)
+                    else len(data))
+            if size > limit:
+                if isinstance(data, _FileMember):
+                    data.discard()
+                ctx["notes"].append(f"too-large:{logical}")
+                continue
+            if isinstance(data, _FileMember):
+                members[arc] = data.add_to(tar, arc, mtime)
+            else:
+                _add_member(tar, arc, data, mtime)
+                members[arc] = hashlib.sha256(data).hexdigest()
+
+        manifest.update({"schema": SCHEMA, "categories": list(categories),
+                         "members": members, "notes": ctx["notes"]})
+        _add_member(tar, MANIFEST_MEMBER,
+                    json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"))
+    os.replace(tmp, dest_path)
+    return manifest
+
+
+def _add_member(tar, arc, data, mtime=None):
+    info = tarfile.TarInfo(arc)
+    info.size = len(data)
+    info.mode = 0o600
+    if mtime is not None:
+        info.mtime = mtime
+    tar.addfile(info, _BytesReader(data))
+
+
+def read_embedded_manifest(tar):
+    """The manifest carried inside an archive, or None for a legacy backup."""
+    try:
+        member = tar.getmember(MANIFEST_MEMBER)
+    except KeyError:
+        return None
+    try:
+        return json.loads(tar.extractfile(member).read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+class _BytesReader:
+    """Minimal file-like wrapper so tarfile can stream transformed bytes."""
+
+    def __init__(self, data):
+        self._data = data
+        self._pos = 0
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            chunk = self._data[self._pos:]
+            self._pos = len(self._data)
+            return chunk
+        chunk = self._data[self._pos:self._pos + size]
+        self._pos += len(chunk)
+        return chunk
+
+
+# ── encryption (encrypt-then-MAC) ────────────────────────────────────
+# openssl is already on the image; `age` is not, and it cannot take a
+# passphrase non-interactively (no --passphrase-file), so it is unusable from a
+# daemon. openssl enc gives confidentiality but no authentication, so an HMAC
+# over the ciphertext is computed separately and verified BEFORE decryption —
+# a tampered or truncated archive is rejected without its bytes ever being fed
+# to the cipher, and a wrong passphrase fails here rather than producing
+# garbage that a restore would then try to interpret.
+_KDF_ITER = 600000
+_SCRYPT_N = 1 << 14
+_SCRYPT_R = 8
+_SCRYPT_P = 1
+
+
+class BackupError(Exception):
+    """Anything that must abort a backup or restore with a message for the UI.
+
+    `code` (+ `fields`), when given, is a hifi_i18n key the HTTP layer
+    translates into the owner's language; str(e) stays the fallback."""
+
+    def __init__(self, message, code=None, **fields):
+        super().__init__(message)
+        self.code = code
+        self.fields = fields
+
+
+def _hmac_key(passphrase, salt):
+    return hashlib.scrypt(passphrase.encode("utf-8"), salt=salt,
+                          n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P,
+                          dklen=32, maxmem=64 * 1024 * 1024)
+
+
+def _file_hmac(path, key):
+    mac = hmac.new(key, digestmod=hashlib.sha256)
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            mac.update(chunk)
+    return mac.hexdigest()
+
+
+def _openssl(args, passphrase):
+    try:
+        proc = subprocess.run(["openssl"] + args, input=passphrase + "\n",
+                              capture_output=True, text=True, timeout=600)
+    except FileNotFoundError:
+        # Never fall back to writing the plaintext: the whole reason a
+        # passphrase was given is that this archive contains credentials.
+        raise BackupError("openssl non disponibile: backup cifrato rifiutato",
+                          code="backup.opensslMissing")
+    except subprocess.TimeoutExpired:
+        raise BackupError("Timeout durante la cifratura", code="backup.cryptoTimeout")
+    if proc.returncode != 0:
+        raise BackupError("Cifratura/decifratura fallita (passphrase errata?)",
+                          code="backup.cryptoFailed")
+
+
+def encrypt_archive(plain_path, enc_path, passphrase):
+    """Encrypt in place-ish; returns the manifest's `enc` block."""
+    _openssl(["enc", "-aes-256-ctr", "-pbkdf2", "-iter", str(_KDF_ITER),
+              "-md", "sha512", "-salt", "-pass", "stdin",
+              "-in", plain_path, "-out", enc_path], passphrase)
+    salt = os.urandom(16)
+    mac = _file_hmac(enc_path, _hmac_key(passphrase, salt))
+    return {"cipher": "aes-256-ctr", "kdf": f"pbkdf2-sha512-{_KDF_ITER}",
+            "mac": "hmac-sha256-scrypt", "salt": salt.hex(), "hmac": mac}
+
+
+def encrypt_in_place(plain_path, enc_path, passphrase, manifest):
+    """Encrypt a freshly built archive and record how in its manifest. The
+    plaintext goes either way: it holds the credentials the passphrase is
+    there to protect."""
+    try:
+        manifest["enc"] = encrypt_archive(plain_path, enc_path, passphrase)
+    finally:
+        try:
+            os.unlink(plain_path)
+        except OSError:
+            pass
+    return manifest
+
+
+def decrypt_archive(enc_path, plain_path, passphrase, enc_meta):
+    """Verify the MAC first, then decrypt. Raises BackupError on either."""
+    salt = bytes.fromhex(enc_meta.get("salt") or "")
+    expected = enc_meta.get("hmac") or ""
+    actual = _file_hmac(enc_path, _hmac_key(passphrase, salt))
+    if not hmac.compare_digest(actual, expected):
+        raise BackupError("Passphrase errata o archivio manomesso", code="restore.wrongPassphrase")
+    _openssl(["enc", "-d", "-aes-256-ctr", "-pbkdf2", "-iter", str(_KDF_ITER),
+              "-md", "sha512", "-pass", "stdin",
+              "-in", enc_path, "-out", plain_path], passphrase)
+
+
+# ── the downloadable file ────────────────────────────────────────────
+# Unencrypted backups are the flat archive itself: config files at their normal
+# paths plus the manifest member. That format is readable by the restore code
+# that shipped before this feature (it just ignores the manifest member), so a
+# plain backup keeps working across the upgrade in both directions.
+#
+# Encrypted backups cannot be flat — the whole point is that the paths and
+# contents are unreadable — so they are wrapped: an outer tar carrying the
+# manifest (which holds the KDF salt and the MAC) next to the ciphertext. The
+# wrapper is what makes an encrypted download restorable anywhere, instead of
+# only from the generation directory it was produced in.
+def wrap_encrypted(dest_path, manifest, enc_path):
+    # Fastest compression: the ciphertext does not compress at all, and at the
+    # default level 9 gzip spent most of a minute on a big one for nothing.
+    with tarfile.open(dest_path, "w:gz", compresslevel=1) as tar:
+        _add_member(tar, MANIFEST_NAME,
+                    json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"))
+        tar.add(enc_path, arcname=ENC_NAME)
+
+
+def payload_size(path, limit):
+    """Bytes `path` (a gzip file) decompresses to; BackupError past `limit`.
+
+    Run before tarfile ever walks an archive a restore was handed: listing a
+    .tar.gz decompresses all of it, so a small upload built to expand a
+    thousandfold would otherwise cost hours of CPU (and, for the ciphertext
+    of an encrypted wrapper, the disk it is copied to) before any per-member
+    check could look at it. Stops reading as soon as the limit is passed."""
+    total = 0
+    try:
+        with gzip.open(path, "rb") as f:
+            while True:
+                block = f.read(1024 * 1024)
+                if not block:
+                    break
+                total += len(block)
+                if total > limit:
+                    raise BackupError("Archivio troppo grande", code="restore.archiveTooLarge",
+                                      mb=limit // (1024 * 1024))
+    except BackupError:
+        raise
+    except Exception:
+        raise BackupError("Archivio non valido o corrotto", code="restore.archiveInvalid")
+    return total
+
+
+def _need_space(path, need):
+    if not free_space_ok(path, need):
+        raise BackupError("Spazio su disco insufficiente", code="backup.noSpace",
+                          mb=(need + FREE_SPACE_MARGIN) // (1024 * 1024) + 1)
+
+
+def open_backup(path, workdir, passphrase="", max_payload=None):
+    """Open a backup file of either shape.
+
+    Returns (tarfile, manifest). The caller closes the tarfile and removes
+    `workdir`. Raises BackupError for anything the user needs to be told about
+    (wrong passphrase, tampering, unreadable archive).
+
+    With `max_payload`, every gzip layer is measured first (payload_size) and
+    the copies an encrypted backup needs in `workdir` are checked against the
+    free space there — the restore path always passes it.
+    """
+    if max_payload is not None:
+        payload_size(path, max_payload)
+    try:
+        outer = tarfile.open(path, "r:gz")
+    except Exception:
+        raise BackupError("Archivio non valido o corrotto", code="restore.archiveInvalid")
+
+    names = set(outer.getnames())
+    if ENC_NAME not in names:
+        return outer, read_embedded_manifest(outer)
+
+    # Encrypted wrapper.
+    try:
+        with outer:
+            manifest = json.loads(
+                outer.extractfile(MANIFEST_NAME).read().decode("utf-8"))
+            enc_meta = manifest.get("enc") or {}
+            enc_size = outer.getmember(ENC_NAME).size
+            if max_payload is not None:
+                # The ciphertext, then the archive it decrypts to.
+                _need_space(workdir, 2 * enc_size)
+            enc_path = os.path.join(workdir, ENC_NAME)
+            with open(enc_path, "wb") as out, outer.extractfile(ENC_NAME) as src:
+                shutil.copyfileobj(src, out)
+    except BackupError:
+        raise
+    except Exception:
+        raise BackupError("Archivio cifrato non valido", code="restore.encryptedInvalid")
+
+    if not passphrase:
+        raise BackupError("Questo backup è cifrato: serve la passphrase",
+                          code="restore.passphraseRequired")
+
+    plain_path = os.path.join(workdir, ARCHIVE_NAME)
+    decrypt_archive(enc_path, plain_path, passphrase, enc_meta)
+    # The ciphertext has served its purpose: give its space back now.
+    try:
+        os.unlink(enc_path)
+    except OSError:
+        pass
+    if max_payload is not None:
+        payload_size(plain_path, max_payload)
+    try:
+        inner = tarfile.open(plain_path, "r:gz")
+    except Exception:
+        raise BackupError("Archivio cifrato non valido", code="restore.encryptedInvalid")
+    return inner, (read_embedded_manifest(inner) or manifest)
+
+
+# ── restore mapping ──────────────────────────────────────────────────
+def restore_dest_for_member(name, categories, root="/"):
+    """Map a tar member name to the absolute path it may be written to, or None.
+
+    Never trusts the member's own path: the name is normalised and then matched
+    against the allow-list built from `categories`. Anything that does not match
+    exactly (or sit under an allowed directory) is silently ignored, so path
+    traversal, absolute paths and symlink tricks in a crafted archive have
+    nothing to aim at.
+    """
+    logical = os.path.normpath("/" + name.replace("\\", "/").lstrip("/"))
+    logical = logical.replace(os.sep, "/")
+    if is_denied(logical):
+        return None
+    for cat in categories:
+        spec = CATEGORIES.get(cat)
+        if not spec:
+            continue
+        for entry in spec["entries"]:
+            if entry[0] == "file":
+                if logical == entry[1]:
+                    return _abs(root, logical)
+            else:
+                prefix = entry[1].rstrip("/") + "/"
+                if logical.startswith(prefix) and logical != entry[1]:
+                    return _abs(root, logical)
+    return None
+
+
+def categories_in_manifest(manifest):
+    """Categories a manifest claims to hold; legacy archives (no manifest, or
+    one without the field) are treated as the pre-categories config backup,
+    which is exactly what "core" + "sources" cover."""
+    if not manifest:
+        return ("core", "sources")
+    cats = manifest.get("categories")
+    if not cats:
+        return ("core", "sources")
+    return tuple(c for c in cats if c in CATEGORIES)
+
+
+def merge_sources_state(restored_raw, current_raw):
+    """Reinstate SMB logins the archive had redacted.
+
+    An unencrypted backup drops credentials (see _transform_sources). When such
+    a backup is restored onto the device it came from, the logins are still
+    sitting in the live file, so match on server+share and keep them — the user
+    gets their sources back working instead of getting a list of shares that all
+    fail to mount. The live file holds them sealed ("login"); one written before
+    that holds a clear "password", which is carried over the same way and
+    sealed by sources_server.py on its next load.
+    """
+    try:
+        restored = json.loads(restored_raw.decode("utf-8"))
+        current = json.loads(current_raw.decode("utf-8"))
+    except Exception:
+        return restored_raw
+    have = {}
+    for entry in current.get("sources", []):
+        key = (entry.get("server"), entry.get("share"))
+        if entry.get("login"):
+            have[key] = {"login": entry["login"]}
+        elif entry.get("password"):
+            have[key] = {"username": entry.get("username") or "", "password": entry["password"]}
+    changed = False
+    for entry in restored.get("sources", []):
+        key = (entry.get("server"), entry.get("share"))
+        if entry.get("login") or entry.get("password") or key not in have:
+            continue
+        entry.pop("username", None)
+        entry.pop("password", None)
+        entry.update(have[key])
+        changed = True
+    if not changed:
+        return restored_raw
+    return json.dumps(restored, indent=2).encode("utf-8")
+
+
+# ── generations on disk ──────────────────────────────────────────────
+def _gen_dir(store, gen_id):
+    """Directory of one generation, confined to `store`.
+
+    Generation ids reach here from URLs (/api/backup/<gen_id>) as well as
+    from our own listings. valid_gen_id() is the API-level check; this is
+    the backstop that holds even if a caller forgets it: an id that would
+    resolve anywhere outside the store raises instead of yielding a path."""
+    root = os.path.abspath(store)
+    path = os.path.abspath(os.path.join(root, str(gen_id)))
+    if not path.startswith(root + os.sep):
+        raise ValueError("invalid generation id")
+    return path
+
+
+def gen_dir(store, gen_id):
+    """Public name of _gen_dir() for the API layer."""
+    return _gen_dir(store, gen_id)
+
+
+def read_manifest(store, gen_id):
+    try:
+        with open(os.path.join(_gen_dir(store, gen_id), MANIFEST_NAME)) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def archive_path(store, gen_id, manifest=None):
+    manifest = manifest if manifest is not None else read_manifest(store, gen_id)
+    name = ENC_NAME if (manifest or {}).get("enc") else ARCHIVE_NAME
+    return os.path.join(_gen_dir(store, gen_id), name)
+
+
+def valid_gen_id(gen_id):
+    """Generation ids are our own timestamps; anything else is a caller trying
+    to reach outside the store."""
+    return bool(gen_id) and len(gen_id) <= 32 and all(
+        c.isdigit() or c == "-" for c in gen_id)
+
+
+def list_generations(store=STORE_DIR):
+    """Complete generations, newest first. A directory without a manifest is
+    an interrupted build and is not listed."""
+    out = []
+    try:
+        names = os.listdir(store)
+    except OSError:
+        return out
+    for name in names:
+        if not valid_gen_id(name) or not os.path.isdir(_gen_dir(store, name)):
+            continue
+        manifest = read_manifest(store, name)
+        if not manifest:
+            continue
+        path = archive_path(store, name, manifest)
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        out.append({
+            "id": name,
+            "created": manifest.get("created"),
+            "size": size,
+            "categories": manifest.get("categories", []),
+            "encrypted": bool(manifest.get("enc")),
+            "trigger": manifest.get("trigger", "manual"),
+            "versions": manifest.get("versions", {}),
+            "notes": manifest.get("notes", []),
+        })
+    out.sort(key=lambda g: g["id"], reverse=True)
+    return out
+
+
+def prune_incomplete(store=STORE_DIR):
+    """Remove directories with no manifest — either a build that died partway
+    or one we ourselves abandoned. Returns how many were removed."""
+    removed = 0
+    try:
+        names = os.listdir(store)
+    except OSError:
+        return 0
+    now = datetime.now().timestamp()
+    for name in names:
+        path = _gen_dir(store, name)
+        if name.startswith(WORKDIR_PREFIX) and os.path.isdir(path):
+            # A download or restore that died with its scratch space. Only
+            # once clearly stale: a live one may be in use right now.
+            try:
+                stale = now - os.path.getmtime(path) > WORKDIR_STALE_SECS
+            except OSError:
+                stale = False
+            if stale:
+                shutil.rmtree(path, ignore_errors=True)
+            continue
+        if not os.path.isdir(path) or not valid_gen_id(name):
+            continue
+        if read_manifest(store, name) is None:
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+    return removed
+
+
+def make_workdir(purpose, store=None):
+    """A private scratch directory on disk, beside the generations.
+
+    Not /run or /tmp: both are tmpfs here, and a big archive built or unpacked
+    there used to take its size out of RAM. Same filesystem and same 0700
+    store as the backups themselves, and never mistaken for one (see
+    WORKDIR_PREFIX). The caller removes it."""
+    store = store or STORE_DIR
+    os.makedirs(store, exist_ok=True)
+    os.chmod(store, 0o700)
+    path = tempfile.mkdtemp(prefix=f"{WORKDIR_PREFIX}{purpose}-", dir=store)
+    os.chmod(path, 0o700)
+    return path
+
+
+def pin_generation(gen_id, pin_file=None):
+    """Mark `gen_id` as being read by a restore: rotate() leaves it alone."""
+    pin_file = pin_file or RESTORE_PIN_FILE
+    tmp = pin_file + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(f"{gen_id}\n")
+    os.replace(tmp, pin_file)
+
+
+def unpin_generation(pin_file=None):
+    try:
+        os.unlink(pin_file or RESTORE_PIN_FILE)
+    except OSError:
+        pass
+
+
+def pinned_generations(pin_file=None):
+    try:
+        with open(pin_file or RESTORE_PIN_FILE) as f:
+            return {line.strip() for line in f if valid_gen_id(line.strip())}
+    except OSError:
+        return set()
+
+
+def rotate(store=STORE_DIR, keep=DEFAULT_KEEP, protect=(), pin_file=None):
+    """Keep the newest `keep` of the owner's generations, drop the rest.
+
+    A restore's safety snapshots (PRE_RESTORE_TRIGGER) are counted apart and
+    only the newest PRE_RESTORE_KEEP of them stay, so taking one never costs
+    the owner a backup. Whatever is in `protect` or pinned by a running
+    restore (pin_generation) is never removed, even past the limit: deleting
+    the archive a restore is about to read is how a restore of the oldest
+    backup used to fail and lose that backup too."""
+    keep = max(1, int(keep or DEFAULT_KEEP))
+    spared = set(protect or ()) | pinned_generations(pin_file)
+    gens = list_generations(store)
+    owners = [g for g in gens if g.get("trigger") != PRE_RESTORE_TRIGGER]
+    safety = [g for g in gens if g.get("trigger") == PRE_RESTORE_TRIGGER]
+    dropped = []
+    for gen in owners[keep:] + safety[PRE_RESTORE_KEEP:]:
+        if gen["id"] in spared:
+            continue
+        shutil.rmtree(_gen_dir(store, gen["id"]), ignore_errors=True)
+        dropped.append(gen["id"])
+    return dropped
+
+
+def new_gen_id(now=None):
+    now = now or datetime.now(timezone.utc)
+    return now.strftime("%Y%m%d-%H%M%S")
+
+
+def free_space_ok(path, need_bytes):
+    """True if `path`'s filesystem can hold need_bytes plus headroom."""
+    try:
+        return shutil.disk_usage(path).free >= need_bytes + FREE_SPACE_MARGIN
+    except OSError:
+        return True         # cannot tell — do not block the backup on this
+
+
+def record_history(store, line):
+    """Append-only log of what happened, in the same spirit as the OS-migration
+    ledger: the per-run log can be lost or overwritten, this cannot."""
+    try:
+        os.makedirs(store, exist_ok=True)
+        with open(os.path.join(store, HISTORY_NAME), "a") as f:
+            f.write(f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}\t{line}\n")
+    except OSError:
+        pass
+
+
+def read_settings(path=None):
+    """Scheduling preferences. Absent file = the shipped default (off)."""
+    try:
+        with open(path or SETTINGS_FILE) as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    return {
+        "scheduled": bool(data.get("scheduled")),
+        "keep": max(1, min(20, int(data.get("keep") or DEFAULT_KEEP))),
+    }
+
+
+def device_versions(root="/"):
+    """Versions recorded at backup time. Informational only — they are never
+    restored (they are on the deny-list), but they let a restore warn when an
+    archive comes from a newer build than the one running."""
+    out = {}
+    for key, logical in (("os", "/etc/hifi-player/OS_VERSION"),
+                         ("system", "/etc/hifi-player/SYSTEM_VERSION"),
+                         ("ui", "/etc/hifi-player/UI_VERSION")):
+        try:
+            with open(_abs(root, logical)) as f:
+                out[key] = f.read().strip()
+        except OSError:
+            pass
+    return out

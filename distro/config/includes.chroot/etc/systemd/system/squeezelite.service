@@ -1,0 +1,69 @@
+[Unit]
+# Native systemd unit for squeezelite on the HiFi Player appliance.
+#
+# The Debian `squeezelite` package only ships a SysV init script
+# (/etc/init.d/squeezelite); enabling that during the live-build chroot does
+# not create a persistent autostart, so squeezelite did not come up on a fresh
+# install. This native unit (shadowing the sysv-generated one) is enabled with a
+# real wants-symlink by hook 0400 and starts reliably at boot.
+#
+# Arguments come from /etc/default/squeezelite (ARGS=...), so the UI's DAC
+# selection (api_server.py set_audio_device, which rewrites ARGS and restarts
+# this service) keeps working. DO NOT hardcode the output device here.
+Description=Squeezelite Audio Player (HiFi Player)
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Before every start, render /etc/default/squeezelite from the settings in
+# /etc/hifi-player/squeezelite.json (hifi_squeezelite.py). A device that only
+# has the file gets it imported into the JSON once. Runs here, not as a
+# migration, so every device is right at the next boot; the file is read by
+# EnvironmentFile= only after this step. A hand edit of the file does not
+# survive this — the JSON (or Settings → Audio) is the place to change it.
+# `-` so squeezelite still starts if the script ever fails.
+ExecStartPre=-/usr/bin/python3 /usr/local/bin/hifi_squeezelite.py apply
+EnvironmentFile=-/etc/default/squeezelite
+ExecStart=/usr/bin/squeezelite $ARGS
+Restart=always
+RestartSec=5
+
+# 🚨 A squeezelite stuck on its output (the DAC or the USB stopped answering)
+# ignores SIGTERM: its handler only asks the main loop to stop, and the main
+# loop is waiting on the output thread. With the default 90 s a reboot from
+# the screen sat on "Stopping squeezelite" until the owner pulled the plug
+# (field bundle 2026-10-03). SIGKILL after 10 s ends a user-space hang; one
+# blocked inside the driver is at least bounded instead of open-ended.
+TimeoutStopSec=10
+
+# Highest scheduling priority on the box: squeezelite feeds the DAC directly,
+# so an underrun is audible in a way a dropped UI frame never is. CPU niceness
+# (not realtime/RR) to avoid starving other processes if it ever spins; realtime
+# I/O class so buffer reads never queue behind UI/log/update disk traffic.
+Nice=-10
+IOSchedulingClass=realtime
+IOSchedulingPriority=0
+
+# 🚨 Nice= and the I/O class alone were NOT enough, and the reason is cgroup v2:
+# a nice value only orders tasks *within* one cgroup, and systemd gives every
+# service its own. So squeezelite's -10 never competed with Lyrion at all —
+# which is how a background library analysis (the Bliss plugin, running inside
+# lyrionmusicserver.service) could starve playback until the track ended and
+# nothing else played. The weights below are what actually settle that, and
+# they are the counterpart to the deliberately low ones in
+# lyrionmusicserver.service. They only bite under contention: on an idle box
+# every service still gets whatever it asks for.
+CPUAccounting=yes
+IOAccounting=yes
+CPUWeight=1000
+IOWeight=1000
+
+# Last to go when memory runs out: systemd-oomd skips it (system.slice.d/
+# 10-hifi-oomd.conf) and the kernel's own OOM killer ranks it near the bottom.
+# It needs a few MB; killing it would never be what frees the box.
+ManagedOOMPreference=avoid
+OOMScoreAdjust=-900
+
+[Install]
+WantedBy=multi-user.target

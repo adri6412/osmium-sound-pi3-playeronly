@@ -1,0 +1,419 @@
+"""Joining a Wi-Fi network from the post-setup UIs (api_server.wifi_connect).
+
+The case that matters is re-joining a network the box has already used: the
+`nmcli device wifi connect` shorthand pushes the password into the existing
+profile as a bare `psk`, NetworkManager refuses the update with
+"802-11-wireless-security.key-mgmt: property is missing" (issue #98), and
+Wi-Fi becomes unreachable from every UI until the profile is removed by hand.
+These tests pin the profile-building path that replaces it, the key management
+it picks per security type, and the "don't touch a saved profile the user
+typed no password for" rule.
+"""
+import os
+import subprocess
+import sys
+import unittest
+from unittest.mock import patch
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+
+import api_server  # noqa: E402  (needs the path above)
+
+
+def _cp(cmd, rc=0, stdout='', stderr=''):
+    return subprocess.CompletedProcess(cmd, rc, stdout=stdout, stderr=stderr)
+
+
+class WifiConnectTests(unittest.TestCase):
+    #: SSID -> SECURITY, as `nmcli -t -f SSID,SECURITY device wifi list` prints it
+    SCAN = {'HomeNet': 'WPA2', 'Legacy': 'WEP', 'Cafe': '',
+            'NewNet': 'WPA2 WPA3', 'FutureNet': 'WPA3'}
+
+    def setUp(self):
+        self.calls = []          # every nmcli argv, in order
+        self.profiles = set()    # Wi-Fi profile names NetworkManager holds
+        self.active = set()      # the ones active right now
+        self.up_results = [0]    # return codes for successive `connection up`
+        self.add_rc = 0
+        #: profile name -> `nmcli -t -f ipv4.* connection show` output
+        self.profile_ipv4 = {}
+
+    # ── stubs ────────────────────────────────────────────────────────
+    def _fake_run(self, cmd, timeout=20):
+        self.calls.append(cmd)
+        if cmd[:4] == ['nmcli', '-t', '-f', 'NAME'] and cmd[-1] == '--active':
+            return _cp(cmd, stdout=''.join(f'{n}\n' for n in sorted(self.active)))
+        if cmd[:5] == ['nmcli', '-t', '-f', 'NAME,TYPE', 'connection']:
+            rows = ''.join(f'{n}:802-11-wireless\n' for n in sorted(self.profiles))
+            return _cp(cmd, stdout=rows)
+        if cmd[:5] == ['nmcli', '-t', '-f', 'SSID,SECURITY', 'device']:
+            rows = ''.join(f'{s}:{sec}\n' for s, sec in self.SCAN.items())
+            return _cp(cmd, stdout=rows)
+        if cmd[3].startswith('ipv4.method') and cmd[4:6] == ['connection', 'show']:
+            return _cp(cmd, stdout=self.profile_ipv4.get(cmd[-1], ''))
+        if cmd[1:3] == ['connection', 'delete']:
+            self.profiles.discard(cmd[-1])
+            return _cp(cmd)
+        if cmd[1:3] == ['connection', 'add']:
+            if self.add_rc == 0:
+                self.profiles.add(cmd[cmd.index('con-name') + 1])
+            return _cp(cmd, rc=self.add_rc, stderr='add refused' if self.add_rc else '')
+        if cmd[1:3] == ['connection', 'modify'] and 'connection.id' in cmd:
+            self.profiles.discard(cmd[4])
+            self.profiles.add(cmd[cmd.index('connection.id') + 1])
+            return _cp(cmd)
+        if cmd[1:3] == ['connection', 'up']:
+            rc = self.up_results.pop(0) if self.up_results else 4
+            return _cp(cmd, rc=rc, stderr='activation failed' if rc else '')
+        if cmd[1:4] == ['device', 'wifi', 'connect']:
+            return _cp(cmd)
+        return _cp(cmd)
+
+    def _connect(self, ssid, password, wifi_dev='wlan0', ip='192.168.1.40', band=''):
+        self.enabled = []
+        with patch.object(api_server, '_run', self._fake_run), \
+             patch.object(api_server, '_first_device_of_type',
+                          lambda t: wifi_dev if t == 'wifi' else 'eth0'), \
+             patch.object(api_server, '_ensure_networkmanager_state', lambda *a: None), \
+             patch.object(api_server, '_ensure_dhcp_ip', lambda dev, **kw: ip), \
+             patch.object(api_server, '_set_interface_enabled',
+                          lambda t, on: self.enabled.append((t, on))), \
+             patch.object(api_server.time, 'sleep', lambda *a: None):
+            # time.sleep is the retry backoff inside _wifi_join; api_server.time
+            # is the stdlib module, so this is restored on exit rather than left
+            # patched for the process.
+            return api_server.wifi_connect(ssid, password, band)
+
+    def _argv(self, *prefix):
+        """The first recorded nmcli call starting with these arguments."""
+        for cmd in self.calls:
+            if cmd[:len(prefix)] == list(prefix):
+                return cmd
+        return None
+
+    # ── the reported bug ─────────────────────────────────────────────
+    def test_rejoining_a_known_network_rebuilds_the_profile(self):
+        """Issue #98: with a profile already on disk the shorthand is unusable."""
+        self.profiles.add('HomeNet')
+        res = self._connect('HomeNet', 'hunter2hunter2')
+        self.assertTrue(res['success'], res)
+        # A fresh profile, not an update of the stale one — the update is what
+        # NetworkManager rejected with the missing key-mgmt. It is tried under
+        # a name of its own and takes the saved one's place once it works.
+        trial = 'HomeNet' + api_server._WIFI_TRIAL_SUFFIX
+        self.assertIn(['nmcli', 'connection', 'up', 'id', trial], [c[:5] for c in self.calls])
+        self.assertIn(['nmcli', 'connection', 'delete', 'id', 'HomeNet'], self.calls)
+        self.assertIn(['nmcli', 'connection', 'modify', 'id', trial, 'connection.id', 'HomeNet'],
+                      self.calls)
+        self.assertEqual(self.profiles, {'HomeNet'})
+        add = self._argv('nmcli', 'connection', 'add')
+        self.assertEqual(add[add.index('con-name') + 1], trial)
+        self.assertIn('802-11-wireless-security.key-mgmt', add)
+        self.assertEqual(add[add.index('802-11-wireless-security.key-mgmt') + 1], 'wpa-psk')
+        self.assertEqual(add[add.index('802-11-wireless-security.psk') + 1], 'hunter2hunter2')
+        self.assertEqual(add[add.index('ifname') + 1], 'wlan0')
+        # …and the shorthand is not used at all any more.
+        self.assertIsNone(self._argv('nmcli', 'device', 'wifi', 'connect'))
+
+    def test_first_time_join_takes_the_same_path(self):
+        """A never-seen network is joined the same way, not via a second path."""
+        res = self._connect('HomeNet', 'hunter2hunter2')
+        self.assertTrue(res['success'], res)
+        self.assertIsNotNone(self._argv('nmcli', 'connection', 'add'))
+        self.assertIsNone(self._argv('nmcli', 'device', 'wifi', 'connect'))
+
+    # ── key management per security type ─────────────────────────────
+    def _keymgmt(self, ssid, password='hunter2hunter2'):
+        self._connect(ssid, password)
+        add = self._argv('nmcli', 'connection', 'add')
+        if '802-11-wireless-security.key-mgmt' not in add:
+            return None
+        return add[add.index('802-11-wireless-security.key-mgmt') + 1]
+
+    def test_wpa2_uses_psk(self):
+        self.assertEqual(self._keymgmt('HomeNet'), 'wpa-psk')
+
+    def test_wpa3_only_uses_sae(self):
+        self.assertEqual(self._keymgmt('FutureNet'), 'sae')
+
+    def test_wpa2_wpa3_transition_ap_still_uses_psk(self):
+        # Both are advertised; wpa-psk is what associates with such an AP.
+        self.assertEqual(self._keymgmt('NewNet'), 'wpa-psk')
+
+    def test_unknown_ssid_falls_back_to_psk(self):
+        # Not in the scan list (the card's passive cache can miss a live
+        # network) — assume the home-network case rather than give up.
+        self.assertEqual(self._keymgmt('Hidden'), 'wpa-psk')
+
+    def test_open_network_gets_no_security_setting(self):
+        # Scanned and reported open: a typed password would make the profile
+        # unusable, so it is dropped rather than written.
+        self.assertIsNone(self._keymgmt('Cafe'))
+
+    def test_wep_passphrase_and_key_are_told_apart(self):
+        self._connect('Legacy', 'a-longer-wep-passphrase')
+        add = self._argv('nmcli', 'connection', 'add')
+        self.assertEqual(add[add.index('802-11-wireless-security.key-mgmt') + 1], 'none')
+        self.assertEqual(add[add.index('802-11-wireless-security.wep-key0') + 1],
+                         'a-longer-wep-passphrase')
+        self.assertEqual(add[add.index('802-11-wireless-security.wep-key-type') + 1], '2')
+        self.setUp()
+        self._connect('Legacy', 'ABCDE')          # 5 characters: a raw key
+        add = self._argv('nmcli', 'connection', 'add')
+        self.assertEqual(add[add.index('802-11-wireless-security.wep-key-type') + 1], '1')
+
+    # ── no password typed ────────────────────────────────────────────
+    def test_saved_profile_is_activated_not_rewritten(self):
+        """No password means no new secret: the saved one must survive."""
+        self.profiles.add('HomeNet')
+        res = self._connect('HomeNet', '')
+        self.assertTrue(res['success'], res)
+        self.assertIsNone(self._argv('nmcli', 'connection', 'delete'))
+        self.assertIsNone(self._argv('nmcli', 'connection', 'add'))
+        self.assertIsNotNone(self._argv('nmcli', 'connection', 'up', 'id', 'HomeNet'))
+
+    def test_open_network_without_a_profile_uses_the_shorthand(self):
+        res = self._connect('Cafe', '')
+        self.assertTrue(res['success'], res)
+        self.assertEqual(self._argv('nmcli', 'device', 'wifi', 'connect'),
+                         ['nmcli', 'device', 'wifi', 'connect', 'Cafe'])
+
+    # ── the band of a dual-band network ──────────────────────────────
+    # A home router broadcasts one SSID on 2.4 and 5 GHz; the scan list shows
+    # the two apart, and picking one has to mean something — without the band
+    # on the profile NetworkManager joins whichever half it likes.
+    def _band_arg(self, add):
+        if add is None or '802-11-wireless.band' not in add:
+            return None
+        return add[add.index('802-11-wireless.band') + 1]
+
+    def test_a_picked_band_is_written_onto_the_profile(self):
+        res = self._connect('HomeNet', 'hunter2hunter2', band='5')
+        self.assertTrue(res['success'], res)
+        self.assertEqual(self._band_arg(self._argv('nmcli', 'connection', 'add')), 'a')
+
+    def test_24_is_the_bg_band(self):
+        self._connect('HomeNet', 'hunter2hunter2', band='2.4')
+        self.assertEqual(self._band_arg(self._argv('nmcli', 'connection', 'add')), 'bg')
+
+    def test_6ghz_joins_on_the_same_band_setting_as_5(self):
+        # NetworkManager has no separate name for it: 'a' covers both.
+        self._connect('HomeNet', 'hunter2hunter2', band='6')
+        self.assertEqual(self._band_arg(self._argv('nmcli', 'connection', 'add')), 'a')
+
+    def test_no_band_leaves_the_profile_free_to_roam(self):
+        """The common case: one band, or an SSID typed by hand. Pinning there
+        would only give NetworkManager one more way to fail."""
+        self._connect('HomeNet', 'hunter2hunter2')
+        self.assertIsNone(self._band_arg(self._argv('nmcli', 'connection', 'add')))
+
+    def test_nonsense_band_is_ignored(self):
+        self._connect('HomeNet', 'hunter2hunter2', band='wifi6e')
+        self.assertIsNone(self._band_arg(self._argv('nmcli', 'connection', 'add')))
+
+    def test_a_saved_profile_keeps_its_secret_and_gets_the_band(self):
+        """No password typed: the stored secret must survive, so the band is
+        written onto the profile that is already there."""
+        self.profiles.add('HomeNet')
+        res = self._connect('HomeNet', '', band='2.4')
+        self.assertTrue(res['success'], res)
+        self.assertIsNone(self._argv('nmcli', 'connection', 'add'))
+        self.assertEqual(self._argv('nmcli', 'connection', 'modify'),
+                         ['nmcli', 'connection', 'modify', 'id', 'HomeNet',
+                          '802-11-wireless.band', 'bg'])
+        self.assertIsNotNone(self._argv('nmcli', 'connection', 'up', 'id', 'HomeNet'))
+
+    def test_an_open_network_on_a_chosen_band_gets_a_profile(self):
+        """The `device wifi connect` shorthand can't pin a band, so the join
+        goes through an explicit profile — with no security settings on it."""
+        res = self._connect('Cafe', '', band='5')
+        self.assertTrue(res['success'], res)
+        self.assertIsNone(self._argv('nmcli', 'device', 'wifi', 'connect'))
+        add = self._argv('nmcli', 'connection', 'add')
+        self.assertEqual(self._band_arg(add), 'a')
+        self.assertNotIn('802-11-wireless-security.key-mgmt', add)
+
+    # ── failure handling ─────────────────────────────────────────────
+    def test_activation_is_retried_once(self):
+        self.up_results = [4, 0]
+        res = self._connect('HomeNet', 'hunter2hunter2')
+        self.assertTrue(res['success'], res)
+        self.assertEqual(sum(1 for c in self.calls if c[1:3] == ['connection', 'up']), 2)
+
+    def test_a_profile_that_never_associates_is_removed(self):
+        self.up_results = [4, 4]
+        res = self._connect('HomeNet', 'wrong-password')
+        self.assertFalse(res['success'])
+        self.assertEqual(res['code'], 'network.connectFailed')
+        self.assertEqual(res['message'], 'activation failed')
+        # Nothing left behind for the next attempt to trip over.
+        self.assertNotIn('HomeNet', self.profiles)
+        self.assertEqual(self.enabled, [])   # and the cable is left alone
+
+    def test_a_wrong_password_keeps_the_saved_profile(self):
+        """Retyping the password of the network the box is on, with a typo:
+        the saved profile -- and with it the box's way back onto its own
+        network -- must survive, and the box goes back onto it."""
+        self.profiles.add('HomeNet')
+        self.active.add('HomeNet')
+        self.up_results = [4, 4, 0]
+        res = self._connect('HomeNet', 'wrong-password')
+        self.assertFalse(res['success'])
+        self.assertEqual(res['code'], 'network.connectFailed')
+        self.assertEqual(self.profiles, {'HomeNet'})
+        self.assertNotIn(['nmcli', 'connection', 'delete', 'id', 'HomeNet'], self.calls)
+        self.assertEqual(self.calls[-1][:5], ['nmcli', 'connection', 'up', 'id', 'HomeNet'])
+
+    def test_a_wrong_password_for_a_saved_network_not_in_use_is_not_activated(self):
+        self.profiles.add('HomeNet')
+        self.up_results = [4, 4]
+        res = self._connect('HomeNet', 'wrong-password')
+        self.assertFalse(res['success'])
+        self.assertEqual(self.profiles, {'HomeNet'})
+        self.assertNotIn(['nmcli', 'connection', 'up', 'id', 'HomeNet'],
+                         [c[:5] for c in self.calls])
+
+    def test_a_trial_profile_is_not_listed_as_saved(self):
+        self.profiles.update({'HomeNet', 'HomeNet' + api_server._WIFI_TRIAL_SUFFIX})
+        with patch.object(api_server, '_run', self._fake_run):
+            r = api_server.wifi_saved()
+        self.assertEqual([n['ssid'] for n in r['networks']], ['HomeNet'])
+
+    def test_add_failure_is_reported_verbatim(self):
+        self.add_rc = 2
+        res = self._connect('HomeNet', 'hunter2hunter2')
+        self.assertFalse(res['success'])
+        self.assertEqual(res['message'], 'add refused')
+        self.assertIsNone(self._argv('nmcli', 'connection', 'up'))
+
+    # ── a fixed address on a Wi-Fi profile ───────────────────────────
+    def test_a_fixed_address_survives_the_rebuild(self):
+        """The admin web UI can put a fixed address on Wi-Fi, and it lives on
+        the very profile the join rebuilds — losing it would move a headless
+        box to some other address the owner never chose."""
+        self.profiles.add('HomeNet')
+        self.profile_ipv4['HomeNet'] = ('ipv4.method:manual\n'
+                                        'ipv4.addresses:192.168.1.90/24\n'
+                                        'ipv4.gateway:192.168.1.1\n'
+                                        'ipv4.dns:192.168.1.1,1.1.1.1\n')
+        res = self._connect('HomeNet', 'hunter2hunter2', ip='192.168.1.90')
+        self.assertTrue(res['success'], res)
+        add = self._argv('nmcli', 'connection', 'add')
+        self.assertEqual(add[add.index('ipv4.method') + 1], 'manual')
+        self.assertEqual(add[add.index('ipv4.addresses') + 1], '192.168.1.90/24')
+        self.assertEqual(add[add.index('ipv4.gateway') + 1], '192.168.1.1')
+        self.assertEqual(add[add.index('ipv4.dns') + 1], '192.168.1.1 1.1.1.1')
+        self.assertEqual(add[add.index('ipv4.ignore-auto-dns') + 1], 'yes')
+
+    def test_a_dhcp_profile_is_left_on_dhcp(self):
+        self.profiles.add('HomeNet')
+        self.profile_ipv4['HomeNet'] = 'ipv4.method:auto\n'
+        self._connect('HomeNet', 'hunter2hunter2')
+        self.assertNotIn('ipv4.method', self._argv('nmcli', 'connection', 'add'))
+
+    def test_a_new_network_is_not_given_an_address(self):
+        # Nothing to carry over: no profile existed, so nothing is read either.
+        self._connect('HomeNet', 'hunter2hunter2')
+        self.assertNotIn('ipv4.method', self._argv('nmcli', 'connection', 'add'))
+        self.assertIsNone(self._argv('nmcli', '-t', '-f', 'ipv4.method,ipv4.addresses,'
+                                     'ipv4.gateway,ipv4.dns'))
+
+    # ── the exclusivity flip ─────────────────────────────────────────
+    def test_ip_is_read_from_the_wifi_interface(self):
+        """Not from _active_device(), which prefers Ethernet: on a box that is
+        still cabled that returned the wired address, so Wi-Fi looked up and
+        the cable got turned off on the strength of the cable's own IP."""
+        seen = []
+        with patch.object(api_server, '_run', self._fake_run), \
+             patch.object(api_server, '_first_device_of_type',
+                          lambda t: 'wlan0' if t == 'wifi' else 'eth0'), \
+             patch.object(api_server, '_ensure_networkmanager_state', lambda *a: None), \
+             patch.object(api_server, '_ensure_dhcp_ip',
+                          lambda dev, **kw: seen.append(dev) or '192.168.1.40'), \
+             patch.object(api_server, '_set_interface_enabled', lambda t, on: None), \
+             patch.object(api_server, '_active_device',
+                          lambda: self.fail('_active_device() prefers Ethernet')):
+            res = api_server.wifi_connect('HomeNet', 'hunter2hunter2')
+        self.assertTrue(res['success'], res)
+        self.assertEqual(seen, ['wlan0'])
+        self.assertEqual(res['ip'], '192.168.1.40')
+
+    def test_exclusivity_only_flips_once_wifi_has_an_ip(self):
+        res = self._connect('HomeNet', 'hunter2hunter2', ip=None)
+        self.assertTrue(res['success'], res)
+        self.assertIsNone(res['ip'])
+        self.assertEqual(self.enabled, [])
+        self.setUp()
+        self._connect('HomeNet', 'hunter2hunter2', ip='192.168.1.40')
+        self.assertEqual(self.enabled, [('wifi', True), ('ethernet', False)])
+
+    # ── argv safety (unchanged behaviour, kept pinned) ───────────────
+    def test_missing_and_unsafe_values_are_refused(self):
+        self.assertEqual(self._connect('', 'pw')['code'], 'network.ssidMissing')
+        self.assertEqual(self._connect('-oProxyCommand', 'pw')['code'], 'network.invalidField')
+        self.assertEqual(self._connect('HomeNet', 'pw\nmore')['code'], 'network.invalidField')
+        self.assertEqual(self.calls, [])
+
+
+if __name__ == '__main__':
+    unittest.main()
+
+
+class WifiForgetTests(unittest.TestCase):
+    """Forgetting a network (api_server.wifi_forget): the profile named after
+    the SSID goes, nothing else is touched, and an SSID the box never saved
+    or that is not a valid argument is refused before nmcli is called."""
+
+    def setUp(self):
+        self.calls = []
+        self.profiles = {'HomeNet', 'Cafe'}
+        self.delete_rc = 0
+
+    def _fake_run(self, cmd, timeout=20):
+        self.calls.append(cmd)
+        if cmd[:5] == ['nmcli', '-t', '-f', 'NAME,TYPE', 'connection']:
+            rows = ''.join(f'{n}:802-11-wireless\n' for n in sorted(self.profiles))
+            return _cp(cmd, stdout=rows)
+        if cmd[1:3] == ['connection', 'delete']:
+            if self.delete_rc == 0:
+                self.profiles.discard(cmd[-1])
+            return _cp(cmd, rc=self.delete_rc, stderr='refused' if self.delete_rc else '')
+        return _cp(cmd)
+
+    def _forget(self, ssid):
+        with patch.object(api_server, '_run', self._fake_run):
+            return api_server.wifi_forget(ssid)
+
+    def test_forgets_the_profile_named_after_the_ssid(self):
+        r = self._forget('HomeNet')
+        self.assertTrue(r['success'], r)
+        self.assertIn(['nmcli', 'connection', 'delete', 'id', 'HomeNet'], self.calls)
+        self.assertEqual(self.profiles, {'Cafe'})
+        self.assertIn('HomeNet', r['message'])
+
+    def test_a_network_never_saved_is_refused_before_nmcli(self):
+        r = self._forget('Elsewhere')
+        self.assertEqual((r['success'], r['code']), (False, 'network.notSaved'))
+        self.assertFalse(any(c[1:3] == ['connection', 'delete'] for c in self.calls))
+
+    def test_bad_arguments_never_reach_nmcli(self):
+        for bad in ('', '-flag', 'ctrl\x01char'):
+            r = self._forget(bad)
+            self.assertFalse(r['success'], bad)
+        self.assertEqual(self.calls, [])
+
+    def test_a_refused_delete_is_reported(self):
+        self.delete_rc = 4
+        r = self._forget('HomeNet')
+        self.assertEqual((r['success'], r['code']), (False, 'network.forgetFailed'))
+
+    def test_saved_lists_every_profile_with_the_one_in_use_first(self):
+        def run(cmd, timeout=20):
+            if cmd[-1] == '--active':
+                return _cp(cmd, stdout='Cafe:802-11-wireless\nWired:802-3-ethernet\n')
+            return self._fake_run(cmd, timeout)
+        with patch.object(api_server, '_run', run):
+            r = api_server.wifi_saved()
+        self.assertEqual(r['networks'], [{'ssid': 'Cafe', 'in_use': True}, {'ssid': 'HomeNet', 'in_use': False}])
+

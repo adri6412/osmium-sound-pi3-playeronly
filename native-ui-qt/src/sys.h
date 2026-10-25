@@ -1,0 +1,136 @@
+// sys — piccole cose di sistema che a QML mancano: file di configurazione
+// in /etc/hifi-player, tastiera fisica collegata (per decidere se mostrare
+// quella a schermo), puntatore, fotografie dello schermo per il collaudo.
+#pragma once
+#include <QObject>
+#include <QColor>
+#include <QEvent>
+#include <QHash>
+#include <QFileSystemWatcher>
+#include <QPointF>
+#include <QTimer>
+#include <QVariantMap>
+
+class QQuickWindow;
+class QWindow;
+
+// ─── helpers shared with remote.cpp ────────────────────────────────────────
+// A file's first line, and one bit of a /sys/class/input bitmap (hex words,
+// most significant first): the remote control classifies input devices with
+// the same two helpers this file uses to decide whether a keyboard is there.
+QString hifiSysfsRead(const QString &path);
+bool hifiSysfsBit(const QString &bitmap, int bit);
+// A mouse event through the QPA layer, like a real mouse. The test channel
+// and the remote control's OK button both press on the scene this way; see
+// the comment on the implementation for why a hand-built QMouseEvent is not
+// the same thing.
+void hifiSendMouse(QWindow *w, QEvent::Type type, const QPointF &p, Qt::MouseButton button = Qt::LeftButton);
+
+class Sys : public QObject {
+    Q_OBJECT
+    Q_PROPERTY(bool pointerEnabled READ pointerEnabled WRITE setPointerEnabled NOTIFY pointerEnabledChanged)
+    Q_PROPERTY(QString assets READ assets CONSTANT)
+    // skins downloaded from the VU meter store (api_server VU_STORE_DIR)
+    Q_PROPERTY(QString vuStore READ vuStore CONSTANT)
+    // Now Playing animations downloaded from their store (api_server ANIM_STORE_DIR)
+    Q_PROPERTY(QString animStore READ animStore CONSTANT)
+    Q_PROPERTY(QString configDir READ configDir CONSTANT)
+    Q_PROPERTY(bool devMode READ devMode CONSTANT)
+    Q_PROPERTY(QString forcedWizard READ forcedWizard CONSTANT)
+    Q_PROPERTY(bool wizardDry READ wizardDry CONSTANT)
+    Q_PROPERTY(bool startExpanded READ startExpanded CONSTANT)
+    Q_PROPERTY(qint64 lastInput READ lastInput NOTIFY lastInputChanged)
+    // Settings -> Display -> Rotation: degrees clockwise the picture is turned
+    // (0, 90, 180, 270), from /etc/hifi-player/ui-rotation. eglfs cannot turn a
+    // Qt Quick scene by itself, so Main.qml turns the canvas. The file is
+    // watched: a change made from the web admin turns the screen right away.
+    Q_PROPERTY(int rotation READ rotation WRITE setRotation NOTIFY rotationChanged)
+    // How much the hardware already turns the picture since this boot:
+    // `hifi.rotate=180` on the kernel command line means the kernel turned
+    // the display plane upside down and udev turned the touch screen with it
+    // (api_server.py, 70-hifi-touch-rotate.rules). Main.qml turns only the
+    // rest. 90/270 are never turned in hardware: 0 for those.
+    Q_PROPERTY(int hwRotation READ hwRotation CONSTANT)
+public:
+    explicit Sys(const QString &assets, QObject *parent = nullptr);
+    void setWindow(QQuickWindow *w) { m_win = w; }
+    bool pointerEnabled() const { return m_pointer; }
+    void setPointerEnabled(bool on);
+    int rotation() const { return m_rotation; }
+    int hwRotation() const { return m_hwRotation; }
+    // only the picture: saving the choice is api_server's job (/ui_rotation),
+    // which also turns the boot splash
+    void setRotation(int deg);
+    QString assets() const { return m_assets; }
+    QString vuStore() const { return qEnvironmentVariable("HIFI_VU_STORE_DIR", QStringLiteral("/var/lib/hifi-player/vu-skins")); }
+    QString animStore() const { return qEnvironmentVariable("HIFI_ANIM_STORE_DIR", QStringLiteral("/var/lib/hifi-player/anim-scenes")); }
+    QString configDir() const { return m_configDir; }
+    bool devMode() const { return m_dev; }
+    QString forcedWizard() const { return m_forcedWizard; }
+    void setForcedWizard(const QString &w, bool dry = false) { m_forcedWizard = w; m_wizardDry = dry; }
+    bool wizardDry() const { return m_wizardDry; }
+    bool startExpanded() const { return m_startExpanded; }
+    void setStartExpanded(bool b) { m_startExpanded = b; }
+
+    Q_INVOKABLE QString readLine(const QString &path, const QString &fallback = QString()) const;
+    Q_INVOKABLE QString readFile(const QString &path) const;
+    Q_INVOKABLE bool writeLine(const QString &path, const QString &text) const;
+    Q_INVOKABLE bool exists(const QString &path) const;
+    // /etc/hifi-player/<name>
+    Q_INVOKABLE QString conf(const QString &name, const QString &fallback = QString()) const;
+    Q_INVOKABLE bool setConf(const QString &name, const QString &value) const;
+    Q_INVOKABLE bool shot(const QString &path) const;
+    // A press (and release) on the scene at a point in window coordinates:
+    // how the remote control's OK button "touches" the control it has the
+    // highlight on. `holdMs` > 0 keeps the finger down that long, which is
+    // what opens a long-press menu.
+    Q_INVOKABLE void tapAt(qreal x, qreal y, int holdMs = 0);
+    bool injecting() const;                          // a tapAt is under way: its mouse events are ours
+    Q_INVOKABLE void quit() const;
+    Q_INVOKABLE qint64 now() const;                  // ms monotonici
+    Q_INVOKABLE QString upper(const QString &s) const { return s.toUpper(); }
+    Q_INVOKABLE void log(const QString &s) const;
+    // Icona lucide gia' tinta (file SVG in cache): si disegna come vettore,
+    // senza passare da una texture — vedi Icon.qml per il perche'.
+    Q_INVOKABLE QString tintedIcon(const QString &name, const QColor &color);
+    // quante icone tinte ci sono ora in cache, quante ne sono state scritte
+    // da quando e' partita e quante volte la cache e' stata svuotata (per il
+    // canale di prova: un tocco non deve farle crescere)
+    Q_INVOKABLE QVariantMap tintStats() const;
+    void setIconDir(const QString &dir) { m_iconDir = dir; }
+    // box-shadow CSS (blur, spread, colore) per un rettangolo con angoli
+    // `radius`: un PNG 9-patch pre-sfocato in cache, da usare con BoxShadow.qml
+    Q_INVOKABLE QString boxShadow(qreal radius, qreal blur, qreal spread, const QColor &color);
+    qint64 lastInput() const { return m_lastInput; }
+    void noteInput();
+    // Un dito (o il mouse) davvero appoggiato sullo schermo: il riflettore del
+    // telecomando si spegne, perche' da qui in poi comanda il dito. Le
+    // pressioni che il telecomando stesso inietta (Sys::tapAt) non contano.
+    void notePointer();
+
+signals:
+    void pointerTouched();
+    void pointerEnabledChanged();
+    void lastInputChanged();
+    void rotationChanged();
+    // the SAVED rotation changed (the file, e.g. from the web admin): a trial
+    // under way on the screen gives way to it
+    void savedRotationChanged();
+
+private:
+    QString m_assets, m_configDir;
+    QString m_iconDir, m_iconCacheDir;
+    QHash<QString, QString> m_tinted;   // chiave nome|colore -> URL del file
+    int m_tintedIcons = 0, m_tintedMade = 0, m_tintedPrunes = 0;
+    void iconCacheDir();                // crea la cartella (e la ripulisce al primo uso)
+    void pruneTinted();
+    bool m_pointer = true, m_dev = false, m_startExpanded = false;
+    int m_rotation = 0, m_savedRotation = -1, m_hwRotation = 0;
+    QFileSystemWatcher m_confWatch;
+    void readRotation();
+    QString m_forcedWizard;
+    bool m_wizardDry = false;
+    QQuickWindow *m_win = nullptr;
+    qint64 m_lastInput = 0;
+    qint64 m_injectUntil = -1;      // finestra in cui le pressioni sono nostre
+};

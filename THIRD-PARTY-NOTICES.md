@@ -1,0 +1,123 @@
+# Third-Party Notices
+
+<!-- Also rendered in-app from src/data/thirdPartyNotices.js: on screen as
+     Settings → Third-Party Notices, and in the web admin as Settings →
+     Licenses & credits, which additionally lists every Debian package of the
+     image with its license (/usr/lib/osmium/credits.json, written by
+     distro/gen-credits.py at image build from the packages' copyright files).
+     Keep that file in sync whenever a dependency is added, removed or changed here. -->
+
+Osmium Sound includes and/or redistributes the following third-party components under their respective licenses. **The AGPL-3.0-only license of this project applies ONLY to the project's own code** (Qt/QML on-screen interface, earlier Electron/React kiosk, Vue web admin, Python services, distro packaging scripts, Osmium Flasher, the "Osmium" theme/CSS for Material Skin) — with the exception of the Android companion app, which remains Apache-2.0 (see below), and of code published before 2026-08-23, which was released under MIT (see `LICENSING.md`). All third-party components are subject to their own licenses.
+
+**Osmium Sound is an independent project and is NOT affiliated with, sponsored by, or endorsed by the Lyrion / LMS-Community project.**
+
+---
+
+## Bundled in the Appliance ISO (`distro/`)
+
+| Component | Version | License | Notes |
+|-----------|---------|---------|-------|
+| **Lyrion Music Server** | 9.1.0 (pinned in `hifi-firstboot.sh` / `build-distro.sh`) | GPL-2.0+ (with Perl/other) | **Not bundled as a file in the ISO.** Downloaded from the official LMS-Community server and installed on the first boot of the installed system (`hifi-firstboot.service`), or by the setup wizard; later updated in place from Settings. [Official source](https://downloads.lms-community.org/LyrionMusicServer_v9.1.0/) |
+| **squeezelite** | Debian trixie | GPL-3.0+ | Audio playback engine (Debian package). Installed from official Debian repos. |
+| **cdparanoia, icedax, libcdio-utils, cd-discid, flac, lame, faad, sox, wavpack, ffmpeg** | Debian trixie | GPL-2.0 / GPL-3.0 / LGPL (per package) | CD reading/ripping and codec support (Debian packages). Installed from official Debian repos. |
+| **Qt 6** (qtbase, qtdeclarative, Qt Quick QML modules, QPA and image-format plugins) | Debian trixie | LGPL-3.0 (also available under GPL-2.0/GPL-3.0) | Runtime of the on-screen interface (`/opt/hifi-qt`). Unmodified Debian shared libraries, dynamically linked: they can be replaced with any compatible build, as the LGPL requires. |
+| **libdrm** | Debian trixie | MIT | Display mode setting for the on-screen interface (DRM/KMS). |
+| **DejaVu fonts, Noto CJK fonts** | Debian trixie | Bitstream Vera license / public domain; SIL OFL-1.1 | Interface typeface and CJK glyph coverage (Debian packages). |
+| **Plymouth** | Debian trixie | GPL-2.0+ | Boot splash (Debian package). |
+| **labwc, wlroots, wlr-randr, XWayland, Xorg, LightDM** | Debian trixie | MIT / GPL / X11 (per package) | Session of the earlier Electron kiosk (Wayland compositor with X11 fallback, display manager), still used by installs that predate the A/B image layout (Debian packages). |
+| **NetworkManager, dnsmasq-base, Avahi, Samba, wsdd2, Tailscale** | Debian trixie / Tailscale repo | GPL / LGPL / BSD (per package) | Networking, setup hotspot, mDNS, SMB shares and their discovery, optional remote access (Tailscale is installed from Tailscale's own repository). |
+| **ipts** (kernel driver) and **iptsd** (daemon) | linux-surface patch `patches/6.12/0005-ipts.patch` @ `321be2e`; iptsd 3.1.0 | GPL-2.0+; iptsd statically links CLI11 (BSD-3-Clause), Eigen (MPL-2.0), fmt (MIT), inih (BSD-3-Clause), Microsoft GSL (MIT), spdlog (MIT) | Touchscreen of Microsoft Surface models with Intel Precise Touch (Surface Pro 4/5/6, Book 1/2, Laptop 1/2). Built unmodified from the pinned [linux-surface](https://github.com/linux-surface/linux-surface) and [iptsd](https://github.com/linux-surface/iptsd/releases/tag/v3.1.0) sources by `distro/config/hooks/normal/0440-surface-ipts.hook.chroot`. |
+| **Debian base system, kernel, firmware** | trixie (Debian 13) | Various (GPL/BSD/firmware EULAs) | Installed from official Debian repos. |
+
+### GPL Source Code Offer
+
+The above GPL- and LGPL-licensed components (Lyrion, squeezelite, CD tools, Qt 6, …) are unmodified binaries from official Debian and LMS-Community sources. The corresponding source code is available from:
+
+- **Lyrion 9.1.0**: [LMS-Community GitHub](https://github.com/LMS-Community/slimserver/releases/tag/v9.1.0)
+- **Debian packages**: [Debian source repositories](https://deb.debian.org/debian-source/), suite `trixie`
+- **ipts / iptsd**: [linux-surface @ 321be2e](https://github.com/linux-surface/linux-surface/blob/321be2e7ebbb751153a97c6ed38836f2f4300dc6/patches/6.12/0005-ipts.patch), [iptsd v3.1.0](https://github.com/linux-surface/iptsd/archive/refs/tags/v3.1.0.tar.gz) (its static dependencies at the versions in `subprojects/*.wrap`)
+
+A complete source code archive matching this ISO can be provided upon written request to `info@osmiumsound.it`.
+
+**Historical note:** install ISOs **v2.5.7 and earlier** bundled Lyrion 9.1.0 directly as a file in the image, rather than downloading it at first boot (the model described above, used from v2.6.0-era images onward). Earlier images were built on Debian 12 "bookworm"; current images are built on Debian 13 "trixie". The source offer above covers those older ISOs too.
+
+---
+
+## Android Companion App (`android-companion/`)
+
+| Component | License | Copyright | Notes |
+|-----------|---------|-----------|-------|
+| **android-squeezer (rebranded)** | Apache-2.0 | Kurt Aaholst, Google Inc. | Rebranded as "Osmium Sound Companion" for remote control. Upstream: [android-squeezer GitHub](https://github.com/kaaholst/android-squeezer). Full license text in `android-companion/docs/LICENSE.md`. |
+| **OkHttp** | Apache-2.0 | Square, Inc. | HTTP client. [square/okhttp](https://square.github.io/okhttp/) |
+| **ZXing Android Embedded** | Apache-2.0 | journeyapps / ZXing | QR code pairing scanner. [journeyapps/zxing-android-embedded](https://github.com/journeyapps/zxing-android-embedded) |
+| **CometD Java Client** | Apache-2.0 | CometD project | Comet/Bayeux client used for LMS server push notifications. [cometd/cometd](https://github.com/cometd/cometd) |
+| **SLF4J Android** | MIT | QOS.ch | Logging facade binding. [slf4j.org](https://www.slf4j.org/) |
+| **ckChangeLog** | Apache-2.0 | cketti | In-app changelog display. [cketti/ckChangeLog](https://github.com/cketti/ckChangeLog) |
+| **RecyclerView-FastScroller** | Apache-2.0 | quiph | Fast-scroll UI widget. [quiph/RecyclerView-FastScroller](https://github.com/quiph/RecyclerView-FastScroller) |
+| **AndroidX libraries & Material Components** | Apache-2.0 | Google / AOSP | `core`, `palette`, `webkit`, `appcompat`, `activity`, `preference`, `media`, `material`. [developer.android.com/jetpack/androidx](https://developer.android.com/jetpack/androidx) |
+| **AndroidX Media3 (ExoPlayer)** | Apache-2.0 | Google / AOSP | `media3-exoplayer`, `media3-datasource`, `media3-extractor`: decodes the stream when the phone itself is the Lyrion player. [developer.android.com/media/media3](https://developer.android.com/media/media3) |
+
+---
+
+## On-screen Interface (`native-ui-qt/`)
+
+The interface on the device's screen is this project's own C++/QML code (AGPL-3.0-only), built against the Debian Qt 6 packages listed above. Besides those libraries it uses:
+
+- **Lucide icons** (ISC) — the SVG icons in `native-ui-qt/icons/`, generated from `lucide-react` 0.294 (the same set the earlier kiosk used) by `native-ui-qt/tools/gen-icons.mjs`
+- The QR code generator (`native-ui-qt/src/qr.c`) is this project's own implementation of the QR specification
+
+---
+
+### Web admin (`admin-webui/`, served by `webui_server.py`)
+
+- **Vue 3, vue-router** (MIT)
+- **qrcode** (MIT)
+
+See `admin-webui/package.json`.
+
+### Osmium Flasher (`flasher/`, desktop USB writer — not part of the appliance)
+
+- **Electron** (MIT)
+- **etcher-sdk** (Apache-2.0, balena) — drive enumeration, unmount/locking, block-device writes
+- **@vscode/sudo-prompt** (MIT) — privilege elevation for the writer helper
+- **file-type** (MIT) — vendored compatibility shim in `flasher/vendor/file-type-compat`
+- **usb, follow-redirects** (MIT) — pinned transitive dependencies
+
+See `flasher/package.json`.
+
+---
+
+## Python Service Dependencies
+
+All Python dependencies are permissive open source:
+
+- **Flask** (BSD-3-Clause) — web framework for the API, sources and web-admin servers
+- **Werkzeug** (BSD-3-Clause, ships with Flask) — password hashing for the web-admin account
+- **flask-cors** (MIT) — cross-origin request support
+- **psutil** (BSD-3-Clause) — system monitoring / CPU stats
+- **websockets** (BSD-3-Clause) — VU meter WebSocket stream
+- **PyYAML, NumPy** (MIT / BSD-3-Clause) — Debian packages used by the on-device services
+
+For a complete list, see `requirements.txt` and `distro/config/package-lists/hifi.list.chroot`.
+
+---
+
+## Not Bundled (Runtime Interaction Only)
+
+- **Lyrion Material Skin** (GPL-3.0, Craig Drummond) — the Lyrion web player. It is **not redistributed** by this project: the appliance downloads it at runtime from the LMS community plugin repository and installs it into Lyrion the same way Lyrion installs any plugin. The "Osmium" theme, global CSS and menu entry (`distro/config/includes.chroot/usr/local/share/hifi-lms-skin/`) are this project's own files (AGPL-3.0-only) placed into Material's documented user-customisation hooks.
+- **Lyrion plugins** (various licenses: Spotty, TIDAL, Qobuz, Deezer, RadioNowPlaying, Radio.net, MusicArtistInfo, ShairTunes2, UPnP/DLNA, …) — installed on demand from the setup wizard or the Lyrion web UI and NOT bundled.
+- **MusicBrainz** web service — queried at runtime for CD metadata; data under MusicBrainz's own terms.
+
+---
+
+## Disclaimer of Affiliation
+
+Osmium Sound is an **independent open-source project** developed to provide a touchscreen-friendly interface for the Lyrion Music Server. It is not affiliated with, sponsored by, endorsed by, or officially associated with the Lyrion project, the LMS-Community, or their contributors. The name "Lyrion" is used in a nominative sense only to describe the service that this frontend connects to.
+
+---
+
+**For license compliance questions or to request source code, please contact:** `info@osmiumsound.it`
+
+---
+
+**Last reviewed:** 2026-09-14 (on-screen interface moved from Electron to Qt 6); previously 2026-08-23 (full transitive npm scan with license-checker for the AGPL relicensing), against `package.json`, `admin-webui/package.json`, `flasher/package.json`, `requirements.txt`, `distro/config/package-lists/hifi.list.chroot`, `native-ui-qt/Makefile` and `android-companion/HiFiMediaPlayer/build.gradle`.

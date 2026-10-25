@@ -1,0 +1,55 @@
+# UI Qt Quick Osmium Sound — build sul dispositivo (Debian 13, Qt 6.8) o nel
+# chroot trixie di sviluppo. Nessun qmake/cmake: moc e un Makefile bastano.
+CXX      ?= g++
+CXXFLAGS ?= -O2 -Wall -std=c++17 -fPIC
+# Qt6DBus: il ponte per i telecomandi Bluetooth parla con BlueZ (btghid.cpp)
+PKGS      = Qt6Quick Qt6Qml Qt6Gui Qt6Network Qt6DBus Qt6Core libdrm
+CXXFLAGS += $(shell pkg-config --cflags $(PKGS))
+# QtGui private (QPA) headers, for the touch injection of the test channel:
+# used only where qt6-base-private-dev is installed (__has_include in main.cpp)
+QTGUI_INC = $(shell pkg-config --variable=includedir Qt6Gui)/QtGui/$(shell pkg-config --modversion Qt6Gui)
+CXXFLAGS += -I$(QTGUI_INC) -I$(QTGUI_INC)/QtGui
+LDLIBS    = $(shell pkg-config --libs $(PKGS))
+MOC      ?= $(shell pkg-config --variable=libexecdir Qt6Core)/moc
+
+CC       ?= gcc
+CFLAGS   ?= -O2 -Wall -std=c11
+SRC   = $(wildcard src/*.cpp)
+CSRC  = $(wildcard src/*.c)
+HDRS  = $(filter-out src/qr.h,$(wildcard src/*.h))
+MOCS  = $(patsubst src/%.h,build/moc_%.cpp,$(HDRS))
+OBJ   = $(patsubst src/%.cpp,build/%.o,$(SRC)) $(patsubst src/%.c,build/c_%.o,$(CSRC)) $(patsubst build/moc_%.cpp,build/moc_%.o,$(MOCS))
+BIN   = hifi-qt
+
+all: $(BIN)
+
+$(BIN): $(OBJ)
+	$(CXX) -o $@ $(OBJ) $(LDLIBS)
+
+build/%.o: src/%.cpp $(HDRS) | build
+	$(CXX) $(CXXFLAGS) -Isrc -c -o $@ $<
+
+build/c_%.o: src/%.c | build
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+build/moc_%.cpp: src/%.h | build
+	$(MOC) $< -o $@
+
+build/moc_%.o: build/moc_%.cpp
+	$(CXX) $(CXXFLAGS) -Isrc -c -o $@ $<
+
+build:
+	mkdir -p build
+
+# The pure parts that need no screen: what to tell eglfs for one or more
+# monitors (kmsmode). Linked with kmsmode alone.
+build/kmsplan_test: tests/kmsplan_test.cpp build/kmsmode.o | build
+	$(CXX) $(CXXFLAGS) -Isrc -o $@ $< build/kmsmode.o $(LDLIBS)
+
+test: build/kmsplan_test
+	build/kmsplan_test
+
+clean:
+	rm -rf build $(BIN)
+
+.PHONY: all clean test

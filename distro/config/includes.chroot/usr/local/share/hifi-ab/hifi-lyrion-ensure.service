@@ -1,0 +1,33 @@
+[Unit]
+Description=Osmium Sound — Lyrion on /data when missing, and off while following another server
+ConditionPathExists=/usr/lib/osmium/IMAGE_VERSION
+# 🚨 The first boot does NOT download Lyrion on its own: the setup wizard does,
+# after asking whether this device is the server or follows one on the network.
+# While the setup is still pending this unit stays put; the script re-checks the
+# same thing. A live session must not download anything into RAM.
+ConditionKernelCommandLine=!boot=live
+ConditionPathExists=!/etc/hifi-player/provisioning-pending
+# 🚨 It also runs when Lyrion IS installed (it used to be skipped then), because
+# its second job is to keep the local server off on a device that follows
+# another one — the rule api_server.py applies when the choice is made, enforced
+# here at boot for devices that were already following. Ordered before the
+# server so on the boot that first applies it, the server never starts at all.
+Before=lyrionmusicserver.service
+After=network-online.target hifi-rauc-config.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# 🚨 The image masks NetworkManager-wait-online (see build-image.sh), so
+# network-online.target above is reached at once and no longer promises an
+# address. Almost every boot this unit exits before touching the network — it
+# only downloads when Lyrion is genuinely missing from /data, ~90 MB — but on
+# that one boot it needs the LAN to be really up. The leading dash is
+# deliberate: if nm-online is absent or times out, the unit runs anyway and
+# hifi-lyrion-update.sh still has curl --retry 3.
+ExecStartPre=-/usr/bin/nm-online -s -q --timeout=30
+ExecStart=/usr/local/sbin/hifi-lyrion-ensure.sh
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=multi-user.target

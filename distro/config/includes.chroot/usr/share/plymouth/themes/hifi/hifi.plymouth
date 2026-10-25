@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=Osmium Sound
+Description=Osmium Sound boot splash: the mark builds up, then shimmers until the interface takes over
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/hifi
+ScriptFile=/usr/share/plymouth/themes/hifi/hifi.script

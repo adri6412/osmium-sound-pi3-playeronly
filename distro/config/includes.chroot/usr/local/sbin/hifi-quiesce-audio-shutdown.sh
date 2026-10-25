@@ -1,0 +1,54 @@
+#!/bin/sh
+# shellcheck shell=sh
+# HiFi Player — quiesce audio before ANY shutdown/reboot/halt/kexec.
+#
+# Mitigates a kernel panic in the DesignWare DMA driver (dw_dmac_core:
+# dw_shutdown -> do_dw_dma_disable) seen on this appliance's hardware
+# (Intel Braswell) during device_shutdown() when the system reboots/powers
+# off while a DMA channel is actively driving audio playback. Not a fix for
+# the kernel bug itself (needs an upstream/kernel fix); just gives the
+# hardware a moment to go idle first. Confirmed via real device logs to be
+# tied to squeezelite's ALSA output generally (present even with CamillaDSP
+# off), not just the DSP engine specifically.
+#
+# This used to be handled ad hoc by whichever script/endpoint triggered the
+# reboot (api_server.py's reboot/shutdown, the OS-update REBOOT handling) —
+# but ANY OTHER way to reboot bypassed both: `sudo reboot`/`sudo shutdown`
+# at a shell (hifi's sudoers grants these NOPASSWD), `systemctl reboot` /
+# `shutdown -r now` via logind/polkit, a factory reset, a physical power
+# button via ACPI+logind. Each of those was a fresh place to forget this.
+#
+# Running as the ExecStop= of a unit that is active from boot makes it
+# unconditional: it runs at the start of EVERY halt/poweroff/reboot/kexec,
+# however it was triggered, with no per-caller cooperation required (see the
+# .service file for the After= ordering that guarantees LMS and squeezelite
+# are still up at that point).
+set -eu
+
+# Capture wherever the internal player's playback currently is (playing/paused/
+# stopped, track, position) so the next boot can restore it, and pause the
+# Bluetooth speakers so they don't come back playing on their own (issue #124)
+# — see hifi-capture-playback-state.py and api_server.py's
+# _resume_playback_after_boot for the read side. Must run BEFORE squeezelite
+# and LMS are stopped -- the unit's After= ordering puts this ahead of both --
+# while a live status is still there to query. Best-effort: a failure
+# here (LMS unreachable, nothing playing) just means no resume next boot,
+# same as before this existed — never worth delaying a shutdown over.
+python3 /usr/local/sbin/hifi-capture-playback-state.py 2>/dev/null || true
+
+# Whatever feeds the DAC: squeezelite, or CamillaDSP / the player side's PCM
+# to DSD conversion behind the Loopback.
+# --no-block: during a shutdown they already have a stop job queued behind
+# this unit's, and a blocking `systemctl stop` would wait on it -- for this
+# very script to finish -- until TimeoutStopSec. Queued (or merged with the
+# job already there) it runs right after this exits, long before
+# device_shutdown() reaches the DMA controller.
+AUDIO_UNITS="camilladsp.service hifi-pcm2dsd-player.service squeezelite.service"
+for unit in $AUDIO_UNITS; do
+    if [ "$(systemctl is-active "$unit" 2>/dev/null)" = "active" ]; then
+        # shellcheck disable=SC2086
+        systemctl --no-block stop $AUDIO_UNITS 2>/dev/null || true
+        break
+    fi
+done
+exit 0

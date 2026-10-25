@@ -1,0 +1,345 @@
+// Le liste del browser (draw_rows in screen_main.c): righe per artisti,
+// brani, cartelle, playlist, radio, app, menu Jive e voci di plugin; griglia
+// a 3 colonne per gli album. Il modello e' Library (righe visibili).
+import QtQuick
+import Hifi
+import Hifi.Ui
+
+Item {
+    id: root
+    property int view: Library.view
+    property string pluginCmd: ""
+    signal rowTap(int row, bool onPlay)
+    signal rowLongPress(int row, real x, real y)
+    signal expandAlbum(int row, real x, real y, real size, string src)   // Cover Flow: the front cover opens
+    readonly property bool grid: view === LibraryModel.Albums || view === LibraryModel.NewMusic
+    // the albums as Cover Flow instead of the grid (Settings → Library, or
+    // the button in the crumb bar)
+    readonly property bool coverflow: grid && !!Ui.app && Ui.app.albumView === "coverflow"
+    // ...or as the discs of the CD changer, to load and play (ChangerView)
+    readonly property bool changer: grid && !!Ui.app && Ui.app.albumView === "changer"
+    readonly property bool search: view === LibraryModel.Search
+    readonly property int pitch: view === LibraryModel.Tracks || view === LibraryModel.PlaylistTracks ? 50
+                               : view === LibraryModel.Radios || view === LibraryModel.Apps ? 54 : 58
+    // 3 columns up to a 1067 canvas; wider canvases add columns (~260 each)
+    readonly property int cols: Math.max(3, Math.round(width / (Theme.bar ? 150 : 260)))
+    readonly property real cardW: (width - 12 * (cols - 1)) / cols
+    readonly property real cardH: cardW + 48
+    readonly property real devScale: Ui.app ? Ui.app.devicePixelScale : 1
+
+    // 🚨 UNA SOLA maschera (angoli tondi in alto) per tutte le schede della
+    // griglia: sono identiche, e prima ognuna si portava dietro la propria
+    // texture. A schermo grande erano megabyte per riquadro, buttati.
+    readonly property alias artMask: sharedArtMask
+    Rectangle {
+        id: sharedArtMask
+        width: Math.max(1, root.cardW); height: Math.max(1, root.cardW)
+        visible: false; radius: 12
+        layer.enabled: true; layer.smooth: true
+        layer.textureSize: Qt.size(Math.max(1, Math.ceil(root.cardW * root.devScale)),
+                                   Math.max(1, Math.ceil(root.cardW * root.devScale)))
+        Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 12 }
+    }
+    function scrollToRow(row) {
+        if (coverflow) flowView.scrollToRow(row)
+        else if (changer) changerView.scrollToRow(row)
+        else if (grid) gridView.positionViewAtIndex(row, GridView.Beginning)
+        else listView.positionViewAtIndex(row, ListView.Beginning)
+    }
+    function scrollTop() { listView.contentY = 0; gridView.contentY = 0; flowView.scrollTop(); changerView.scrollTop() }
+    // Where the list is scrolled right now, so the browser can bring us back
+    // here after opening an album/artist and stepping back (Browser.goView /
+    // loadTop). Cover Flow and the changer keep a centred album; the plain
+    // list and the grid keep a pixel offset (same rows on return, so it lands
+    // exactly where it was).
+    function scrollAnchor() {
+        if (coverflow) return { kind: "flow", row: flowView.cur }
+        if (changer) return { kind: "changer", row: changerView.cur }
+        if (grid) return { kind: "grid", y: gridView.contentY }
+        return { kind: "list", y: listView.contentY }
+    }
+    function restoreAnchor(a) {
+        if (!a) return
+        if (a.kind === "flow") { if (coverflow) flowView.scrollToRow(a.row); return }
+        if (a.kind === "changer") { if (changer) changerView.scrollToRow(a.row); return }
+        // 🚨 forceLayout first: a model that was just reset (Library.request)
+        // repositions at the top on its next layout, which would wipe the
+        // contentY we set. Laying it out now consumes that reset, so the
+        // offset below is the one that stays.
+        if (a.kind === "grid") { if (grid && !coverflow && !changer) {
+                gridView.forceLayout()
+                gridView.contentY = Math.max(0, Math.min(a.y, Math.max(0, gridView.contentHeight - gridView.height))) } return }
+        if (a.kind === "list") { if (!grid) {
+                listView.forceLayout()
+                listView.contentY = Math.max(0, Math.min(a.y, Math.max(0, listView.contentHeight - listView.height))) } }
+    }
+
+    // ─── Cover Flow of the albums ──────────────────────────────────────────
+    CoverFlow {
+        id: flowView
+        anchors.fill: parent
+        visible: root.coverflow
+        devScale: root.devScale
+        onRowTap: (row, onPlay) => root.rowTap(row, onPlay)
+        onRowLongPress: (row, x, y) => root.rowLongPress(row, x, y)
+        onExpand: (row, x, y, size, src) => root.expandAlbum(row, x, y, size, src)
+    }
+    // ─── the CD changer: the albums as discs, the changer behind them ──────
+    ChangerView {
+        id: changerView
+        anchors.fill: parent
+        visible: root.changer
+        devScale: root.devScale
+        onRowLongPress: (row, x, y) => root.rowLongPress(row, x, y)
+    }
+
+    // URL di un'icona di menu/radio: percorso sul server oppure http locale
+    function iconUrl(icon) {
+        if (!icon) return ""
+        if (icon.indexOf("http") === 0) {
+            var h = icon.indexOf("127.0.0.1"); if (h < 0) h = icon.indexOf("localhost")
+            if (h < 0) return ""
+            var slash = icon.indexOf("/", h); if (slash < 0) return ""
+            return Api.lmsBase + icon.substring(slash)
+        }
+        return Api.lmsBase + "/" + (icon.charAt(0) === "/" ? icon.substring(1) : icon)
+    }
+
+    // ─── righe ─────────────────────────────────────────────────────────────
+    ListView {
+        id: listView
+        anchors.fill: parent
+        visible: !root.grid
+        model: root.grid ? null : Library
+        spacing: 4
+        clip: true
+        flickDeceleration: 1500; maximumFlickVelocity: 4000
+        boundsBehavior: Flickable.StopAtBounds
+        cacheBuffer: 200
+        // i risultati della ricerca in tre fasce: artisti, album, brani
+        section.property: root.search ? "section" : ""
+        section.criteria: ViewSection.FullString
+        section.delegate: Item {
+            required property string section
+            width: listView.width; height: 30
+            Text {
+                x: 4; anchors.bottom: parent.bottom; anchors.bottomMargin: 6
+                text: Tr.up(section === "0" ? "player.titles.artists" : section === "1" ? "player.titles.albums" : "player.search.tracks")
+                color: Theme.silverA(0.6); font.family: Theme.font; font.pixelSize: 11; font.bold: true; font.letterSpacing: 2
+            }
+        }
+        delegate: Item {
+            id: row
+            required property int index
+            required property string id
+            required property string text
+            required property string sub
+            required property string icon
+            required property var go
+            required property var play
+            required property bool isDir
+            required property bool hasItems
+            required property bool isAudio
+            required property bool hasInput          // nodo che chiede del testo (ricerca dei plugin)
+            required property int kind               // ricerca: 0 artista, 1 album, 2 brano
+            width: listView.width; height: root.pitch - 4
+            readonly property int v: root.view
+            readonly property bool playBtn: v === LibraryModel.Artists || v === LibraryModel.Composers || v === LibraryModel.Playlists || v === LibraryModel.Folders ||
+                                            v === LibraryModel.Genres || v === LibraryModel.Years ||
+                                            ((v === LibraryModel.MenuHome || v === LibraryModel.Menu) && play && play.length > 0) ||
+                                            (v === LibraryModel.PluginItems && isAudio) || (v === LibraryModel.Search && kind !== 2)
+            readonly property real iconW: v === LibraryModel.Artists || v === LibraryModel.Composers || v === LibraryModel.Playlists || v === LibraryModel.Search ? 28
+                                        : v === LibraryModel.Tracks || v === LibraryModel.PlaylistTracks ? 13
+                                        : v === LibraryModel.Folders || v === LibraryModel.Genres || v === LibraryModel.Years ? 15 : 24
+            // 🚨 the scale goes on the DRAWING, not on the delegate: RowTap
+            // fills the delegate, and scaling that too would shrink the touch
+            // area exactly while the finger holds it (a touch near the edge
+            // would be lost).
+            Item {
+                id: skin
+                anchors.fill: parent
+                scale: rowTap.tapScale
+                // active:bg-hifi-light (bianco 5 % su #161616 era ~#161616: il tocco non si vedeva)
+                Rectangle { anchors.fill: parent; radius: 8; color: rowTap.mix(Theme.surface, Theme.light) }
+                // icona a sinistra
+                Item {
+                    x: 12; anchors.verticalCenter: parent.verticalCenter; width: row.iconW; height: row.iconW
+                    Rectangle { anchors.fill: parent; radius: 14; color: Theme.light; visible: row.v === LibraryModel.Artists || row.v === LibraryModel.Composers || (row.v === LibraryModel.Search && row.kind !== 2) }
+                    Rectangle { anchors.fill: parent; radius: 8; color: Theme.light; visible: row.v === LibraryModel.Playlists }
+                    Image {
+                        id: rowImg
+                        anchors.fill: parent
+                        visible: false
+                        source: (row.v >= LibraryModel.Radios) ? root.iconUrl(row.icon) : ""
+                        asynchronous: true; cache: true; smooth: true
+                        sourceSize.width: Math.round(24 * root.devScale * 2); sourceSize.height: Math.round(24 * root.devScale * 2)
+                        fillMode: Image.PreserveAspectCrop
+                        layer.enabled: true
+                        layer.smooth: true
+                        layer.textureSize: Qt.size(Math.ceil(24 * root.devScale * 2), Math.ceil(24 * root.devScale * 2))
+                    }
+                    Rectangle { id: rowMask; anchors.fill: parent; radius: 4; visible: false; layer.enabled: true; layer.smooth: true
+                                layer.textureSize: Qt.size(Math.ceil(width * root.devScale * 2), Math.ceil(height * root.devScale * 2)) }
+                    ShaderImage { anchors.fill: parent; source: rowImg; mask: rowMask; visible: rowImg.status === Image.Ready }
+                    Icon {
+                        anchors.centerIn: parent
+                        visible: rowImg.status !== Image.Ready
+                        name: row.v === LibraryModel.Artists ? "user" : row.v === LibraryModel.Composers ? "piano" : row.v === LibraryModel.Playlists ? "list-music"
+                            : row.v === LibraryModel.Genres ? "tag" : row.v === LibraryModel.Years ? "calendar"
+                            : row.v === LibraryModel.Search ? (row.kind === 0 ? "user" : row.kind === 1 ? "disc" : "music")
+                            : row.v === LibraryModel.Folders ? (row.isDir ? "folder" : "music")
+                            : row.v === LibraryModel.Radios ? "radio" : row.v === LibraryModel.Apps ? "app-window"
+                            : row.v === LibraryModel.PluginItems ? (row.hasInput ? "search" : row.hasItems ? "folder" : "music")   // lente sul nodo di ricerca, come Electron
+                            : (row.v === LibraryModel.MenuHome || row.v === LibraryModel.Menu) ? ((row.go && row.go.length) ? "app-window" : "music") : "music"
+                        size: row.v === LibraryModel.Artists || row.v === LibraryModel.Composers || (row.v === LibraryModel.Search && row.kind !== 2) ? 13 : row.v === LibraryModel.Playlists ? 14 : row.v === LibraryModel.Folders || row.v === LibraryModel.Genres || row.v === LibraryModel.Years ? 15 : row.v === LibraryModel.Tracks || row.v === LibraryModel.PlaylistTracks ? 13 : 15
+                        color: row.v === LibraryModel.Artists || row.v === LibraryModel.Composers || row.v === LibraryModel.Playlists || (row.v === LibraryModel.Search && row.kind !== 2) ? Theme.silver
+                             : (row.v === LibraryModel.Folders && row.isDir) || row.v === LibraryModel.Genres || row.v === LibraryModel.Years ? Theme.gold : Theme.silverA(0.6)
+                    }
+                }
+                Text {
+                    x: 12 + row.iconW + 12; anchors.verticalCenter: parent.verticalCenter
+                    width: parent.width - x - (row.playBtn ? 48 : 12)
+                    text: row.text; elide: Text.ElideRight
+                    color: Theme.white; font.family: Theme.font; font.pixelSize: 14
+                }
+                // il brano che cerca il proprio artista: righe con la seconda riga (album/artista) quando c'e'
+                Text {
+                    visible: row.v === LibraryModel.Search && row.sub !== ""
+                    x: 12 + row.iconW + 12; y: parent.height / 2 + 2
+                    width: parent.width - x - (row.playBtn ? 48 : 12)
+                    text: row.sub; elide: Text.ElideRight
+                    color: Theme.silverA(0.6); font.family: Theme.font; font.pixelSize: 11
+                }
+                Rectangle {                                   // pulsante play a destra (opacity-70, active:opacity-100)
+                    id: rowPlay
+                    visible: row.playBtn
+                    x: parent.width - 12 - 28; anchors.verticalCenter: parent.verticalCenter; width: 28; height: 28; radius: 14
+                    color: Theme.goldA(0.2)
+                    // 🚨 pressX is frozen at the press: with mouseX the circle
+                    // went dark the moment the finger drifted a point out of its half
+                    opacity: 0.7 + 0.3 * (rowTap.pressX >= x ? rowTap.pressAnim : 0)
+                    Icon { anchors.centerIn: parent; anchors.horizontalCenterOffset: 2; name: "play"; filled: true; size: 12; color: Theme.gold }
+                }
+            }
+            RowTap {
+                id: rowTap
+                flick: listView; tap: 0.98; holdRing: true
+                onClicked: (m) => root.rowTap(row.index, row.playBtn && m.x >= width - 48)
+                onLongPress: (x, y) => root.rowLongPress(row.index, row.mapToItem(root, x, y).x, row.mapToItem(root, x, y).y)
+            }
+            // The play button as a remote stop of its own (right from the
+            // row). It takes no touch: OK presses its centre and the touch goes
+            // to rowTap, which tells from x that it is the play — as a finger.
+            Item {
+                property bool navigable: true
+                visible: row.playBtn
+                x: row.width - 12 - 28 - 4; anchors.verticalCenter: parent.verticalCenter; width: 36; height: 36
+                NavRing { radius: 18 }
+            }
+        }
+        ScrollBar_ { flick: listView }
+    }
+
+    // ─── griglia degli album ───────────────────────────────────────────────
+    GridView {
+        id: gridView
+        // 🚨 12 punti oltre il bordo destro, di proposito: le celle di una
+        // GridView sono tutte uguali e comprendono il distacco, quindi tre
+        // colonne da (cardW + 12) valgono la larghezza della vista PIU' un
+        // distacco. Senza questo margine la terza colonna non entrava mai e
+        // la griglia ripiegava su due. L'ultima scheda finisce comunque a
+        // filo del bordo (il distacco in piu' cade fuori, vuoto), come la
+        // griglia di Electron (grid-cols-3 gap-3).
+        anchors.fill: parent
+        anchors.rightMargin: -12
+        visible: root.grid && !root.coverflow && !root.changer
+        model: root.grid && !root.coverflow && !root.changer ? Library : null
+        cellWidth: root.cardW + 12; cellHeight: root.cardH + 12
+        clip: true
+        flickDeceleration: 1500; maximumFlickVelocity: 4000
+        boundsBehavior: Flickable.StopAtBounds
+        cacheBuffer: 300
+        delegate: Item {
+            id: card
+            required property int index
+            required property string id
+            required property string text
+            required property string sub
+            required property string art
+            width: root.cardW; height: root.cardH
+            // 🚨 the play circle has no touch area of its own: the card's
+            // covers it and would take the press anyway (it already did, and
+            // the circle never lit up). cardTap decides the zone, and the
+            // colour follows the press from there.
+            readonly property real playCx: root.cardW - 6 - 15
+            readonly property bool playHit: Math.abs(cardTap.pressX - playCx) <= 18 && Math.abs(cardTap.pressY - playCx) <= 18
+            readonly property real playF: playHit ? cardTap.pressAnim : 0
+            // the scale on the drawing, not on the delegate (see the list row)
+            Item {
+                id: cardSkin
+                anchors.fill: parent
+                scale: cardTap.tapScale
+                Rectangle { anchors.fill: parent; radius: 12; color: cardTap.mix(Theme.surface, Theme.wa(0.05)); border.width: 1; border.color: Theme.border }
+                Item {
+                    id: artBox
+                    width: root.cardW; height: root.cardW
+                    DiagonalFallback { anchors.fill: parent; radius: 12; visible: artImg.status !== Image.Ready
+                                Icon { anchors.centerIn: parent; name: "disc"; size: 40; color: Theme.silverA(0.2) } }
+                    Image {
+                        id: artImg; anchors.fill: parent; visible: false
+                        // 🚨 stessa forma di indirizzo del kiosk Electron (`cover?size=`):
+                        // con `cover_<W>x<H>_o.jpg` alcune copertine restavano nere,
+                        // perche' Lyrion non sa sempre produrre quella variante.
+                        // La misura segue lo schermo: 300 sulla tela 1 a 1, fino a 1200 a 4K.
+                        readonly property int px: Theme.coverPx(root.cardW)
+                        source: card.art ? Api.lmsBase + "/music/" + card.art + "/cover?size=" + px : ""
+                        asynchronous: true; cache: true; fillMode: Image.PreserveAspectCrop
+                        smooth: true
+                        // 🚨 Si decodifica ESATTAMENTE alla misura che Lyrion serve
+                        // (Theme.coverPx, al massimo 1200): chiedere il doppio dei pixel
+                        // dello schermo ingrandiva un'immagine che piu' dettaglio non ne
+                        // ha, e sprecava megabyte di memoria video per riquadro. E' da li'
+                        // che venivano le copertine nere a caso: finita la memoria della
+                        // scheda video, qualche texture non si alloca piu' e resta il vuoto
+                        // (ricaricando l'elenco ne toccavano altre, e sembrava casuale).
+                        sourceSize.width: artImg.px; sourceSize.height: artImg.px
+                        // 🚨 la texture che la mascheratura usa deve stare alla risoluzione
+                        // dello SCHERMO (non a quella in punti, o si vede seghettata; non al
+                        // doppio, o si spreca memoria video per un dettaglio che non c'e')
+                        layer.enabled: true
+                        layer.smooth: true
+                        layer.textureSize: Qt.size(Math.ceil(root.cardW * root.devScale), Math.ceil(root.cardW * root.devScale))
+                    }
+                    // angoli tondi solo in alto (rounded-t-xl): la maschera e' UNA SOLA per
+                    // tutte le schede (sono identiche), non una per riquadro — vedi
+                    // sharedArtMask in fondo al file
+                    ShaderImage { anchors.fill: parent; source: artImg; mask: root.artMask; visible: artImg.status === Image.Ready }
+                    // shadow-lg = 0 10px 15px -3px + 0 4px 6px -4px, nero al 10 %
+                    BoxShadow { targetX: parent.width - 36; targetY: parent.height - 36; targetW: 30; targetH: 30; radius: 15; blur: 15; spread: -3; offsetY: 10; color: Theme.blackA(0.1) }
+                    BoxShadow { targetX: parent.width - 36; targetY: parent.height - 36; targetW: 30; targetH: 30; radius: 15; blur: 6; spread: -4; offsetY: 4; color: Theme.blackA(0.1) }
+                    Rectangle {
+                        x: parent.width - 6 - 30; y: parent.height - 6 - 30; width: 30; height: 30; radius: 15
+                        color: Theme.mix(Theme.blackA(0.6), Theme.gold, card.playF)      // active:bg-hifi-gold active:text-black
+                        Icon { anchors.centerIn: parent; anchors.horizontalCenterOffset: 2; name: "play"; filled: true; size: 14; color: Theme.white; pressColor: Theme.black; press: card.playF }
+                    }
+                }
+                Text { x: 8; y: artBox.height + 8; width: parent.width - 16; height: 16; verticalAlignment: Text.AlignVCenter; text: card.text; elide: Text.ElideRight; color: Theme.white; font.family: Theme.font; font.pixelSize: 12 }
+                Text { x: 8; y: artBox.height + 24; width: parent.width - 16; height: 16; verticalAlignment: Text.AlignVCenter; text: card.sub; elide: Text.ElideRight; color: Theme.silverA(0.7); font.family: Theme.font; font.pixelSize: 12 }
+            }
+            RowTap {
+                id: cardTap
+                flick: gridView; tap: 0.98; holdRing: true
+                onClicked: (m) => root.rowTap(card.index, Math.abs(m.x - card.playCx) <= 18 && Math.abs(m.y - card.playCx) <= 18)
+                onLongPress: (x, y) => root.rowLongPress(card.index, card.mapToItem(root, x, y).x, card.mapToItem(root, x, y).y)
+            }
+            // the card's play button as a remote stop, like the rows'
+            Item {
+                property bool navigable: true
+                x: card.playCx - 18; y: card.playCx - 18; width: 36; height: 36
+                NavRing { radius: 18 }
+            }
+        }
+        // la vista sborda di 12 a destra: la barra sta sul bordo VISIBILE
+        ScrollBar_ { flick: gridView; x: gridView.width - 12 - 3 }
+    }
+}

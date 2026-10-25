@@ -1,0 +1,26 @@
+# HiFi Player - allow the kiosk user to run the system-control commands
+# used by api_server.py without a password prompt.
+#
+# Keep these as TIGHT as possible: this file is the kiosk user's entire
+# privilege surface, and anything reachable from a compromised kiosk session is
+# reachable through it. In particular `apt-get upgrade *` is NOT used — the
+# trailing wildcard would allow `-o DPkg::Pre-Invoke=<cmd>` /
+# `-o APT::Update::Pre-Invoke` which run arbitrary commands as root. Pin the
+# exact invocation instead.
+#
+# The human SSH/console login is a DIFFERENT account: created from the admin
+# credential in the provisioning wizard (api_server.py set_shell_account) and
+# given real sudo via 'sudo' group membership, so it never needs an entry here.
+# 'hifi' stays out of the 'sudo' group — see 0002-security-hardening.sh, which
+# re-asserts that on every OS update.
+hifi ALL=(ALL) NOPASSWD: /sbin/reboot, /sbin/shutdown, /usr/sbin/reboot, /usr/sbin/shutdown
+hifi ALL=(ALL) NOPASSWD: /usr/bin/apt-get update, /usr/bin/apt-get upgrade -y, /usr/bin/apt-get install -y openssh-server
+# No `ip` and no `dhclient`: with free arguments they were a root shell
+# (`ip netns exec <ns> /bin/sh`, `dhclient -sf <script>`), and nothing running
+# as hifi calls them — the only `sudo ip` / `sudo dhclient` are in
+# api_server.py's configure_network, and hifi-api.service runs as root.
+hifi ALL=(ALL) NOPASSWD: /usr/bin/nmcli *
+# SSH on/off toggle (Settings). Pin the exact unit names — no wildcard.
+hifi ALL=(ALL) NOPASSWD: /usr/bin/systemctl enable --now ssh.service, /usr/bin/systemctl disable --now ssh.service, /usr/bin/systemctl enable --now sshd.service, /usr/bin/systemctl disable --now sshd.service
+# DSP engine on/off toggle (Settings → DSP). Pin the exact unit name.
+hifi ALL=(ALL) NOPASSWD: /usr/bin/systemctl enable --now camilladsp.service, /usr/bin/systemctl disable --now camilladsp.service

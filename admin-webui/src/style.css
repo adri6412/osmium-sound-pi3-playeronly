@@ -1,0 +1,514 @@
+/* Osmium Sound web admin — visual language borrowed from the kiosk (gold on
+   near-black, soft cards, silver secondary text) without being a clone. */
+:root {
+  --bg: #0a0a0a;          /* kiosk hifi-dark */
+  --panel: #0f0f0f;       /* kiosk hifi-panel */
+  --surface: #161616;     /* kiosk hifi-surface */
+  --light: #2a2a2a;       /* kiosk hifi-light */
+  --border: #252525;      /* kiosk hifi-border */
+  --text: #f2f2f2;
+  --muted: #9a9a9a;       /* silver-ish */
+  --silver: #c0c0c0;
+  --gold: #d4af37;        /* kiosk hifi-gold */
+  --gold-dim: rgba(212, 175, 55, 0.15);
+  --danger: #e05a5a;
+  --ok: #6fca6f;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--gold); text-decoration: none; }
+a:hover { filter: brightness(1.15); }
+
+.topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 22px; border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  position: sticky; top: 0; z-index: 10;
+}
+/* the mark: seven gold bars, OSMIUM in gold, SOUND in off-white (the logo's) */
+.brand { display: inline-flex; align-items: center; gap: 7px; font-weight: 700; letter-spacing: 2px; font-size: 14px; color: var(--gold); }
+.brand .bars { height: 10px; width: auto; fill: var(--gold); flex: none; }
+.brand .ink { color: #f1f0ea; margin-left: 3px; }
+.topbar-actions { display: flex; align-items: center; gap: 8px; }
+.topbar-link {
+  padding: 10px 14px; border-radius: 10px; font-size: 14px; font-weight: 500;
+  color: var(--gold); border: 1px solid rgba(212, 175, 55, 0.4);
+}
+
+.wrap { max-width: 760px; margin: 0 auto; padding: 22px 18px 60px; }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 20px;
+  margin: 16px 0;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
+}
+.card h3 {
+  margin: 0 0 6px; font-size: 15px; font-weight: 600;
+  display: flex; align-items: center; gap: 8px;
+}
+.card h3 .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--gold); display: inline-block; }
+.card .sub { color: var(--muted); font-size: 13px; margin: 0 0 14px; line-height: 1.45; }
+
+/* Breaks out of .wrap's 760px cap for cards with denser content (e.g. the
+   Sources panel's source rows: name + path + up to 3 buttons per row get
+   cramped at 760px). Only applies above 900px viewport width, where .wrap
+   is guaranteed to sit at its own max-width (760px box, 724px content
+   after its 18px+18px padding) -- so a fixed symmetric negative margin
+   keeps this card centered on the same point .wrap already centers on
+   (which is the viewport center, since .wrap uses margin:0 auto), without
+   any vw-based math. A first attempt used `calc(50% - 50vw)` (the classic
+   full-bleed trick) but that formula only centers an edge-to-edge (100vw)
+   element -- for a capped width like this it pins the card to the left
+   edge instead, which is what shipped and was reported broken. */
+@media (min-width: 900px) {
+  .card.wide {
+    width: 880px;
+    max-width: calc(100vw - 40px);
+    margin-left: -78px;
+    margin-right: -78px;
+  }
+}
+
+.muted { color: var(--muted); font-size: 13px; }
+.silver { color: var(--silver); }
+.gold { color: var(--gold); }
+
+label { display: block; font-size: 12.5px; color: var(--muted); margin: 12px 0 5px; }
+input, select {
+  width: 100%; padding: 12px 13px; border-radius: 10px;
+  border: 1px solid var(--border); background: var(--panel); color: var(--text);
+  font-size: 14.5px; outline: none;
+}
+input:focus, select:focus { border-color: rgba(212, 175, 55, 0.5); }
+
+button, a.secondary {
+  cursor: pointer; padding: 11px 16px; border-radius: 10px; border: 0;
+  background: var(--gold); color: #111; font-weight: 600; font-size: 14px;
+  transition: filter 0.15s ease;
+}
+button:hover, a.secondary:hover { filter: brightness(1.1); }
+button.secondary, a.secondary {
+  background: var(--light); color: var(--text); border: 1px solid var(--border);
+  font-weight: 500; text-decoration: none; display: inline-block;
+}
+button.ghost { background: transparent; color: var(--silver); border: 1px solid var(--border); font-weight: 500; }
+button.danger { background: rgba(224, 90, 90, 0.12); color: #f0b4b4; border: 1px solid rgba(224, 90, 90, 0.4); }
+button.ghost.active { border-color: var(--gold); color: var(--gold); background: var(--gold-dim); }
+button:disabled { opacity: 0.55; cursor: default; filter: none; }
+
+/* File-picker trigger styled like a secondary button (native <input type=file>
+   can't be restyled directly, so we style the <label for> that wraps it). */
+label.upload-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 11px 16px; border-radius: 10px; cursor: pointer; margin: 0;
+  background: var(--light); color: var(--text); border: 1px solid var(--border);
+  font-weight: 500; font-size: 14px;
+}
+label.upload-btn:hover { filter: brightness(1.1); }
+
+.row { display: flex; gap: 10px; align-items: center; }
+.row > * { flex: 1; }
+.row .fit { flex: 0 0 auto; }
+.between { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 14px; }
+.tile {
+  display: flex; flex-direction: column; gap: 6px; padding: 22px 20px; border-radius: 16px;
+  background: var(--surface); border: 1px solid var(--border); color: var(--text);
+  transition: border-color 0.15s ease;
+}
+.tile:hover { border-color: rgba(212, 175, 55, 0.5); }
+.tile .t { font-weight: 600; }
+
+.msg { border-radius: 10px; padding: 11px 13px; margin: 10px 0; background: var(--panel); font-size: 13px; border: 1px solid var(--border); }
+.msg.err { background: rgba(224, 90, 90, 0.1); color: #f0b4b4; border-color: rgba(224, 90, 90, 0.35); }
+
+/* Kiosk-like pill toggle */
+.toggle {
+  position: relative; width: 46px; height: 26px; flex: 0 0 auto;
+  border-radius: 999px; background: var(--light); border: 1px solid var(--border);
+  cursor: pointer; transition: background 0.15s ease; padding: 0;
+}
+.toggle.on { background: var(--gold); border-color: var(--gold); }
+.toggle .knob {
+  position: absolute; top: 2px; left: 2px; width: 20px; height: 20px;
+  border-radius: 50%; background: #fff; transition: transform 0.15s ease;
+}
+.toggle.on .knob { transform: translateX(20px); }
+.toggle:disabled { opacity: 0.5; cursor: default; }
+
+.item { padding: 11px 4px; border-bottom: 1px solid var(--border); }
+.item:last-child { border-bottom: 0; }
+.net { padding: 11px 4px; border-bottom: 1px solid var(--border); cursor: pointer; }
+.net:hover { background: rgba(255, 255, 255, 0.02); }
+.net:last-child { border-bottom: 0; }
+.check { color: var(--gold); font-weight: 700; }
+/* the network interfaces, as the kiosk lists them: the one in use in gold */
+.ifaces { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; margin: 6px 0 14px; }
+.iface { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); min-width: 0; }
+.iface .nm { font-weight: 600; }
+.iface .ad { margin-left: auto; font-family: ui-monospace, monospace; font-size: 13px; opacity: 0.75; overflow: hidden; text-overflow: ellipsis; }
+.iface.on { border-color: rgba(212, 175, 55, 0.6); color: var(--gold); background: rgba(212, 175, 55, 0.08); }
+/* The band of a Wi-Fi network, shown only when the same name is on more
+   than one of them (2.4 / 5 GHz) — the only thing telling the rows apart. */
+.band { color: var(--gold); border: 1px solid var(--border); border-radius: 4px;
+  padding: 1px 6px; font-size: 11px; margin-left: 6px; white-space: nowrap; }
+
+.pill { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px; border: 1px solid var(--border); color: var(--silver); }
+.pill.gold { border-color: rgba(212, 175, 55, 0.5); color: var(--gold); background: var(--gold-dim); }
+
+/* Accordion bands — the Music sources page (SourcesPanel.vue) is four of
+   these, and the "add source"/"shared folders" bands nest one level of the
+   same thing. The header reuses .net.between so it reads like the section
+   rows in the Settings menu; a nested .acc sits on --surface to stay
+   distinguishable from its parent's --panel. */
+.acc { border: 1px solid var(--border); border-radius: 12px; background: var(--panel); margin: 10px 0; overflow: hidden; }
+.acc > .net { border-bottom: 0; padding: 13px 14px; }
+.acc.open > .net { border-bottom: 1px solid var(--border); }
+.acc > .acc-body { padding: 6px 14px 14px; }
+.acc .acc { background: var(--surface); }
+.acc .chev { color: var(--silver); font-size: 18px; flex: 0 0 auto; }
+
+/* Segmented control: one row of joined buttons, as wide as its labels. The
+   container background is the colour the 1px gaps show once it wraps on a
+   phone (see below) -- there are no gaps here, so it never shows. Painting the
+   buttons (rather than leaving them transparent) is what makes that work; it
+   is the --surface every .seg in this app sits on, cards and the modal cards
+   in SourcesPanel/Setup alike, so nothing changes where it doesn't wrap. */
+.seg {
+  display: inline-flex; max-width: 100%;
+  background: var(--border);
+  border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+  margin-bottom: 12px;
+}
+.seg button { border-radius: 0; background: var(--surface); color: var(--silver); font-weight: 500; padding: 9px 16px; }
+.seg button.active { background: var(--gold); color: #111; font-weight: 600; }
+/* Inside a flex row the seg is one item among others; the row owns the spacing. */
+.between > .seg, .row > .seg { margin-bottom: 0; }
+
+/* Phones. A five-way control (Playback -> track transition) is wider than the
+   screen, and as one unbreakable row it ran off the card and dragged the whole
+   page sideways with it. Let it wrap; the buttons of each wrapped row stretch
+   to fill it so no bare strip is left at the end of a short last row, and the
+   1px gaps become the dividers -- including between the rows, which a
+   border-left per button would not draw (it would draw none there and a stray
+   one at the start of every row after the first).
+   Only below the .wrap column width: above it every seg already fits on one
+   line, and stretching there would re-size each control to the full width of
+   its card, wrapped, for no reason. */
+@media (max-width: 760px) {
+  .seg { flex-wrap: wrap; gap: 1px; }
+  .seg button { flex: 1 1 auto; }
+}
+/* A label and a multi-option seg each want the whole width of a phone; side by
+   side, the last option ended up cut off by the screen edge (Updates ->
+   release channel). Opt a row into stacking with this class rather than
+   wrapping every .between: a flex line breaks on the items' *unshrunk* widths,
+   so a blanket `flex-wrap: wrap` would also drop the trailing toggle of every
+   label+description row onto its own line long before that row was actually
+   too narrow for it. */
+@media (max-width: 560px) {
+  .between.stack-narrow { flex-wrap: wrap; }
+  .between.stack-narrow > * { flex-basis: 100%; }
+}
+
+.qrbox { display: inline-flex; flex-direction: column; align-items: center; background: #fff; border-radius: 14px; padding: 14px; }
+.qrbox img { display: block; width: 190px; height: 190px; }
+
+.center { min-height: 72vh; display: flex; align-items: center; justify-content: center; }
+
+/* Network paths / credentials: label in the first column, the value itself in
+   the second, selectable in one click (user-select: all) since it is meant to
+   be copied into a file manager. */
+.pathlist { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin-top: 7px; align-items: baseline; }
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px; color: var(--silver); word-break: break-all; user-select: all;
+}
+ol.steps { margin: 14px 0 0; padding-left: 20px; color: var(--silver); font-size: 13px; line-height: 1.5; }
+ol.steps li { margin-bottom: 8px; }
+
+/* Forced blocking modal (updates) */
+.overlay {
+  position: fixed; inset: 0; z-index: 100;
+  background: rgba(0, 0, 0, 0.75); backdrop-filter: blur(3px);
+  display: flex; align-items: center; justify-content: center;
+}
+.spinner {
+  width: 38px; height: 38px; margin: 6px auto 14px;
+  border: 3px solid var(--light); border-top-color: var(--gold);
+  border-radius: 50%; animation: spin 0.9s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.backlink { display: inline-flex; align-items: center; gap: 6px; margin-bottom: 4px; font-size: 14px; }
+h2.page { font-size: 20px; margin: 10px 0 4px; }
+
+/* ── File manager ──────────────────────────────────────────────────────
+   A graphical file explorer, in the same gold-on-near-black language as the
+   rest: a places rail on the left, a path bar across the top, and folders as
+   tiles you can see rather than as rows of text. Below 760px the rail turns
+   into a scrolling strip of chips, which is the only way it fits a phone
+   without taking the whole first screen. */
+.ic { flex: 0 0 auto; vertical-align: -0.15em; }
+
+.fm { display: grid; grid-template-columns: 178px 1fr; gap: 14px; align-items: start; }
+/* 🚨 A grid item defaults to min-width:auto, so the places rail — a flex row
+   on a phone — sizes to its content and drags the whole page sideways
+   instead of scrolling inside its own column. */
+.fm > * { min-width: 0; }
+@media (max-width: 760px) { .fm { grid-template-columns: 1fr; } }
+
+.fm-side { display: flex; flex-direction: column; gap: 2px; }
+@media (max-width: 760px) {
+  /* A horizontal strip: the places stay one tap away without pushing the
+     files themselves off the first screen. */
+  .fm-side { flex-direction: row; overflow-x: auto; padding-bottom: 4px; gap: 6px; }
+  /* 🚨 width:100% below is for the rail; kept here every chip would be as
+     wide as the strip, so one place filled the screen and the rest lived off
+     the right edge. */
+  .fm-side .fm-place { flex: 0 0 auto; width: auto; }
+}
+.fm-side .lbl {
+  font-size: 11px; letter-spacing: 1.4px; text-transform: uppercase;
+  color: var(--muted); padding: 2px 8px 6px;
+}
+@media (max-width: 760px) { .fm-side .lbl { display: none; } }
+.fm-place {
+  display: flex; align-items: center; gap: 9px;
+  padding: 8px 10px; border-radius: 9px; cursor: pointer;
+  color: var(--silver); font-size: 13px; line-height: 1.2;
+  border: 1px solid transparent; background: transparent;
+  text-align: left; width: 100%; font-weight: 500;
+}
+.fm-place:hover { background: var(--light); color: var(--text); }
+.fm-place.on { background: var(--gold-dim); border-color: rgba(212, 175, 55, 0.4); color: var(--gold); }
+.fm-place span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Path bar — the breadcrumb, as a control rather than a sentence. */
+.fm-bar {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 10px;
+}
+.fm-path {
+  flex: 1 1 auto; min-width: 0;
+  display: flex; align-items: center; gap: 2px; flex-wrap: wrap;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 6px 8px; min-height: 38px;
+}
+.fm-crumb {
+  background: transparent; border: 0; color: var(--silver);
+  padding: 3px 7px; border-radius: 7px; font-size: 13px; cursor: pointer;
+  font-weight: 500; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.fm-crumb:hover { background: var(--light); color: var(--text); }
+.fm-crumb.here { color: var(--gold); cursor: default; }
+.fm-crumb.here:hover { background: transparent; }
+.fm-path .sep { color: var(--muted); font-size: 12px; }
+
+/* Square icon buttons: up, and the view switch. */
+.fm-ib {
+  flex: 0 0 auto; width: 38px; height: 38px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--panel); color: var(--silver);
+  border: 1px solid var(--border); border-radius: 10px; cursor: pointer;
+}
+.fm-ib:hover:not(:disabled) { background: var(--light); color: var(--text); }
+.fm-ib.on { background: var(--gold-dim); border-color: rgba(212, 175, 55, 0.45); color: var(--gold); }
+.fm-ib:disabled { opacity: 0.4; cursor: default; }
+.fm-views { display: flex; gap: 4px; flex: 0 0 auto; }
+
+/* Action bar. Buttons keep their label on a wide screen and drop to the icon
+   alone on a phone, where six labelled buttons would wrap into three rows. */
+.fm-tools { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.fm-tools button {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 8px 12px; font-size: 13px; font-weight: 500;
+  background: var(--panel); color: var(--silver);
+  border: 1px solid var(--border); border-radius: 9px;
+}
+.fm-tools button:hover:not(:disabled) { background: var(--light); color: var(--text); filter: none; }
+.fm-tools button:disabled { opacity: 0.4; }
+.fm-tools button.danger { color: #f0b4b4; }
+.fm-tools button.primary { color: var(--gold); border-color: rgba(212, 175, 55, 0.4); }
+@media (max-width: 560px) { .fm-tools button .t { display: none; } }
+
+/* Tiles. */
+.fm-grid {
+  display: grid; gap: 8px;
+  /* 96px is what puts three tiles across a 360px phone; wider and it drops
+     to two, which reads as a list with pictures rather than as an explorer. */
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+}
+.fm-tile {
+  position: relative; display: flex; flex-direction: column; align-items: center;
+  gap: 7px; padding: 13px 6px 10px; border-radius: 11px; cursor: pointer;
+  border: 1px solid transparent; background: var(--panel);
+  color: var(--text); text-align: center;
+}
+.fm-tile:hover { background: var(--light); }
+.fm-tile.sel { background: var(--gold-dim); border-color: rgba(212, 175, 55, 0.45); }
+.fm-tile .gl { color: var(--gold); }
+.fm-tile .gl.file { color: var(--muted); }
+.fm-tile .nm {
+  font-size: 12.5px; line-height: 1.3; width: 100%;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden; overflow-wrap: anywhere;
+}
+
+/* Rows (the detail view). */
+.fm-list { display: flex; flex-direction: column; }
+.fm-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 10px; border-radius: 9px; cursor: pointer;
+  border: 1px solid transparent; background: transparent; color: var(--text);
+  width: 100%; text-align: left; font-size: 13.5px;
+}
+.fm-row:hover { background: var(--light); }
+.fm-row.sel { background: var(--gold-dim); border-color: rgba(212, 175, 55, 0.45); }
+.fm-row .gl { color: var(--gold); }
+.fm-row .gl.file { color: var(--muted); }
+.fm-row .nm { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fm-row .meta { flex: 0 0 auto; color: var(--muted); font-size: 12px; }
+@media (max-width: 560px) { .fm-row .meta.date { display: none; } }
+
+/* The selection checkbox, in the corner of a tile and at the head of a row.
+   Always drawn (not hover-only): on a touch screen there is no hover, and a
+   control you cannot see is a control that does not exist. */
+.fm-pick {
+  flex: 0 0 auto; width: 18px; height: 18px; border-radius: 5px;
+  border: 1px solid var(--light); background: var(--bg);
+  display: inline-flex; align-items: center; justify-content: center;
+  color: transparent; cursor: pointer; padding: 0;
+}
+.fm-pick.on { background: var(--gold); border-color: var(--gold); color: #111; }
+.fm-tile .fm-pick { position: absolute; top: 7px; left: 7px; }
+
+.fm-empty {
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  padding: 34px 10px; color: var(--muted); font-size: 13px; text-align: center;
+}
+.fm-empty .ic { color: var(--light); }
+
+/* Progress of a copy/move/delete. */
+.fm-prog { height: 4px; border-radius: 2px; background: var(--light); overflow: hidden; margin-top: 8px; }
+.fm-prog i { display: block; height: 100%; background: var(--gold); }
+/* The count line every file manager has along the bottom. */
+.fm-status {
+  display: flex; gap: 14px; margin-top: 12px; padding-top: 10px;
+  border-top: 1px solid var(--border); color: var(--muted); font-size: 12px;
+}
+
+/* The first screen: not five identical folders but a card per place, the way
+   "This PC" shows drives — the icon says what kind of thing it is and the
+   line under the name says what is actually in it (room left for the
+   player's own storage, how many disks or shares for the mount points).
+   Without that second line "Music on this player" and "Internal disks" read
+   as the same thing, which is exactly what was reported. */
+.fm-drives { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(216px, 1fr)); }
+.fm-drive {
+  display: flex; align-items: center; gap: 13px;
+  padding: 15px 14px; border-radius: 12px; cursor: pointer; text-align: left;
+  background: var(--panel); border: 1px solid var(--border); color: var(--text);
+}
+.fm-drive:hover { background: var(--light); border-color: rgba(212, 175, 55, 0.35); }
+.fm-drive .gl { color: var(--gold); }
+.fm-drive .tx { min-width: 0; }
+.fm-drive .nm { display: block; font-size: 14px; font-weight: 600; line-height: 1.25; }
+.fm-drive .st { display: block; margin-top: 3px; font-size: 12px; color: var(--muted); }
+.fm-drive .bar { margin-top: 7px; height: 3px; border-radius: 2px; background: var(--light); overflow: hidden; }
+.fm-drive .bar i { display: block; height: 100%; background: var(--gold); }
+
+/* Sources, as screens instead of bands. A menu row carries its icon and a
+   line of what it is; the title of the screen you are on sits under the way
+   back, so "where am I" is answered without unfolding anything. */
+.sec-title { font-size: 16px; font-weight: 600; margin: 2px 0 12px; }
+.menu-l { display: flex; align-items: center; gap: 11px; min-width: 0; }
+.menu-l .gl { color: var(--gold); }
+
+/* VU meter store (Settings → Playback): a card per downloadable skin */
+/* Settings → VU meters: two cards per row, like the kiosk's section. */
+.vu-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.vu-skin { display: flex; flex-direction: column; gap: 0; padding: 8px; margin: 0; text-align: left; font-weight: 400;
+  background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 8px; cursor: pointer; }
+.vu-skin:hover { background: var(--light); }
+.vu-skin.sel { border: 2px solid var(--gold); padding: 7px; background: var(--gold-dim); }
+.vu-skin-name { display: flex; align-items: center; justify-content: space-between; gap: 6px; min-height: 36px; padding: 0 4px;
+  font-size: 14px; overflow: hidden; }
+.vu-skin-name > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vu-skin.sel .vu-skin-name { color: var(--gold); font-weight: 600; }
+.vu-skin-preview { width: 100%; max-width: 100%; aspect-ratio: 1280 / 675; }
+.vu-skin-preview svg { display: block; width: 100%; height: 100%; }
+.vu-skin-preview rect.shadow { filter: drop-shadow(1px 0 1.5px rgba(0, 0, 0, 0.6)); }
+.dot-new { display: inline-block; width: 8px; height: 8px; margin-left: 8px; border-radius: 50%; background: var(--gold); vertical-align: middle; }
+.vu-card { display: flex; flex-direction: column; gap: 6px; min-width: 0; padding: 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.vu-card.fresh { border-color: rgba(212, 175, 55, 0.6); }
+.vu-card strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vu-preview { position: relative; aspect-ratio: 1280 / 675; max-width: 100%; border-radius: 6px; overflow: hidden; background: rgba(0, 0, 0, 0.3); }
+.vu-preview img { width: 100%; height: 100%; object-fit: contain; display: block; }
+/* Settings → Animations: the stills are 2:1, like the kiosk's cards */
+.vu-preview.anim { aspect-ratio: 2 / 1; }
+.anim-preview { display: flex; align-items: center; justify-content: center; width: 100%; aspect-ratio: 2 / 1;
+  border-radius: 6px; overflow: hidden; background: rgba(0, 0, 0, 0.3); padding: 0; text-align: center; font-size: 12px; }
+.anim-preview img { width: 100%; height: 100%; object-fit: contain; display: block; }
+.anim-preview .muted { padding: 0 10px; }
+.vu-badge { position: absolute; top: 8px; left: 8px; background: var(--gold); color: #111; font-weight: 600; }
+.vu-card button { margin-top: 4px; }
+
+/* Dashboard disk space: one bar plus a table whose rows add up to the disk. */
+.du-bar { display: flex; height: 12px; border-radius: 99px; overflow: hidden; background: var(--light); margin: 12px 0 6px; }
+.du-bar > span { display: block; height: 100%; }
+.du-system { background: #7a7a7a; }
+.du-used, .du-usedShared { background: var(--gold); }
+.du-free { background: var(--light); }
+.du-reserve { background: repeating-linear-gradient(45deg, #6b6b6b 0 3px, #454545 3px 6px); }
+.disk-alert.warn { border-color: #facc15; }
+.disk-alert.warn h3 .dot { background: #facc15; }
+.disk-alert.full { border-color: #f87171; }
+.disk-alert.full h3 .dot { background: #f87171; }
+.du-wrap { overflow-x: auto; }
+table.du { width: 100%; border-collapse: collapse; font-size: 14px; }
+table.du th { font-size: 12px; font-weight: 500; color: var(--muted); text-align: left; padding: 8px 4px; border-bottom: 1px solid var(--border); }
+table.du td { padding: 10px 4px; border-bottom: 1px solid var(--border); vertical-align: top; }
+table.du .num { text-align: right; white-space: nowrap; padding-left: 12px; }
+table.du tfoot td { border-bottom: 0; font-weight: 600; }
+.du-name { display: flex; align-items: center; gap: 8px; }
+.du-swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+.du-swatch.du-free { border: 1px solid #555; }
+.du-desc { display: block; font-size: 12px; margin: 3px 0 0 18px; line-height: 1.35; }
+
+/* Settings → Network check: one row per step, a sub-row per update source */
+.nc-step { display: flex; gap: 10px; align-items: flex-start; }
+.nc-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.nc-detail { font-family: ui-monospace, "DejaVu Sans Mono", monospace; font-size: 12px; text-align: right; overflow-wrap: anywhere; min-width: 0; }
+.nc-mark { flex: 0 0 18px; width: 18px; height: 18px; border-radius: 50%; font-size: 12px; font-weight: 700; line-height: 18px; text-align: center; color: var(--muted); border: 1px solid var(--border); }
+.nc-mark.ok { color: #111; background: var(--ok); border-color: var(--ok); }
+.nc-mark.warn { color: #111; background: #facc15; border-color: #facc15; }
+.nc-mark.fail { color: #fff; background: var(--danger); border-color: var(--danger); }
+.nc-why { font-size: 12px; color: var(--muted); }
+.nc-why.warn { color: #facc15; }
+.nc-why.fail { color: #f0b4b4; }
+.nc-src { display: flex; gap: 8px; align-items: flex-start; margin-top: 8px; font-size: 13px; }
+.nc-src .nc-mark { flex-basis: 14px; width: 14px; height: 14px; line-height: 14px; font-size: 10px; }
+.nc-verdict.ok { border-color: rgba(111, 202, 111, 0.4); color: var(--ok); }
+.nc-verdict.warn { border-color: rgba(250, 204, 21, 0.4); color: #fde68a; }
+.nc-verdict:not(.ok):not(.warn) { background: rgba(224, 90, 90, 0.1); color: #f0b4b4; border-color: rgba(224, 90, 90, 0.35); }
+.nc-plain { align-items: center; }
+.nc-plain .nc-body { flex-direction: row; gap: 12px; }
+/* a long address drops to its own line instead of breaking mid-name */
+.nc-step .between { flex-wrap: wrap; row-gap: 2px; }
+.nc-step .nc-detail { margin-left: auto; }
+.nc-plain .nc-body { flex-wrap: nowrap; }
+.nc-state { font-size: 13px; color: var(--muted); white-space: nowrap; }
+.nc-state.ok { color: var(--ok); }
+.nc-state.warn { color: #facc15; }
+.nc-state.fail { color: #f0b4b4; }
+.nc-advanced { margin-top: 14px; padding-top: 6px; border-top: 1px solid var(--border); }

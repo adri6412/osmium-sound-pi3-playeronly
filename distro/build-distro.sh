@@ -1,0 +1,572 @@
+#!/usr/bin/env bash
+#
+# build-distro.sh — Build the HiFi Player Debian appliance ISO with live-build.
+#
+# Run this AS ROOT on a Debian machine (bookworm recommended):
+#     sudo ./build-distro.sh --qt-dir /path/to/qtui
+#
+# The Qt on-screen interface must already be built into a payload folder
+# (native-ui-qt/ci/build-payload.sh). This script does NOT need Node/npm —
+# it only assembles and builds the ISO.
+#
+# ── Incremental / staged builds ──────────────────────────────────────
+# live-build runs three stages: bootstrap → chroot → binary. They are slow to
+# the left, fast to the right. Pass --stage to rebuild only what you need and
+# reuse the rest (+ the package cache):
+#
+#   --stage all      (default) full build: bootstrap + chroot + binary
+#   --stage chroot   rebuild chroot + binary (keep bootstrap & pkg cache)
+#   --stage binary   rebuild ONLY the binary/ISO (reuse existing chroot)
+#   --stage image    bootstrap + chroot, NO ISO: then hands the chroot to
+#                    build-image.sh, which turns it into the read-only slot
+#                    image + signed RAUC bundle (schema A/B). Extra options
+#                    for that step go through the environment, see
+#                    build-image.sh (RAUC_CERT, RAUC_KEY, IMAGE_OUT, ...),
+#                    tranne --no-bundle che si passa qui e viene inoltrato.
+#
+# Typical loop while iterating on boot menus / splash / ISO layout:
+#   sudo ./build-distro.sh --qt-dir … --stage all      # once
+#   sudo ./build-distro.sh --qt-dir … --stage binary   # fast re-spins
+#
+# The Debian package cache (config/../cache/) is preserved across runs unless
+# you pass --clean-cache.
+#
+set -euo pipefail
+
+# ─────────────────────────── Configurable ───────────────────────────
+# trixie, non bookworm: la sessione kiosk gira su labwc (vedi
+# os-update/files/kiosk-wayland-session) e labwc, wlr-randr e xwayland
+# esistono solo da Debian 13 in poi. Con bookworm la lista pacchetti non
+# si risolve e l'immagine, se pure venisse fuori, si accenderebbe sul
+# greeter: l'autologin punta a una sessione il cui compositor non c'è.
+DEBIAN_SUITE="${DEBIAN_SUITE:-trixie}"
+ARCH="${ARCH:-amd64}"
+ISO_NAME="${ISO_NAME:-hifi-player-installer.iso}"
+LYRION_DEB_URL="${LYRION_DEB_URL:-https://downloads.lms-community.org/LyrionMusicServer_v9.1.0/lyrionmusicserver_9.1.0_all.deb}"
+BRAND_NAME="${BRAND_NAME:-Osmium Sound}"
+
+# ─────────────────────────── Paths ──────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CONFIG="$SCRIPT_DIR/config"
+QT_DIR=""            # pacchetto dell'interfaccia Qt (vuoto → cercato da solo)
+APP_VERSION=""
+STAGE="all"          # all | chroot | binary
+CLEAN_CACHE=0        # 1 → also wipe the Debian package cache
+
+log()  { printf '\033[1;33m[hifi-build]\033[0m %s\n' "$*"; }
+die()  { printf '\033[1;31m[hifi-build ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# ─────────────────────────── Args ───────────────────────────────────
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --qt-dir) QT_DIR="$2"; shift 2 ;;
+        --app-version) APP_VERSION="$2"; shift 2 ;;
+        --lyrion-url) LYRION_DEB_URL="$2"; shift 2 ;;
+        --suite) DEBIAN_SUITE="$2"; shift 2 ;;
+        --stage) STAGE="$2"; shift 2 ;;
+        # passed straight through to build-image.sh: stop at the squashfs, no
+        # bundle and no signing keys (what the ISO needs — it copies those
+        # blocks into slot A itself)
+        --no-bundle) IMAGE_ARGS="${IMAGE_ARGS:-} --no-bundle"; shift ;;
+        --clean-cache) CLEAN_CACHE=1; shift ;;
+        -h|--help)
+            grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) die "Unknown argument: $1" ;;
+    esac
+done
+
+# 🚨 La compressione del filesystem live. Normalmente xz, che comprime di
+# più. Ma nella ISO a filesystem unico quello stesso squashfs finisce nello
+# slot A e lo legge GRUB per avviarlo: il modulo squash4 di GRUB apre solo
+# gzip e xz, e xz costa troppo in decompressione a ogni accesso a /usr su un
+# J4105. Quindi lì è gzip, come per l'immagine OTA.
+LB_COMPRESSION=xz
+[ "$STAGE" = iso-image ] && LB_COMPRESSION=gzip
+
+case "$STAGE" in
+    all|chroot|binary|image|iso-image) ;;
+    *) die "Invalid --stage '$STAGE' (use: all | chroot | binary | image | iso-image)." ;;
+esac
+
+# Stessa ragione, ma per chi passa --suite a mano: meglio fermarsi qui che
+# scoprirlo a immagine masterizzata.
+if [ "$DEBIAN_SUITE" = "bookworm" ] && grep -qx 'labwc' "$CONFIG/package-lists/hifi.list.chroot" 2>/dev/null; then
+    die "--suite bookworm non ha labwc/wlr-randr/xwayland: la sessione kiosk non partirebbe. Usa trixie."
+fi
+
+# ─────────────────────────── Pre-flight ─────────────────────────────
+[ "$(id -u)" -eq 0 ] || die "Please run as root (sudo)."
+
+# A binary-only re-spin needs an already-built chroot to reuse.
+if [ "$STAGE" = "binary" ] && [ ! -d "$SCRIPT_DIR/chroot" ]; then
+    die "--stage binary needs an existing chroot. Run '--stage all' (or '--stage chroot') first."
+fi
+
+log "Installing build prerequisites (live-build, imagemagick, curl, xorriso)…"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y --no-install-recommends live-build imagemagick curl xorriso ca-certificates
+
+# The python daemons are only needed when we (re)build the chroot. A
+# binary-only re-spin reuses the existing chroot, so skip these.
+if [ "$STAGE" != "binary" ]; then
+    [ -f "$REPO_ROOT/api_server.py" ]      || die "Missing $REPO_ROOT/api_server.py"
+    [ -f "$REPO_ROOT/vu_meter_daemon.py" ] || die "Missing $REPO_ROOT/vu_meter_daemon.py"
+    [ -f "$REPO_ROOT/sources_server.py" ]  || die "Missing $REPO_ROOT/sources_server.py"
+    [ -f "$REPO_ROOT/hifi_logging.py" ]    || die "Missing $REPO_ROOT/hifi_logging.py"
+    [ -f "$REPO_ROOT/hifi_backup.py" ]     || die "Missing $REPO_ROOT/hifi_backup.py"
+    [ -f "$REPO_ROOT/hifi_i18n.py" ]       || die "Missing $REPO_ROOT/hifi_i18n.py"
+    [ -f "$REPO_ROOT/hifi_metadata.py" ]   || die "Missing $REPO_ROOT/hifi_metadata.py"
+    [ -f "$REPO_ROOT/hifi_tags.py" ]       || die "Missing $REPO_ROOT/hifi_tags.py"
+    [ -f "$REPO_ROOT/hifi_squeezelite.py" ] || die "Missing $REPO_ROOT/hifi_squeezelite.py"
+    [ -f "$REPO_ROOT/hifi_cdrip.py" ]      || die "Missing $REPO_ROOT/hifi_cdrip.py"
+    [ -f "$REPO_ROOT/hifi_signal_path.py" ] || die "Missing $REPO_ROOT/hifi_signal_path.py"
+    [ -f "$REPO_ROOT/hifi_diskguard.py" ]  || die "Missing $REPO_ROOT/hifi_diskguard.py"
+fi
+
+# ─────────────────────────── Normalise text files ──────────────────
+# Config files were authored on Windows → strip CR so chroot shebangs work.
+log "Normalising line endings of config text files…"
+find "$CONFIG" -type f \
+    ! -path "*/includes.chroot/opt/*" \
+    ! -path "*/packages.chroot/*" \
+    ! -name "*.png" \
+    -exec sed -i 's/\r$//' {} +
+
+# ─────────────────────────── Inject payloads ───────────────────────
+# All of these land in includes.chroot/ and are baked into the chroot during
+# the CHROOT stage. For a binary-only re-spin (--stage binary) the chroot is
+# reused as-is, so we SKIP these (notably the slow Lyrion download).
+if [ "$STAGE" = "binary" ]; then
+    log "Skipping chroot payload injection (binary-only re-spin)."
+else
+
+# The Electron app is no longer built nor shipped (removed from the
+# repository on 2026-10-02): /opt/hifi-media-player stays empty in new images.
+# A legacy install that still runs it keeps what it has.
+rm -rf "$CONFIG/includes.chroot/opt/hifi-media-player"
+
+# Seed the installed UI version (baseline for OTA update comparison). Default to
+# the version in package.json unless overridden with --app-version.
+if [ -z "$APP_VERSION" ] && [ -f "$REPO_ROOT/package.json" ]; then
+    APP_VERSION="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$REPO_ROOT/package.json" | head -n1)"
+fi
+[ -n "$APP_VERSION" ] || APP_VERSION="unknown"
+# 🚨 Da 2.5.24 la versione dell'interfaccia sta fuori dalla cartella del
+# programma: è quella che legge l'aggiornatore.
+mkdir -p "$CONFIG/includes.chroot/etc/hifi-player"
+printf '%s\n' "$APP_VERSION" > "$CONFIG/includes.chroot/etc/hifi-player/UI_VERSION"
+log "Seeded UI_VERSION = $APP_VERSION"
+
+# ── l'interfaccia Qt, l'unica da 2.5.24 ─────────────────────────────
+# La costruisce native-ui-qt/ci/build-payload.sh (in CI è un lavoro a parte,
+# perché serve docker); qui viene solo copiata dentro l'immagine. Senza di
+# lei non si va avanti: un'immagine senza programma da avviare sarebbe uno
+# schermo nero (l'hook 0400 abilita hifi-qt.service solo se la trova).
+QT_DEST="$CONFIG/includes.chroot/opt/hifi-qt"
+if [ -z "$QT_DIR" ]; then
+    for c in "$REPO_ROOT/qtui" "$QT_DEST"; do
+        [ -x "$c/hifi-qt" ] && QT_DIR="$c" && break
+    done
+fi
+if [ -n "$QT_DIR" ] && [ -x "$QT_DIR/hifi-qt" ]; then
+    log "Injecting Qt UI → includes.chroot/opt/hifi-qt (from $QT_DIR)"
+    if [ "$(cd "$QT_DIR" && pwd)" != "$(cd "$QT_DEST" 2>/dev/null && pwd)" ]; then
+        rm -rf "$QT_DEST"; mkdir -p "$QT_DEST"
+        cp -a "$QT_DIR/." "$QT_DEST/"
+    fi
+    chmod 755 "$QT_DEST/hifi-qt"
+    if [ -f "$QT_DEST/hifi-media-player" ]; then chmod 755 "$QT_DEST/hifi-media-player"; fi
+    printf '%s\n' "$APP_VERSION" > "$QT_DEST/UI_VERSION"
+else
+    die "Qt UI payload not found: build it with native-ui-qt/ci/build-payload.sh and pass --qt-dir"
+fi
+
+log "Injecting canonical kiosk X session → includes.chroot/home/hifi/.xsession"
+# Single source of truth: the SAME file the OS-update OTA installs
+# (distro/os-update/files/xsession) is baked into the image here, so the live
+# session and the OTA can never drift (a one-byte drift used to force a reboot
+# on every OS update). Ownership/exec bit are finalised by hook 0100 after the
+# 'hifi' user is created.
+XSESSION_SRC="$SCRIPT_DIR/os-update/files/xsession"
+[ -f "$XSESSION_SRC" ] || die "Missing canonical X session at $XSESSION_SRC"
+XSESSION_DEST_DIR="$CONFIG/includes.chroot/home/hifi"
+mkdir -p "$XSESSION_DEST_DIR"
+cp -f "$XSESSION_SRC" "$XSESSION_DEST_DIR/.xsession"
+sed -i 's/\r$//' "$XSESSION_DEST_DIR/.xsession"
+chmod +x "$XSESSION_DEST_DIR/.xsession"
+
+log "Injecting canonical kiosk Wayland session → includes.chroot (labwc)"
+# Stessa regola della .xsession qui sopra: i file canonici sono quelli che
+# installa anche l'OTA (distro/os-update/files/kiosk-wayland-*), così immagine e
+# aggiornamento non possono divergere. La sessione X11 resta comunque installata
+# come via di rollback (basta rimettere user-session=hifi-kiosk in
+# etc/lightdm/lightdm.conf.d/99-hifi-autologin.conf).
+WL_SESSION_SRC="$SCRIPT_DIR/os-update/files/kiosk-wayland-session"
+WL_LAUNCH_SRC="$SCRIPT_DIR/os-update/files/kiosk-wayland-launch"
+WL_DESKTOP_SRC="$SCRIPT_DIR/os-update/files/hifi-kiosk-wayland.desktop"
+WL_TMPFILES_SRC="$SCRIPT_DIR/os-update/files/hifi-player-tmpfiles.conf"
+for f in "$WL_SESSION_SRC" "$WL_LAUNCH_SRC" "$WL_DESKTOP_SRC" "$WL_TMPFILES_SRC"; do
+    [ -f "$f" ] || die "Missing canonical Wayland kiosk file at $f"
+done
+mkdir -p "$CONFIG/includes.chroot/usr/local/bin" \
+         "$CONFIG/includes.chroot/usr/share/wayland-sessions" \
+         "$CONFIG/includes.chroot/usr/lib/tmpfiles.d"
+cp -f "$WL_SESSION_SRC"  "$CONFIG/includes.chroot/usr/local/bin/hifi-kiosk-wayland"
+cp -f "$WL_LAUNCH_SRC"   "$CONFIG/includes.chroot/usr/local/bin/hifi-kiosk-launch"
+sed -i 's/\r$//' "$CONFIG/includes.chroot/usr/local/bin/hifi-kiosk-wayland" \
+                 "$CONFIG/includes.chroot/usr/local/bin/hifi-kiosk-launch"
+chmod +x "$CONFIG/includes.chroot/usr/local/bin/hifi-kiosk-wayland" \
+         "$CONFIG/includes.chroot/usr/local/bin/hifi-kiosk-launch"
+cp -f "$WL_DESKTOP_SRC"  "$CONFIG/includes.chroot/usr/share/wayland-sessions/hifi-kiosk-wayland.desktop"
+cp -f "$WL_TMPFILES_SRC" "$CONFIG/includes.chroot/usr/lib/tmpfiles.d/hifi-player.conf"
+
+log "Injecting kiosk session selector (Wayland vs X11) → includes.chroot"
+# Wayland vale solo dove c'è una GPU vera: in una VM (VMware, VirtualBox,
+# QEMU) wlroots rifiuta il renderer GLES2 in software e il kiosk resta a
+# schermo nero fino a far ricomparire il greeter. Questo selettore gira a ogni
+# avvio, prima di lightdm, e decide il protocollo — stesso file canonico che
+# installa l'OTA (os-update/apply.d/0050-kiosk-session-select.sh).
+SEL_SRC="$SCRIPT_DIR/os-update/files/kiosk-session-select"
+SEL_UNIT_SRC="$SCRIPT_DIR/os-update/files/hifi-kiosk-session.service"
+for f in "$SEL_SRC" "$SEL_UNIT_SRC"; do
+    [ -f "$f" ] || die "Missing canonical kiosk session selector at $f"
+done
+mkdir -p "$CONFIG/includes.chroot/usr/local/sbin" \
+         "$CONFIG/includes.chroot/etc/systemd/system"
+cp -f "$SEL_SRC" "$CONFIG/includes.chroot/usr/local/sbin/hifi-kiosk-session.sh"
+sed -i 's/\r$//' "$CONFIG/includes.chroot/usr/local/sbin/hifi-kiosk-session.sh"
+chmod +x "$CONFIG/includes.chroot/usr/local/sbin/hifi-kiosk-session.sh"
+cp -f "$SEL_UNIT_SRC" "$CONFIG/includes.chroot/etc/systemd/system/hifi-kiosk-session.service"
+
+log "Injecting EFI-boot-entry-fix → kernel postinst.d hook + apt Post-Invoke hook"
+# Single source of truth: the SAME script the OS-update OTA installs
+# (distro/os-update/files/hifi-fix-efi-boot.sh) is baked into the image here,
+# at BOTH locations, so a fresh install and an OTA-updated device converge to
+# the identical end state. The apt Post-Invoke hook is the one that reliably
+# runs after grub-efi-amd64-signed/shim-signed are configured (see
+# distro/os-update/apply.d/0021-efi-boot-apt-hook.sh for why the kernel
+# postinst.d copy alone isn't enough).
+EFI_HOOK_SRC="$SCRIPT_DIR/os-update/files/hifi-fix-efi-boot.sh"
+[ -f "$EFI_HOOK_SRC" ] || die "Missing canonical EFI boot hook at $EFI_HOOK_SRC"
+
+EFI_HOOK_DEST_DIR="$CONFIG/includes.chroot/etc/kernel/postinst.d"
+mkdir -p "$EFI_HOOK_DEST_DIR"
+cp -f "$EFI_HOOK_SRC" "$EFI_HOOK_DEST_DIR/zzz-hifi-fix-efi-boot"
+sed -i 's/\r$//' "$EFI_HOOK_DEST_DIR/zzz-hifi-fix-efi-boot"
+chmod +x "$EFI_HOOK_DEST_DIR/zzz-hifi-fix-efi-boot"
+
+EFI_HOOK_SBIN_DIR="$CONFIG/includes.chroot/usr/local/sbin"
+mkdir -p "$EFI_HOOK_SBIN_DIR"
+cp -f "$EFI_HOOK_SRC" "$EFI_HOOK_SBIN_DIR/hifi-fix-efi-boot.sh"
+sed -i 's/\r$//' "$EFI_HOOK_SBIN_DIR/hifi-fix-efi-boot.sh"
+chmod +x "$EFI_HOOK_SBIN_DIR/hifi-fix-efi-boot.sh"
+
+EFI_APT_HOOK_DIR="$CONFIG/includes.chroot/etc/apt/apt.conf.d"
+mkdir -p "$EFI_APT_HOOK_DIR"
+cat > "$EFI_APT_HOOK_DIR/99-hifi-fix-efi-boot" <<'EOF'
+DPkg::Post-Invoke { "test -x /usr/local/sbin/hifi-fix-efi-boot.sh && /usr/local/sbin/hifi-fix-efi-boot.sh; true"; };
+EOF
+
+log "Injecting Samba base config → includes.chroot/etc/samba/smb.conf"
+SAMBA_DEST_DIR="$CONFIG/includes.chroot/etc/samba"
+mkdir -p "$SAMBA_DEST_DIR"
+# SAMBA_DEST_DIR already IS $REPO_ROOT/distro/config/includes.chroot/etc/samba
+# (CONFIG = $SCRIPT_DIR/config = $REPO_ROOT/distro/config) — the file is
+# already in place via includes.chroot, so there is nothing to copy; a
+# self-copy here makes `cp` fail ("same file"). Line-ending normalization for
+# every config text file (this one included) already runs earlier in this
+# script, so only permissions need setting.
+chmod 644 "$SAMBA_DEST_DIR/smb.conf"
+: > "$SAMBA_DEST_DIR/hifi-shares.conf"
+chmod 644 "$SAMBA_DEST_DIR/hifi-shares.conf"
+
+log "Injecting python daemons → includes.chroot/usr/local/bin"
+BIN_DEST="$CONFIG/includes.chroot/usr/local/bin"
+mkdir -p "$BIN_DEST"
+cp -f "$REPO_ROOT/api_server.py"      "$BIN_DEST/"
+cp -f "$REPO_ROOT/vu_meter_daemon.py" "$BIN_DEST/"
+cp -f "$REPO_ROOT/sources_server.py"  "$BIN_DEST/"
+cp -f "$REPO_ROOT/webui_server.py"    "$BIN_DEST/"
+cp -f "$REPO_ROOT/hifi_logging.py"    "$BIN_DEST/"
+cp -f "$REPO_ROOT/hifi_backup.py"     "$BIN_DEST/"
+cp -f "$REPO_ROOT/hifi_i18n.py"       "$BIN_DEST/"
+cp -f "$REPO_ROOT/hifi_metadata.py"   "$BIN_DEST/"
+cp -f "$REPO_ROOT/hifi_tags.py"       "$BIN_DEST/"
+cp -f "$REPO_ROOT/hifi_squeezelite.py" "$BIN_DEST/"
+cp -f "$REPO_ROOT/hifi_cdrip.py"      "$BIN_DEST/"
+cp -f "$REPO_ROOT/hifi_signal_path.py" "$BIN_DEST/"
+cp -f "$REPO_ROOT/hifi_diskguard.py"  "$BIN_DEST/"
+sed -i 's/\r$//' "$BIN_DEST/api_server.py" "$BIN_DEST/vu_meter_daemon.py" "$BIN_DEST/sources_server.py" "$BIN_DEST/webui_server.py" "$BIN_DEST/hifi_logging.py" "$BIN_DEST/hifi_backup.py" "$BIN_DEST/hifi_i18n.py" "$BIN_DEST/hifi_metadata.py" "$BIN_DEST/hifi_tags.py" "$BIN_DEST/hifi_squeezelite.py" "$BIN_DEST/hifi_cdrip.py" "$BIN_DEST/hifi_signal_path.py" "$BIN_DEST/hifi_diskguard.py"
+chmod +x "$BIN_DEST/api_server.py" "$BIN_DEST/vu_meter_daemon.py" "$BIN_DEST/sources_server.py" "$BIN_DEST/webui_server.py"
+
+# Web-admin Vue build (built by CI before this script runs). REQUIRED: a
+# missing/empty dist here means every device installed from this ISO gets the
+# daemon's built-in fallback page instead of the real web-admin, silently and
+# with nothing in the ISO itself to show for it. Fail the build instead of
+# shipping that — build it first with (cd admin-webui && npm ci && npm run build).
+WEBUI_DIST_SRC="$REPO_ROOT/admin-webui/dist"
+WEBUI_DIST_DEST="$CONFIG/includes.chroot/opt/hifi-webui/dist"
+if [ -f "$WEBUI_DIST_SRC/index.html" ]; then
+    mkdir -p "$WEBUI_DIST_DEST"
+    cp -a "$WEBUI_DIST_SRC/." "$WEBUI_DIST_DEST/"
+    log "Injected web-admin build → /opt/hifi-webui/dist"
+else
+    die "admin-webui/dist missing or empty (no index.html) — build it first: (cd admin-webui && npm ci && npm run build). Refusing to ship an ISO without the web-admin UI."
+fi
+
+log "Injecting helper scripts → includes.chroot/usr/local/sbin"
+SBIN_DEST="$CONFIG/includes.chroot/usr/local/sbin"
+mkdir -p "$SBIN_DEST"
+# SBIN_DEST already IS $REPO_ROOT/distro/config/includes.chroot/usr/local/sbin
+# — same self-copy pitfall as the smb.conf injection above. The file is
+# already in place and already CRLF-normalized by the earlier repo-wide sed
+# pass; only the exec bit needs setting.
+chmod +x "$SBIN_DEST/hifi-format-disk.sh"
+chmod +x "$SBIN_DEST/hifi-display-mode.sh"
+chmod +x "$SBIN_DEST/hifi-ui-refresh.sh"
+chmod +x "$SBIN_DEST/hifi-factory-reset.sh"
+chmod +x "$SBIN_DEST/hifi-quiesce-audio-shutdown.sh"
+chmod +x "$SBIN_DEST/hifi-capture-playback-state.py"
+chmod +x "$SBIN_DEST/hifi-grub-install.sh"
+chmod +x "$SBIN_DEST/hifi-disk-install.sh"
+
+# Seed the installed system-components version (baseline for OTA comparison),
+# matching the UI version so a fresh image reports a real baseline.
+SYS_VERSION_DEST="$CONFIG/includes.chroot/etc/hifi-player"
+mkdir -p "$SYS_VERSION_DEST"
+printf '%s\n' "$APP_VERSION" > "$SYS_VERSION_DEST/SYSTEM_VERSION"
+log "Seeded SYSTEM_VERSION = $APP_VERSION"
+
+# Seed the OS OTA baseline version (so hifi-os-* comparisons have a baseline).
+printf '%s\n' "$APP_VERSION" > "$SYS_VERSION_DEST/OS_VERSION"
+log "Seeded OS_VERSION = $APP_VERSION"
+
+# Seed the first-boot provisioning marker. This is the ONLY place (besides
+# hifi-factory-reset.sh) that creates it: a freshly installed unit boots into
+# the hotspot/captive setup flow (webui_server.py picks it up). It is consumed
+# and removed at finalize, and an OS-OTA migration must NEVER recreate it (that
+# would drop configured fleet units back into setup mode).
+printf 'pending\n' > "$SYS_VERSION_DEST/provisioning-pending"
+log "Seeded provisioning-pending marker (fresh-install setup flow)"
+
+# Bake the OTA public key so the device can verify signed OS bundles. Without
+# it, the OS updater safely refuses every update. Generate it once with
+# distro/ota-keys/gen-ota-key.sh (see distro/ota-keys/README.md).
+OTA_PUBKEY_SRC="$SCRIPT_DIR/ota-keys/ota-pubkey.pem"
+if [ -f "$OTA_PUBKEY_SRC" ]; then
+    cp -f "$OTA_PUBKEY_SRC" "$SYS_VERSION_DEST/ota-pubkey.pem"
+    chmod 644 "$SYS_VERSION_DEST/ota-pubkey.pem"
+    log "Baked OTA public key → /etc/hifi-player/ota-pubkey.pem"
+else
+    log "WARNING: $OTA_PUBKEY_SRC missing — OS OTA updates will be refused on this image."
+fi
+
+# RAUC keyring (CA pubblica): l'immagine la porta in /etc/rauc/keyring.pem
+# (build-image.sh) e il pacchetto di sistema in /usr/local/share/hifi-ab/
+# per gli apparecchi legacy che si convertono. Stessa fonte per entrambi:
+# distro/rauc-keys/keyring.pem (vedi gen-rauc-ca.sh).
+RAUC_KEYRING_SRC="$SCRIPT_DIR/rauc-keys/keyring.pem"
+if [ -f "$RAUC_KEYRING_SRC" ]; then
+    mkdir -p "$CONFIG/includes.chroot/usr/local/share/hifi-ab"
+    cp -f "$RAUC_KEYRING_SRC" "$CONFIG/includes.chroot/usr/local/share/hifi-ab/keyring.pem"
+    chmod 644 "$CONFIG/includes.chroot/usr/local/share/hifi-ab/keyring.pem"
+    log "Baked RAUC keyring → /usr/local/share/hifi-ab/keyring.pem"
+else
+    log "WARNING: $RAUC_KEYRING_SRC missing — RAUC image bundles will be refused."
+fi
+
+log "Lyrion Music Server will be downloaded on-demand by hook 0050 (during chroot build)"
+# Not staged in includes.chroot — downloaded during the chroot build by hook 0050,
+# installed, and the .deb file is removed. The installed package (dpkg metadata)
+# survives the installer; hifi-firstboot.sh will re-ensure it on first boot.
+
+# The splash itself is the animated mark (frame-*.png + hifi.script in the
+# theme dir). logo.png still goes in next to it: it is what the legacy
+# single-image script showed, and apply.d/0003 keeps that file in place.
+log "Copying the static logo into the Plymouth theme"
+THEME_DIR="$CONFIG/includes.chroot/usr/share/plymouth/themes/hifi"
+mkdir -p "$THEME_DIR"
+if [ -f "$REPO_ROOT/logo osmium.png" ]; then
+    cp -f "$REPO_ROOT/logo osmium.png" "$THEME_DIR/logo.png"
+else
+    convert -size 720x200 xc:black \
+        -gravity center \
+        -fill '#d4af37' -font DejaVu-Sans-Bold -pointsize 72 -annotate +0-10 'Osmium Sound' \
+        -fill '#888888' -font DejaVu-Sans -pointsize 22 -annotate +0+55 'network audio streamer' \
+        "$THEME_DIR/logo.png" \
+        || convert -size 720x200 xc:black -gravity center -fill white -pointsize 60 -annotate 0 'Osmium Sound' "$THEME_DIR/logo.png"
+fi
+
+# Solid-black GRUB background for the installed system, so the (hidden) GRUB
+# graphical terminal shows nothing — no menu, no "Loading Linux…" text.
+# Bake it into the image here (ImageMagick is not installed on the target).
+log "Generating black GRUB background → includes.chroot/boot/grub/hifi-bg.png"
+GRUB_BG_DIR="$CONFIG/includes.chroot/boot/grub"
+mkdir -p "$GRUB_BG_DIR"
+convert -size 1920x1080 xc:black "$GRUB_BG_DIR/hifi-bg.png" 2>/dev/null \
+    || die "Failed to generate GRUB background image."
+
+fi  # end: chroot payload injection (skipped for --stage binary)
+
+# ─────────────────────────── Installer boot splash ─────────────────
+# Brand the ISO boot menu (isolinux/BIOS + grub/UEFI) with the mark itself:
+# the logo file, scaled, on the near-black of the mark's own background. The
+# text version stays as the fallback for a checkout without the logo.
+# isolinux wants a 640x480 splash.png; grub a 640x480 background too.
+#
+# IMPORTANT: we do NOT overwrite the menu .cfg files (they contain the
+# correct kernel/initrd paths, which differ between live-build/d-i versions
+# — hardcoding them caused "vmlinuz not found"). Instead we only drop our
+# splash images here, and a *binary* hook (0500-brand-boot.hook.binary)
+# rewrites colours/title/timeout in the live-build-generated menus in place.
+log "Generating installer boot splash (same branding as Plymouth)"
+BINARY="$CONFIG/includes.binary"
+ISOLINUX_DIR="$BINARY/isolinux"
+GRUB_DIR="$BINARY/boot/grub"
+mkdir -p "$ISOLINUX_DIR" "$GRUB_DIR"
+
+# 640x480 for both isolinux/BIOS and grub/UEFI (gfxterm): the mark centred.
+make_splash() {
+    if [ -f "$REPO_ROOT/logo osmium.png" ]; then
+        convert -size 640x480 xc:'#0c0c0c' \
+            \( "$REPO_ROOT/logo osmium.png" -resize 480x \) \
+            -gravity center -composite "$1" && return 0
+    fi
+    convert -size 640x480 xc:black \
+        -gravity center \
+        -fill '#d4af37' -font DejaVu-Sans-Bold -pointsize 56 -annotate +0-30 'Osmium Sound' \
+        -fill '#888888' -font DejaVu-Sans -pointsize 18 -annotate +0+20 'network audio streamer' \
+        "$1" \
+        || convert -size 640x480 xc:black -gravity center -fill white -pointsize 48 -annotate 0 'Osmium Sound' "$1"
+}
+make_splash "$ISOLINUX_DIR/splash.png"
+make_splash "$GRUB_DIR/splash.png"
+
+# ─────────────────────────── Make hooks executable ─────────────────
+chmod +x "$CONFIG"/hooks/normal/*.hook.chroot
+chmod +x "$CONFIG"/hooks/normal/*.hook.binary 2>/dev/null || true
+
+# ─────────────────────────── live-build clean (stage-aware) ────────
+cd "$SCRIPT_DIR"
+log "Build stage: $STAGE"
+
+# Clean only what the requested stage needs to rebuild. The Debian package
+# cache (cache/) is preserved unless --clean-cache is given, so re-spins don't
+# re-download packages.
+case "$STAGE" in
+    all)
+        log "Cleaning chroot + binary artefacts (keeping package cache)…"
+        lb clean --chroot --binary >/dev/null 2>&1 || true
+        ;;
+    chroot|image)
+        log "Cleaning chroot + binary artefacts (keeping bootstrap + cache)…"
+        lb clean --chroot --binary >/dev/null 2>&1 || true
+        ;;
+    binary)
+        log "Cleaning ONLY binary artefacts (reusing existing chroot)…"
+        lb clean --binary >/dev/null 2>&1 || true
+        ;;
+esac
+if [ "$CLEAN_CACHE" -eq 1 ]; then
+    log "Wiping package cache (--clean-cache)…"
+    lb clean --cache >/dev/null 2>&1 || true
+fi
+
+# ─────────────────────────── live-build config ─────────────────────
+# (Re)generate the live-build config for full/chroot builds. For a binary-only
+# re-spin we keep the existing config/ (generated by a previous run) so we
+# don't disturb the chroot we're about to reuse.
+if [ "$STAGE" != "binary" ]; then
+    log "Configuring live-build (suite=$DEBIAN_SUITE arch=$ARCH)…"
+    # No debian-installer at all: this is a live-only ISO. Its one boot menu
+    # entry ("Install Osmium Sound") boots the live kernel/initrd/squashfs
+    # with an extra kernel parameter (hifi.installer=1) that the on-screen
+    # interface reads at startup to show the installer UI. The actual
+    # disk installation (partition/format/copy/bootloader) is driven by
+    # hifi-disk-install.sh from inside that live session, not by d-i.
+    # See config/hooks/normal/0500-brand-boot.hook.binary for the boot menu
+    # generation and distro/README.md for the full flow.
+    #
+    # noautologin: live-config (pulled in automatically by live-build) writes
+    # its OWN lightdm autologin fragment at boot for the generic Debian-Live
+    # default account ("user"), which lands AFTER our baked-in
+    # includes.chroot/etc/lightdm/lightdm.conf.d/99-hifi-autologin.conf and
+    # wins — lightdm then tries "Can't login unknown user 'user'" and falls
+    # back to the greeter instead of autologging in as 'hifi'. This boot
+    # parameter tells live-config to leave autologin alone entirely, so our
+    # own config is the only one lightdm ever sees.
+    lb config \
+        --distribution "$DEBIAN_SUITE" \
+        --architectures "$ARCH" \
+        --archive-areas "main contrib non-free non-free-firmware" \
+        --bootloaders "syslinux,grub-efi" \
+        --bootappend-live "boot=live components quiet splash loglevel=0 systemd.show_status=0 rd.systemd.show_status=0 vt.global_cursor_default=0 hostname=hifiplayer noautologin" \
+        --iso-application "$BRAND_NAME" \
+        --iso-publisher "$BRAND_NAME" \
+        --iso-volume "OSMIUM_SOUND" \
+        --memtest none \
+        --apt-recommends false \
+        --compression "$LB_COMPRESSION"
+else
+    [ -d config/bootstrap ] \
+        || die "--stage binary but no live-build config found. Run '--stage all' first."
+    log "Reusing existing live-build config (binary-only re-spin)."
+fi
+
+# ─────────────────────────── Build (stage-aware) ───────────────────
+case "$STAGE" in
+    all)
+        log "Building full ISO (bootstrap → chroot → binary) — 20-40 min…"
+        lb build
+        ;;
+    chroot)
+        log "Building bootstrap + chroot + binary…"
+        lb bootstrap
+        lb chroot
+        lb binary
+        ;;
+    binary)
+        log "Building ONLY the binary stage (fast re-spin)…"
+        lb binary
+        ;;
+    iso-image)
+        # 🚨 La ISO a filesystem unico: il sistema live È l'immagine. Si
+        # costruisce un solo chroot, lo si post-processa come immagine (con
+        # live-boot dentro, inerte senza boot=live) e poi live-build lo
+        # comprime UNA volta sola. Quello squashfs fa due mestieri: filesystem
+        # della sessione live e contenuto dello slot A, che l'installer copia
+        # a blocchi dal supporto stesso. Prima la ISO portava due sistemi quasi
+        # identici e pesava ~1,9 GiB; così ne porta uno.
+        log "Building the single-filesystem ISO (chroot → image → one squashfs)…"
+        lb bootstrap
+        lb chroot
+        log "Handing the chroot to build-image.sh (post-processing only)…"
+        # shellcheck disable=SC2097,SC2098
+        IMAGE_VERSION="${IMAGE_VERSION:-$APP_VERSION}" \
+            "$SCRIPT_DIR/build-image.sh" --chroot "$SCRIPT_DIR/chroot" \
+                --version "${IMAGE_VERSION:-$APP_VERSION}" --chroot-only --live-capable
+        log "Compressing it once, as the live filesystem AND as the slot image…"
+        lb binary
+        ;;
+    image)
+        log "Building bootstrap + chroot (no ISO), then the RAUC slot image…"
+        lb bootstrap
+        lb chroot
+        log "Handing the chroot to build-image.sh…"
+        # shellcheck disable=SC2097,SC2098  # the prefix is the child's env, the fallback is the outer value
+        # shellcheck disable=SC2086          # IMAGE_ARGS is a deliberate word list
+        IMAGE_VERSION="${IMAGE_VERSION:-$APP_VERSION}" \
+            "$SCRIPT_DIR/build-image.sh" --chroot "$SCRIPT_DIR/chroot" --version "${IMAGE_VERSION:-$APP_VERSION}" ${IMAGE_ARGS:-}
+        log "DONE ✓  RAUC image built (see build-image.sh output above)"
+        exit 0
+        ;;
+esac
+
+ISO_SRC="$(ls -1 *.iso 2>/dev/null | head -n1 || true)"
+[ -n "$ISO_SRC" ] || die "Build finished but no .iso was produced."
+mv -f "$ISO_SRC" "$REPO_ROOT/$ISO_NAME"
+
+log "DONE ✓  ISO ready at: $REPO_ROOT/$ISO_NAME"
+ls -lh "$REPO_ROOT/$ISO_NAME"

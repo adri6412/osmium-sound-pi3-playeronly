@@ -1,0 +1,851 @@
+"""Per-request i18n for the appliance's Python backends (api_server.py,
+sources_server.py, webui_server.py).
+
+Both frontends (the Electron kiosk and the Vue admin-webui) have their own
+working i18n system and let the owner pick English or Italian — but every
+backend JSON response used to carry a `message` string hardcoded in Italian.
+An English-locale user would still see raw Italian text for every error/status
+toast in Settings, because both frontends render `response.message` verbatim
+when present, only falling back to their own translated string when it's
+missing. This module is the fix: a flat `MESSAGES` catalog keyed by a stable
+dotted `code` (the same `namespace.name` convention a handful of endpoints
+already used, e.g. `ssh.installFailed`), and a `t()` that looks a code up in
+the caller's language.
+
+This mirrors sources_server.py's own SOURCES_I18N/`_t()` (used for its
+self-contained Sources web page), but is meant to be shared by everything
+that returns `{'success': False, 'message': ...}`-shaped JSON, so it lives in
+its own dependency-free module rather than being duplicated per-file.
+"""
+
+MESSAGES = {
+    # ── Network (Wi-Fi / wired) ─────────────────────────────────────
+    'network.ssidMissing': {'en': 'Missing SSID', 'it': 'SSID mancante'},
+    'network.invalidField': {'en': '{label} is invalid', 'it': '{label} non valido'},
+    'network.connectTimeout': {'en': 'Connection timed out', 'it': 'Timeout durante la connessione'},
+    'network.connectFailed': {'en': 'Connection failed', 'it': 'Connessione fallita'},
+    'network.connected': {'en': 'Connected to {ssid}', 'it': 'Connesso a {ssid}'},
+    'network.notSaved': {'en': '{ssid} is not a saved network', 'it': '{ssid} non è una rete salvata'},
+    'network.forgetFailed': {'en': 'Could not forget {ssid}', 'it': 'Non sono riuscito a dimenticare {ssid}'},
+    'network.forgotten': {'en': '{ssid} forgotten: the player will not join it again by itself',
+                          'it': '{ssid} dimenticata: il lettore non vi si collegherà più da solo'},
+    'network.noEthernet': {'en': 'No Ethernet interface found', 'it': 'Nessuna interfaccia Ethernet trovata'},
+    'network.wiredFailed': {'en': 'Wired connection failed', 'it': 'Connessione via cavo fallita'},
+    'network.wiredConnected': {'en': 'Connected via cable', 'it': 'Connesso via cavo'},
+    'network.cableNotConnected': {'en': 'Cable not connected', 'it': 'Cavo non connesso'},
+
+    # ── Fixed (static) IPv4 address ─────────────────────────────────
+    'network.noActiveConnection': {'en': 'No active network connection',
+                                   'it': 'Nessuna connessione di rete attiva'},
+    'network.noProfile': {'en': 'No network profile found for {device}',
+                          'it': 'Nessun profilo di rete trovato per {device}'},
+    'network.invalidMode': {'en': 'Invalid mode: {mode}', 'it': 'Modalità non valida: {mode}'},
+    'network.invalidAddress': {'en': 'Invalid IP address: {address}',
+                               'it': 'Indirizzo IP non valido: {address}'},
+    'network.invalidPrefix': {'en': 'Invalid network prefix: {prefix} (use 1–30)',
+                              'it': 'Prefisso di rete non valido: {prefix} (usa 1–30)'},
+    'network.unusableAddress': {'en': '{address} cannot be assigned to this device',
+                                'it': '{address} non può essere assegnato a questo dispositivo'},
+    'network.invalidGateway': {'en': 'Invalid gateway: {gateway}',
+                               'it': 'Gateway non valido: {gateway}'},
+    'network.gatewayOutsideSubnet': {'en': 'The gateway {gateway} is not in the same network as {address}/{prefix}',
+                                     'it': 'Il gateway {gateway} non è nella stessa rete di {address}/{prefix}'},
+    'network.invalidDns': {'en': 'Invalid DNS address: {dns}', 'it': 'Indirizzo DNS non valido: {dns}'},
+    'network.ipv4ApplyFailed': {'en': 'Could not apply the network settings',
+                                'it': 'Impossibile applicare le impostazioni di rete'},
+    'network.staticApplying': {'en': 'Applying the fixed address {address} — reconnect there in a few seconds',
+                               'it': 'Sto applicando l\'indirizzo fisso {address} — ricollegati lì tra qualche secondo'},
+    'network.dhcpApplying': {'en': 'Switching back to an automatic address — the device address may change',
+                             'it': 'Torno all\'indirizzo automatico — l\'indirizzo del dispositivo può cambiare'},
+
+    # ── Audio output (DAC) ──────────────────────────────────────────
+    'audio.deviceMissing': {'en': 'Missing device', 'it': 'Device mancante'},
+    'audio.invalidDevice': {'en': 'Invalid audio device: {device}', 'it': 'Dispositivo audio non valido: {device}'},
+    'audio.dspOutputFailed': {'en': 'Setting output (DSP) failed', 'it': 'Impostazione uscita (DSP) fallita'},
+    'audio.dspOutputSet': {'en': 'Audio output (DSP) set to {device}', 'it': 'Uscita audio (DSP) impostata su {device}'},
+    'audio.writeConfigFailed': {'en': 'Writing the configuration failed', 'it': 'Scrittura configurazione fallita'},
+    'audio.deviceSetRestartWarn': {'en': 'Device set ({device}); squeezelite restart: {err}',
+                                   'it': 'Device impostato ({device}); riavvio squeezelite: {err}'},
+    'audio.deviceSetRestartFailed': {'en': 'Device set ({device}); restart failed',
+                                     'it': 'Device impostato ({device}); riavvio non riuscito'},
+    'audio.outputSet': {'en': 'Audio output set to {device}', 'it': 'Uscita audio impostata su {device}'},
+    'audio.defaultDeviceName': {'en': 'System default', 'it': 'Predefinito di sistema'},
+    # Settings → Audio, the squeezelite model (hifi_squeezelite.py)
+    'squeezelite.saved': {'en': 'Saved, player restarted', 'it': 'Salvato, player riavviato'},
+    'squeezelite.reset': {'en': 'Back to defaults, player restarted', 'it': 'Predefiniti ripristinati, player riavviato'},
+    'squeezelite.unknownField': {'en': 'Unknown setting: {field}', 'it': 'Impostazione sconosciuta: {field}'},
+    'squeezelite.invalidValue': {'en': 'Invalid value for {field}: {detail}', 'it': 'Valore non valido per {field}: {detail}'},
+    'squeezelite.extraManaged': {'en': 'These options are set above, not here: {detail}',
+                                 'it': 'Queste opzioni si impostano sopra, non qui: {detail}'},
+    'squeezelite.extraInvalid': {'en': 'Not allowed in the extra arguments: {detail}',
+                                 'it': 'Non ammesso negli argomenti aggiuntivi: {detail}'},
+    'squeezelite.noMixer': {'en': 'This output has no hardware volume control',
+                            'it': 'Questa uscita non ha un controllo di volume hardware'},
+    'squeezelite.restartWarn': {'en': 'Saved; squeezelite restart: {err}', 'it': 'Salvato; riavvio di squeezelite: {err}'},
+    'squeezelite.savedLyrionRestart': {'en': 'Saved. Lyrion is restarting to apply the DSD conversion: music is back in a few seconds',
+                                       'it': 'Salvato. Lyrion si riavvia per applicare la conversione in DSD: la musica torna fra pochi secondi'},
+    'squeezelite.pcm2dsdTooHeavy': {'en': 'This processor is not fast enough to convert to {detail} while playing',
+                                    'it': 'Questo processore non è abbastanza veloce per convertire in {detail} durante l\'ascolto'},
+
+    # ── Audio zones: one more player per DAC ────────────────────────
+    'zones.added': {'en': '"{name}" added: it is now a player of its own in Lyrion',
+                    'it': '"{name}" aggiunta: ora è un player a sé in Lyrion'},
+    'zones.saved': {'en': 'Saved, zone restarted', 'it': 'Salvato, zona riavviata'},
+    'zones.removed': {'en': 'Zone removed', 'it': 'Zona tolta'},
+    'zones.dacNotFree': {'en': 'This DAC is already in use, or no longer connected',
+                         'it': 'Questo DAC è già in uso, oppure non è più collegato'},
+    'zones.dacInUse': {'en': 'This DAC plays the zone "{zone}": remove the zone first',
+                       'it': 'Questo DAC suona la zona "{zone}": togli prima la zona'},
+    'zones.tooMany': {'en': 'At most {max} zones', 'it': 'Al massimo {max} zone'},
+    'zones.badName': {'en': 'Use up to 32 characters, without quotes', 'it': 'Usa al massimo 32 caratteri, senza virgolette'},
+    'zones.notFound': {'en': 'This zone no longer exists', 'it': 'Questa zona non esiste più'},
+    'zones.saveFailed': {'en': 'Could not save the zones', 'it': 'Non sono riuscito a salvare le zone'},
+
+    # ── Multiroom / Lyrion server role ──────────────────────────────
+    'lms.invalidHost': {'en': 'Invalid server address: {host}. Use an IP address (192.168.1.50) or a name (nas.local)',
+                        'it': 'Indirizzo del server non valido: {host}. Usa un indirizzo IP (192.168.1.50) o un nome (nas.local)'},
+    'lms.hostNotFound': {'en': 'No device called {host} was found on the network. Check the name, or use its IP address',
+                         'it': 'Nessun dispositivo chiamato {host} trovato sulla rete. Controlla il nome, oppure usa il suo indirizzo IP'},
+    'lms.useLocalMode': {'en': 'Use "This device" mode for the local server',
+                         'it': 'Usa la modalità "Questo dispositivo" per il server locale'},
+    'lms.ownAddress': {'en': '{host} is this device itself. To use its own music server, choose the internal server instead of an external one',
+                       'it': '{host} è questo stesso dispositivo. Per usare il suo server musicale scegli il server interno invece di uno esterno'},
+    'lms.invalidMode': {'en': 'Invalid mode: {mode}', 'it': 'Modalità non valida: {mode}'},
+    'lms.sqConfigMissing': {'en': 'squeezelite configuration not found', 'it': 'Configurazione squeezelite non trovata'},
+    'lms.serverSetRestartWarn': {'en': 'Server set ({target}); squeezelite restart: {err}',
+                                 'it': 'Server impostato ({target}); riavvio squeezelite: {err}'},
+    'lms.serverSetRestartFailed': {'en': 'Server set ({target}); restart failed',
+                                   'it': 'Server impostato ({target}); riavvio non riuscito'},
+    'lms.localRestored': {'en': 'Local Lyrion server restored', 'it': 'Ripristinato il server Lyrion locale'},
+    'lms.volatileBoot': {'en': 'Warning: this device started without its data partition, so the choice will be lost at the next restart. Restart it and set it again.',
+                         'it': 'Attenzione: questo apparecchio è partito senza la sua partizione dati, quindi la scelta andrà persa al prossimo riavvio. Riavvialo e rifai la scelta.'},
+    'lms.serverSet': {'en': 'Lyrion server set to {target}; this device\'s own server has been switched off',
+                      'it': 'Server Lyrion impostato su {target}; il server di questo apparecchio è stato spento'},
+
+    # ── Player name ──────────────────────────────────────────────────
+    'player.invalidName': {'en': 'Invalid name: letters, numbers, dot, dash and underscore only, '
+                                  'no spaces (max 24 characters)',
+                           'it': 'Nome non valido: solo lettere, numeri, punto, trattino e underscore, '
+                                 'senza spazi (max 24 caratteri)'},
+    'player.nameSetRestartWarn': {'en': 'Name set ({name}); squeezelite restart: {err}',
+                                  'it': 'Nome impostato ({name}); riavvio squeezelite: {err}'},
+    'player.nameSetRestartFailed': {'en': 'Name set ({name}); restart failed',
+                                    'it': 'Nome impostato ({name}); riavvio non riuscito'},
+    'player.nameSet': {'en': 'Player name set to {name}', 'it': 'Nome player impostato su {name}'},
+    'player.toggleFailed': {'en': 'The player on/off operation failed.',
+                            'it': "L'operazione di accensione/spegnimento del player non è riuscita."},
+    'player.enabled': {'en': 'Player enabled.', 'it': 'Player abilitato.'},
+    'player.disabled': {'en': 'Player disabled.', 'it': 'Player disabilitato.'},
+
+    # ── Device name (hostname + player name, set together) ────────────
+    'device.invalidName': {'en': 'Invalid name: letters, numbers and dashes only, no spaces '
+                                  '(max 24 characters, cannot start or end with a dash)',
+                           'it': 'Nome non valido: solo lettere, numeri e trattini, senza spazi '
+                                 '(max 24 caratteri, non può iniziare o finire con un trattino)'},
+    'device.hostnameSetFailed': {'en': 'Could not set the device name.',
+                                 'it': 'Impossibile impostare il nome del dispositivo.'},
+    'device.playerNameFailed': {'en': 'The device is now called {name} on the network, but the player '
+                                      'name could not be changed: try again.',
+                                'it': 'Ora in rete l\'apparecchio si chiama {name}, ma non è stato '
+                                      'possibile cambiare il nome del player: riprova.'},
+    'device.nameSet': {'en': 'Device name set to {name}', 'it': 'Nome dispositivo impostato su {name}'},
+
+    # ── SSH ──────────────────────────────────────────────────────────
+    'ssh.installFailed': {'en': 'Could not install openssh-server.',
+                          'it': 'Impossibile installare openssh-server.'},
+    'ssh.toggleFailed': {'en': 'The SSH operation failed.', 'it': "L'operazione SSH non è riuscita."},
+    'ssh.enabled': {'en': 'SSH enabled.', 'it': 'SSH abilitato.'},
+    'ssh.disabled': {'en': 'SSH disabled.', 'it': 'SSH disabilitato.'},
+
+    # ── Shell (SSH/console) account ────────────────────────────────
+    'shell.badUsername': {'en': 'Invalid username: use 3-32 lowercase letters, digits, - or _.',
+                          'it': 'Nome utente non valido: usa 3-32 lettere minuscole, cifre, - oppure _.'},
+    'shell.reservedUsername': {'en': 'The name "{username}" is reserved by the system.',
+                               'it': 'Il nome "{username}" è riservato dal sistema.'},
+    'shell.shortPassword': {'en': 'The password must be at least 8 characters long.',
+                            'it': 'La password deve contenere almeno 8 caratteri.'},
+    'shell.badPassword': {'en': 'The password cannot contain ":" or a line break.',
+                          'it': 'La password non può contenere ":" o un a capo.'},
+    'shell.createFailed': {'en': 'Could not create the login. See the system log for details.',
+                           'it': "Impossibile creare l'utenza. Controlla il log di sistema per i dettagli."},
+
+    # ── Tailscale ────────────────────────────────────────────────────
+    'tailscale.alreadyInstalled': {'en': 'Tailscale is already installed', 'it': 'Tailscale è già installato'},
+    'tailscale.installFailedNetwork': {'en': 'Tailscale installation failed — check your Internet '
+                                              'connection and try again',
+                                       'it': 'Installazione di Tailscale fallita — controlla la connessione '
+                                             'a Internet e riprova'},
+    'tailscale.installFailed': {'en': 'Tailscale installation failed', 'it': 'Installazione di Tailscale fallita'},
+    'tailscale.installed': {'en': 'Tailscale installed', 'it': 'Tailscale installato'},
+    'tailscale.notInstalled': {'en': 'Tailscale is not installed on this device. Complete the system '
+                                      'update and try again.',
+                               'it': "Tailscale non è installato sul dispositivo. Completa l'aggiornamento "
+                                     'di sistema e riprova.'},
+    'tailscale.enableFailed': {'en': 'Enabling Tailscale failed', 'it': 'Attivazione Tailscale fallita'},
+    'tailscale.disableFailed': {'en': 'Disabling Tailscale failed', 'it': 'Disattivazione Tailscale fallita'},
+    'tailscale.openLink': {'en': 'Open the link to authorize this device',
+                           'it': 'Apri il link per autorizzare questo dispositivo'},
+    'tailscale.enabled': {'en': 'Tailscale enabled', 'it': 'Tailscale attivato'},
+    'tailscale.enabling': {'en': 'Enabling Tailscale…', 'it': 'Attivazione Tailscale in corso…'},
+    'tailscale.disabled': {'en': 'Tailscale disabled', 'it': 'Tailscale disattivato'},
+
+    # ── Mouse pointer / misc preferences ────────────────────────────
+    'prefs.saveFailed': {'en': 'Could not save the preference', 'it': 'Impossibile salvare la preferenza'},
+    'prefs.vuStyleUnknown': {'en': 'That VU meter style is not installed', 'it': 'Questo stile di VU meter non è installato'},
+    # ── VU meter store ──────────────────────────────────────────────
+    'vuStore.catalogUnavailable': {'en': 'Could not reach the list of VU meters to download — check the Internet connection',
+                                   'it': "Impossibile leggere l'elenco dei VU meter da scaricare — controlla la connessione a Internet"},
+    'vuStore.signatureInvalid': {'en': 'The list of VU meters did not pass the security check and was ignored',
+                                 'it': "L'elenco dei VU meter non ha superato il controllo di sicurezza ed è stato ignorato"},
+    'vuStore.catalogInvalid': {'en': 'The list of VU meters could not be read', 'it': "Impossibile leggere l'elenco dei VU meter"},
+    'vuStore.unknown': {'en': 'That VU meter is not available for download', 'it': 'Questo VU meter non è disponibile da scaricare'},
+    'vuStore.builtin': {'en': 'This VU meter is already on the device', 'it': "Questo VU meter è già presente nell'apparecchio"},
+    'vuStore.unsupported': {'en': 'This VU meter needs a newer version of the device software',
+                            'it': "Questo VU meter richiede un aggiornamento dell'apparecchio"},
+    'vuStore.busy': {'en': 'Already in progress', 'it': 'Operazione già in corso'},
+    'vuStore.downloadFailed': {'en': 'Download failed — check the Internet connection',
+                               'it': 'Download non riuscito — controlla la connessione a Internet'},
+    'vuStore.noRoom': {'en': 'Not enough room on the system disk: some space always stays free for Lyrion and the system',
+                       'it': 'Non c\'è abbastanza spazio sul disco di sistema: un po\' di spazio resta sempre libero per Lyrion e il sistema'},
+    'vuStore.verifyFailed': {'en': 'The downloaded file is damaged and was discarded', 'it': 'Il file scaricato è danneggiato ed è stato scartato'},
+    'vuStore.invalidPackage': {'en': 'This VU meter package is not valid', 'it': 'Il pacchetto di questo VU meter non è valido'},
+    'vuStore.installFailed': {'en': 'Could not install the VU meter', 'it': 'Impossibile installare il VU meter'},
+    'vuStore.notInstalled': {'en': 'That VU meter was not downloaded', 'it': 'Questo VU meter non è stato scaricato'},
+    'vuStore.removeFailed': {'en': 'Could not remove the VU meter', 'it': 'Impossibile rimuovere il VU meter'},
+    # ── Now-playing animation store ─────────────────────────────────
+    'animStore.catalogUnavailable': {'en': 'Could not reach the list of animations to download — check the Internet connection',
+                                     'it': "Impossibile leggere l'elenco delle animazioni da scaricare — controlla la connessione a Internet"},
+    'animStore.signatureInvalid': {'en': 'The list of animations did not pass the security check and was ignored',
+                                   'it': "L'elenco delle animazioni non ha superato il controllo di sicurezza ed è stato ignorato"},
+    'animStore.catalogInvalid': {'en': 'The list of animations could not be read', 'it': "Impossibile leggere l'elenco delle animazioni"},
+    'animStore.unknown': {'en': 'That animation is not available for download', 'it': 'Questa animazione non è disponibile da scaricare'},
+    'animStore.builtin': {'en': 'This animation is already on the device', 'it': "Questa animazione è già presente nell'apparecchio"},
+    'animStore.unsupported': {'en': 'This animation needs a newer version of the device software',
+                              'it': "Questa animazione richiede un aggiornamento dell'apparecchio"},
+    'animStore.busy': {'en': 'Already in progress', 'it': 'Operazione già in corso'},
+    'animStore.downloadFailed': {'en': 'Download failed — check the Internet connection',
+                                 'it': 'Download non riuscito — controlla la connessione a Internet'},
+    'animStore.noRoom': {'en': 'Not enough room on the system disk: some space always stays free for Lyrion and the system',
+                       'it': 'Non c\'è abbastanza spazio sul disco di sistema: un po\' di spazio resta sempre libero per Lyrion e il sistema'},
+    'animStore.verifyFailed': {'en': 'The downloaded file is damaged and was discarded', 'it': 'Il file scaricato è danneggiato ed è stato scartato'},
+    'animStore.invalidPackage': {'en': 'This animation package is not valid', 'it': "Il pacchetto di questa animazione non è valido"},
+    'animStore.installFailed': {'en': 'Could not install the animation', 'it': "Impossibile installare l'animazione"},
+    'animStore.notInstalled': {'en': 'That animation was not downloaded', 'it': 'Questa animazione non è stata scaricata'},
+    'animStore.removeFailed': {'en': 'Could not remove the animation', 'it': "Impossibile rimuovere l'animazione"},
+    'pointer.shown': {'en': 'Mouse pointer shown', 'it': 'Puntatore mouse attivato'},
+    'pointer.hidden': {'en': 'Mouse pointer hidden', 'it': 'Puntatore mouse disattivato'},
+
+    # ── Display mode (GUI / headless) ───────────────────────────────
+    'displayMode.invalid': {'en': 'Invalid mode', 'it': 'Modalità non valida'},
+    'update.inProgressRetry': {'en': 'Update in progress — try again once it finishes',
+                               'it': 'Aggiornamento in corso — riprova a fine aggiornamento'},
+    'displayMode.changeFailed': {'en': 'Mode change failed', 'it': 'Cambio modalità fallito'},
+    'displayMode.guiEnabled': {'en': 'Screen mode enabled', 'it': 'Modalità con schermo attivata'},
+    'displayMode.headlessEnabled': {'en': 'Headless mode enabled — the screen will turn off',
+                                    'it': 'Modalità headless attivata — lo schermo verrà spento'},
+
+    # ── Screen rotation ─────────────────────────────────────────────
+    'uiRotation.invalid': {'en': 'Invalid rotation', 'it': 'Rotazione non valida'},
+    'uiRotation.saveFailed': {'en': 'Could not save the screen rotation',
+                              'it': 'Impossibile salvare la rotazione dello schermo'},
+    'uiRotation.saved': {'en': 'Rotation saved — the startup screen turns too from the next restart',
+                         'it': 'Rotazione salvata — dal prossimo riavvio si gira anche la schermata di avvio'},
+    'uiRotation.savedScreenOnly': {'en': 'Rotation saved for the screen; the startup screen could not be turned',
+                                   'it': 'Rotazione salvata per lo schermo; non è stato possibile girare la schermata di avvio'},
+
+    # ── Interfaccia su schermo: quale delle due (Electron / Qt) ─────
+    'uiEngine.invalid': {'en': 'Invalid interface', 'it': 'Interfaccia non valida'},
+    'uiEngine.notInstalled': {'en': 'That interface is not installed on this device',
+                              'it': "Quell'interfaccia non è installata su questo dispositivo"},
+    'uiEngine.changeFailed': {'en': 'Interface change failed', 'it': "Cambio dell'interfaccia fallito"},
+    'uiEngine.electronEnabled': {'en': 'Electron interface enabled', 'it': 'Interfaccia Electron attivata'},
+    'uiEngine.qtEnabled': {'en': 'Qt interface enabled', 'it': 'Interfaccia Qt attivata'},
+    # ── UI render resolution ────────────────────────────────────────
+    'uiResolution.invalid': {'en': 'Invalid resolution', 'it': 'Risoluzione non valida'},
+    'uiResolution.unavailable': {'en': 'Feature not available on this system version',
+                                 'it': 'Funzione non disponibile su questa versione di sistema'},
+    'uiResolution.changeFailed': {'en': 'Resolution change failed', 'it': 'Cambio risoluzione fallito'},
+    'uiResolution.updated': {'en': 'Resolution updated — the interface is restarting',
+                             'it': "Risoluzione aggiornata — l'interfaccia si riavvia"},
+
+    # ── More than one screen ────────────────────────────────────────
+    'uiScreens.invalid': {'en': 'Invalid choice for the screens', 'it': 'Scelta non valida per gli schermi'},
+    'uiScreens.notConnected': {'en': 'That screen is not connected', 'it': 'Quello schermo non è collegato'},
+    'uiScreens.changeFailed': {'en': 'Could not change what the screens show',
+                               'it': 'Impossibile cambiare cosa mostrano gli schermi'},
+    'uiScreens.updated': {'en': 'Screens updated — the interface is restarting',
+                          'it': "Schermi aggiornati — l'interfaccia si riavvia"},
+
+    # ── Panel refresh rate ──────────────────────────────────────────
+    'uiRefresh.invalid': {'en': 'Invalid refresh rate', 'it': 'Frequenza di aggiornamento non valida'},
+    'uiRefresh.unavailable': {'en': 'Feature not available on this system version',
+                              'it': 'Funzione non disponibile su questa versione di sistema'},
+    'uiRefresh.changeFailed': {'en': 'Refresh rate change failed', 'it': 'Cambio frequenza fallito'},
+    'uiRefresh.updated': {'en': 'Refresh rate updated', 'it': 'Frequenza pannello aggiornata'},
+
+    # ── Provisioning / factory reset / web-admin credential reset ──
+    'provisioning.notActive': {'en': 'Provisioning is not active', 'it': 'Provisioning non attivo'},
+    'factoryReset.scriptMissing': {'en': 'Reset script not available',
+                                   'it': 'Script di ripristino non disponibile'},
+    'factoryReset.started': {'en': 'Factory reset started — the device will reboot',
+                             'it': 'Ripristino di fabbrica avviato — il dispositivo si riavvierà'},
+    'factoryReset.startFailed': {'en': 'Could not start the reset', 'it': 'Avvio ripristino fallito'},
+    'webui.credsReset': {'en': 'Web interface credentials cleared',
+                         'it': 'Credenziali interfaccia web azzerate'},
+    'webui.credsResetFailed': {'en': 'Credential reset failed', 'it': 'Reset credenziali fallito'},
+
+    # ── DSP engine ───────────────────────────────────────────────────
+    'dsp.unavailable': {'en': 'DSP is not available on this device', 'it': 'DSP non disponibile su questo dispositivo'},
+    'dsp.opFailed': {'en': 'DSP operation failed', 'it': 'Operazione DSP fallita'},
+    'dsp.enabled': {'en': 'DSP enabled', 'it': 'DSP attivato'},
+    'dsp.disabled': {'en': 'DSP disabled', 'it': 'DSP disattivato'},
+
+    # ── DSP presets ──────────────────────────────────────────────────
+    'dspPreset.invalidName': {'en': 'Invalid preset name', 'it': 'Nome preset non valido'},
+    'dspPreset.maxReached': {'en': 'Maximum number of presets reached',
+                             'it': 'Numero massimo di preset raggiunto'},
+    'dspPreset.saveFailed': {'en': 'Saving the preset failed', 'it': 'Salvataggio preset fallito'},
+    'dspPreset.saved': {'en': 'Preset saved', 'it': 'Preset salvato'},
+    'dspPreset.notFound': {'en': 'Preset not found', 'it': 'Preset non trovato'},
+    'dspPreset.loaded': {'en': 'Preset loaded', 'it': 'Preset caricato'},
+    'dspPreset.nameExists': {'en': 'A preset with this name already exists',
+                             'it': 'Esiste già un preset con questo nome'},
+    'dspPreset.renameFailed': {'en': 'Renaming the preset failed', 'it': 'Rinomina preset fallita'},
+    'dspPreset.renamed': {'en': 'Preset renamed', 'it': 'Preset rinominato'},
+    'dspPreset.deleteFailed': {'en': 'Deleting the preset failed', 'it': 'Eliminazione preset fallita'},
+    'dspPreset.deleted': {'en': 'Preset deleted', 'it': 'Preset eliminato'},
+
+    # ── Bluetooth ────────────────────────────────────────────────────
+    'bluetooth.unavailableUpdate': {'en': 'Bluetooth is not available: update the system',
+                                    'it': 'Bluetooth non disponibile: aggiorna il sistema'},
+    'bluetooth.opFailed': {'en': 'Bluetooth operation failed', 'it': 'Operazione Bluetooth fallita'},
+    'bluetooth.enabled': {'en': 'Bluetooth enabled', 'it': 'Bluetooth abilitato'},
+    'bluetooth.disabled': {'en': 'Bluetooth disabled', 'it': 'Bluetooth disabilitato'},
+    'bluetooth.unavailable': {'en': 'Bluetooth is not available', 'it': 'Bluetooth non disponibile'},
+    'bluetooth.invalidAddress': {'en': 'Invalid Bluetooth address', 'it': 'Indirizzo Bluetooth non valido'},
+    'bluetooth.deviceNotFound': {'en': 'Speaker not found', 'it': 'Altoparlante non trovato'},
+    'bluetooth.forgotten': {'en': 'Speaker forgotten', 'it': 'Altoparlante dimenticato'},
+    'bluetooth.statusUnavailable': {'en': 'Bluetooth status unavailable',
+                                    'it': 'Stato Bluetooth non disponibile'},
+    'bluetooth.turnOnFirst': {'en': 'Turn Bluetooth on first', 'it': 'Prima accendi il Bluetooth'},
+    'bluetooth.noAdapter': {'en': 'No Bluetooth adapter on this device',
+                            'it': 'Nessun Bluetooth su questo apparecchio'},
+    'bluetooth.scanDone': {'en': 'Search finished', 'it': 'Ricerca finita'},
+    'bluetooth.scanFailed': {'en': 'The search failed', 'it': 'La ricerca non è riuscita'},
+    'bluetooth.pairFailed': {'en': 'Could not pair with the speaker: put it in pairing mode and try again',
+                             'it': "Non è riuscito il collegamento con l'altoparlante: mettilo in modalità accoppiamento e riprova"},
+    'bluetooth.alreadyAdded': {'en': 'This speaker is already in the list',
+                               'it': "Questo altoparlante è già nell'elenco"},
+    'bluetooth.speakerAdded': {'en': 'Speaker added: it now shows up as a player of its own',
+                               'it': 'Altoparlante aggiunto: ora compare come lettore a sé'},
+    'bluetooth.connectFailed': {'en': 'Could not connect to the speaker: check that it is on and nearby',
+                                'it': "Non è riuscito il collegamento all'altoparlante: controlla che sia acceso e vicino"},
+    'bluetooth.connected': {'en': 'Speaker connected', 'it': 'Altoparlante collegato'},
+    'bluetooth.disconnected': {'en': 'Speaker disconnected', 'it': 'Altoparlante scollegato'},
+    'bluetooth.saved': {'en': 'Saved', 'it': 'Salvato'},
+    # telecomandi Bluetooth: gli stessi passi degli altoparlanti, ma i messaggi
+    # parlano di un telecomando (chi accoppia un telecomando non vuole leggere
+    # "altoparlante non trovato")
+    'bluetooth.remoteNeedsUpdate': {
+        'en': 'This device cannot pair a Bluetooth remote yet: install the latest update',
+        'it': 'Questo apparecchio non può ancora accoppiare un telecomando Bluetooth: installa l\'ultimo aggiornamento'},
+    'bluetooth.remoteNotFound': {'en': 'Remote not found', 'it': 'Telecomando non trovato'},
+    'bluetooth.remoteAlreadyAdded': {'en': 'This remote is already in the list',
+                                     'it': 'Questo telecomando è già nell\'elenco'},
+    'bluetooth.remotePairFailed': {
+        'en': 'Could not pair with the remote: put it in pairing mode and try again',
+        'it': 'Non sono riuscito ad accoppiare il telecomando: mettilo in accoppiamento e riprova'},
+    'bluetooth.remoteAdded': {'en': 'Remote added: press a key to use it',
+                              'it': 'Telecomando aggiunto: premi un tasto per usarlo'},
+    'bluetooth.remoteForgotten': {'en': 'Remote forgotten', 'it': 'Telecomando dimenticato'},
+    'remote.saved': {'en': 'Saved', 'it': 'Salvato'},
+    'remote.saveFailed': {'en': 'Could not save the choice', 'it': 'Non sono riuscito a salvare la scelta'},
+    'remote.badKey': {'en': 'That key is not valid', 'it': 'Quel tasto non è valido'},
+    'remote.badAction': {'en': 'That action does not exist', 'it': 'Quell\'azione non esiste'},
+    'touch.reset': {'en': 'Touchscreen restarted', 'it': 'Touch screen riavviato'},
+    'touch.none': {'en': 'No touchscreen found', 'it': 'Nessun touch screen trovato'},
+    'touch.failed': {'en': 'Could not restart the touchscreen', 'it': 'Non sono riuscito a riavviare il touch screen'},
+
+    # ── OTA channel ──────────────────────────────────────────────────
+    'ota.invalidChannel': {'en': 'Invalid channel', 'it': 'Canale non valido'},
+    'ota.channelSaveFailed': {'en': 'Could not save the channel', 'it': 'Impossibile salvare il canale'},
+
+    # ── OTA updates (UI / system / OS) + the multi-component sequencer ─
+    'update.checkFailed': {'en': 'Update check failed, please try again',
+                           'it': 'Controllo aggiornamenti fallito, riprova'},
+    'update.noneAvailable': {'en': 'No update available', 'it': 'Nessun aggiornamento disponibile'},
+    'update.noneAvailableOs': {'en': 'No OS update available', 'it': 'Nessun aggiornamento OS disponibile'},
+    'update.checksumMissing': {'en': 'Checksum (.sha256) missing from the release',
+                               'it': 'Checksum (.sha256) mancante nella release'},
+    'update.checksumReadFailed': {'en': 'Reading the checksum failed', 'it': 'Lettura checksum fallita'},
+    'update.checksumEmpty': {'en': 'Checksum is empty', 'it': 'Checksum vuoto'},
+    'update.sigMissing': {'en': 'Signature (.sha256.sig) missing: OS update refused',
+                          'it': 'Firma (.sha256.sig) mancante: aggiornamento OS rifiutato'},
+    'update.startFailed': {'en': 'Starting the update failed', 'it': 'Avvio aggiornamento fallito'},
+    'update.alreadyInProgress': {'en': 'Update already in progress', 'it': 'Aggiornamento già in corso'},
+    'update.planSaveFailed': {'en': 'Saving the update plan failed', 'it': 'Salvataggio del piano fallito'},
+    'update.inProgress': {'en': 'Update in progress', 'it': 'Aggiornamento in corso'},
+    'update.liveSession': {'en': "This is a live session (running from the USB stick): updates can't be installed here — install Osmium Sound first",
+                           'it': 'Questa è una sessione live (avviata dalla chiavetta): qui gli aggiornamenti non si possono installare — prima installa Osmium Sound'},
+    # ── Isolated update mode (stage-then-reboot-then-apply) ────────────
+    'update.stagedPendingReboot': {
+        'en': 'Update verified — the device will restart to apply it',
+        'it': 'Aggiornamento verificato — il dispositivo si riavvierà per applicarlo'},
+    'update.applying': {
+        'en': 'Applying the update — do not disconnect power',
+        'it': 'Applicazione aggiornamento in corso — non staccare l\'alimentazione'},
+    'update.applyDone': {'en': 'Update applied successfully', 'it': 'Aggiornamento applicato con successo'},
+    'update.applyError': {'en': 'The update could not be applied',
+                          'it': "Non è stato possibile applicare l'aggiornamento"},
+
+    # ── Messages written by the shell side of the updater (stage/apply
+    # runners, hifi-image-update.sh) as a `key` + `params` next to their
+    # plain-English text, and translated here for whichever frontend polls
+    # /update/status — so the kiosk in Italian and the web admin in English
+    # both read the same step in their own language. ──
+    'update.stagedRebooting': {'en': 'Update verified — restarting to apply it',
+                               'it': 'Aggiornamento verificato, riavvio in corso'},
+    'update.image.rebooting': {'en': 'System image installed — restarting into the new system',
+                               'it': 'Immagine di sistema installata, riavvio sul nuovo sistema'},
+    'update.image.media': {'en': 'Moving your music onto the data partition…',
+                           'it': 'Spostamento della musica sulla partizione dati…'},
+    'update.image.seed': {'en': 'Copying your settings to the data partition…',
+                          'it': 'Copia delle impostazioni sulla partizione dati…'},
+    'update.image.install': {'en': 'Installing system image {version} into the standby slot…',
+                             'it': "Installazione dell'immagine di sistema {version} nello slot di riserva…"},
+    'update.image.download': {'en': 'Downloading system image {version}… {pct}%',
+                              'it': "Download dell'immagine di sistema {version}… {pct}%"},
+    'update.image.downloadFailed': {'en': 'Downloading the system image failed: check the network and try again',
+                                    'it': "Download dell'immagine di sistema non riuscito: controlla la rete e riprova"},
+    'update.image.checksum': {'en': 'The downloaded system image is damaged (checksum mismatch): try again',
+                              'it': "L'immagine di sistema scaricata è danneggiata (checksum non corrispondente): riprova"},
+    'update.image.write': {'en': 'Writing system image {version}… {pct}%',
+                           'it': "Scrittura dell'immagine di sistema {version}… {pct}%"},
+    'update.image.selector': {'en': 'Enabling the A/B boot selector…',
+                              'it': 'Attivazione del selettore di avvio A/B…'},
+    'update.image.staged': {'en': 'System image {version} installed — the new system starts at the next restart',
+                            'it': 'Immagine di sistema {version} installata: al riavvio parte il nuovo sistema'},
+    'update.image.ready': {'en': 'System image {version} ready', 'it': 'Immagine di sistema {version} pronta'},
+    'update.image.badSource': {'en': 'Invalid system image source', 'it': "Sorgente dell'immagine di sistema non valida"},
+    'update.image.notConverted': {'en': 'RAUC is not configured: the device has not been converted to the A/B layout yet',
+                                  'it': "RAUC non configurato: l'apparecchio non è ancora convertito allo schema A/B"},
+    'update.image.mediaFailed': {'en': 'Moving the music folders to the data partition failed',
+                                 'it': 'Spostamento delle cartelle di musica sulla partizione dati fallito'},
+    'update.image.seedFailed': {'en': 'Copying the settings to the data partition failed',
+                                'it': 'Copia delle impostazioni sulla partizione dati fallita'},
+    'update.image.installFailed': {'en': 'Installing the system image failed (rauc rc={rc})',
+                                   'it': "Installazione dell'immagine di sistema fallita (rauc rc={rc})"},
+    'update.image.slotBusy': {'en': 'The standby system slot {dev} is in use and cannot be written: restart and try again',
+                              'it': 'Lo slot di sistema di riserva {dev} è in uso e non si può scrivere: riavvia e riprova'},
+    'update.image.selectorFailed': {'en': 'Writing the A/B boot selector failed',
+                                    'it': 'Scrittura del selettore di avvio A/B fallita'},
+    'update.ab.noSpace': {
+        'en': 'Update failed: not enough space to switch to the new system layout — free at least {needed} MiB on this {disk} MiB disk (8 GB or more is recommended), then restart: the device picks the switch up again on its own',
+        'it': 'Aggiornamento non riuscito: spazio insufficiente per passare al nuovo schema di sistema — libera almeno {needed} MiB su questo disco da {disk} MiB (consigliati 8 GB o più), poi riavvia: il passaggio riparte da solo'},
+    'update.ab.musicOnSystemDisk': {
+        'en': 'Update failed: the music kept in folders on the system disk ({music} MiB) does not fit in the {data} MiB the new system leaves for your data. Move it onto a USB or internal disk and restart: the device picks the switch up again on its own',
+        'it': 'Aggiornamento non riuscito: la musica tenuta in cartelle del disco di sistema ({music} MiB) non entra nei {data} MiB che il nuovo sistema lascia ai dati. Spostala su un disco USB o interno e riavvia: il passaggio riparte da solo'},
+    'update.ab.armed': {
+        'en': 'Ready to switch to the new system: it happens at the next restart',
+        'it': 'Tutto pronto per il passaggio al nuovo sistema: avverrà al prossimo riavvio'},
+    'update.ab.notConvertible': {
+        'en': 'Update failed: this device cannot switch to the new system layout: {reason}',
+        'it': 'Aggiornamento non riuscito: questo apparecchio non può passare al nuovo schema di sistema: {reason}'},
+    'update.ab.prepareFailed': {
+        'en': 'Update failed: the switch to the new system layout could not be prepared',
+        'it': 'Aggiornamento non riuscito: non è stato possibile preparare il passaggio al nuovo schema di sistema'},
+    'update.apply.stuckUpdateMode': {
+        'en': 'Could not leave update mode: restart the device and try again',
+        'it': "Non è stato possibile uscire dalla modalità aggiornamento: riavvia l'apparecchio e riprova"},
+    'update.ab.rebooting': {
+        'en': 'Restarting now to switch to the new system',
+        'it': 'Riavvio in corso per passare al nuovo sistema'},
+    'update.ab.converting': {'en': 'Switching to the new system — the device will restart on its own',
+                             'it': 'Passaggio al nuovo sistema — l\'apparecchio si riavvierà da solo'},
+    'update.image.kickFailed': {'en': 'The system image update could not be started — try "Update now" again',
+                                'it': 'Impossibile avviare l\'aggiornamento dell\'immagine di sistema — riprova con "Aggiorna ora"'},
+    'update.apply.noPlan': {'en': 'No update plan found in update mode — unexpected state',
+                            'it': 'Nessun piano di aggiornamento trovato in modalità update — stato inatteso'},
+    'update.apply.emptyPlan': {'en': 'The update plan has no components — unexpected state',
+                               'it': 'Il piano di aggiornamento non contiene componenti — stato inatteso'},
+    'update.apply.notStaged': {'en': "Step '{kind}' was not completed during staging (state: {state})",
+                               'it': "Passo '{kind}' non risulta completato in fase di staging (stato: {state})"},
+    'update.apply.stagedMissing': {'en': 'Staged package missing for {kind} {version}',
+                                   'it': 'Pacchetto staged mancante per {kind} {version}'},
+    'update.apply.failed': {'en': 'Applying {kind} {version} failed after {attempts} attempts (rc={rc})',
+                            'it': 'Applicazione di {kind} {version} fallita dopo {attempts} tentativi (rc={rc})'},
+    'update.apply.gaveUp': {'en': 'The update did not complete after {attempts} attempts — try "Update now" again',
+                            'it': 'L\'aggiornamento non si è completato dopo {attempts} tentativi — riprova con "Aggiorna ora"'},
+
+    # ── Disk install (bare-metal installer) + guided room correction ──
+    'install.enumFailed': {'en': 'Disk enumeration failed', 'it': 'Enumerazione dischi fallita'},
+    'install.invalidDisk': {'en': 'Invalid disk', 'it': 'Disco non valido'},
+    'install.cannotInstallOnBootMedia': {'en': 'Cannot install on the boot medium',
+                                         'it': 'Non è possibile installare sul supporto di avvio'},
+    'install.systemdRunNoResponse': {'en': 'systemd-run did not respond',
+                                     'it': 'systemd-run non ha risposto'},
+    'common.starting': {'en': 'Starting…', 'it': 'Avvio…'},
+    'common.cancelled': {'en': 'Cancelled', 'it': 'Annullato'},
+
+    # ── CD rip worker (hifi-rip-cd.py): it writes the code and its values
+    # into the status file, /api/cd/rip/status says it in the reader's
+    # language ─────────────────────────────────────────────────────────
+    'cdrip.usage': {'en': 'usage: hifi-rip-cd.py <plan.json>', 'it': 'uso: hifi-rip-cd.py <plan.json>'},
+    'cdrip.badPlan': {'en': 'Unreadable rip plan: {err}', 'it': 'Piano di rip illeggibile: {err}'},
+    'cdrip.destNotMounted': {'en': 'The destination is not mounted', 'it': 'La destinazione non è montata'},
+    'cdrip.noTracks': {'en': 'No tracks to rip', 'it': 'Nessuna traccia da rippare'},
+    'cdrip.noAudioTracks': {'en': 'No audio tracks to rip', 'it': 'Nessuna traccia audio da rippare'},
+    'cdrip.cancelled': {'en': 'Rip cancelled', 'it': 'Copia annullata'},
+    'cdrip.readingToc': {'en': 'Reading the disc index…', 'it': 'Lettura dell\'indice del disco…'},
+    'cdrip.track': {'en': 'Track {num}/{total}: {title}', 'it': 'Traccia {num}/{total}: {title}'},
+    'cdrip.readFailed': {'en': 'Reading track {num} failed (damaged disc?)',
+                         'it': 'Lettura della traccia {num} fallita (disco rovinato?)'},
+    'cdrip.encodeFailed': {'en': 'Encoding track {num} failed', 'it': 'Codifica della traccia {num} fallita'},
+    'cdrip.replayGain': {'en': 'ReplayGain…', 'it': 'ReplayGain…'},
+    'cdrip.done': {'en': '{album} — {total} tracks', 'it': '{album} — {total} tracce'},
+    'cdrip.doneUnverified': {'en': '{album} — {total} tracks ({unverified} not verified)',
+                             'it': '{album} — {total} tracce ({unverified} non verificate)'},
+    'cdrip.unexpected': {'en': 'Unexpected error: {err}', 'it': 'Errore inatteso: {err}'},
+    'roomcorr.updateRequired': {'en': 'A system update is required', 'it': 'Aggiornamento di sistema richiesto'},
+    'roomcorr.micNotFound': {'en': 'Microphone not found: connect a USB mic',
+                             'it': 'Microfono non trovato: collega un mic USB'},
+    'roomcorr.alreadyMeasuring': {'en': 'A measurement is already in progress', 'it': 'Misura già in corso'},
+    'roomcorr.noFilter': {'en': 'No filter present: run the measurement first',
+                          'it': 'Nessun filtro presente: esegui prima la misura'},
+
+    # ── Lyrion Music Server updates ─────────────────────────────────
+    'lyrion.badChannel': {'en': 'Unknown channel.', 'it': 'Canale sconosciuto.'},
+    'lyrion.channelSaveFailed': {'en': 'Could not save the channel.', 'it': 'Impossibile salvare il canale.'},
+    'lyrion.checkFailed': {'en': 'Could not check for Lyrion updates.',
+                           'it': 'Impossibile controllare gli aggiornamenti di Lyrion.'},
+    'lyrion.noBuildFound': {'en': 'No Lyrion build found on the download server.',
+                            'it': 'Nessuna build di Lyrion trovata sul server di download.'},
+    'lyrion.upToDate': {'en': 'Lyrion Music Server is already up to date.',
+                        'it': 'Lyrion Music Server è già aggiornato.'},
+    'lyrion.startFailed': {'en': 'Could not start the update.', 'it': "Impossibile avviare l'aggiornamento."},
+
+    # ── sources_server.py: applying sources to Lyrion prefs ─────────
+    'lyrion.yamlMissing': {'en': 'python3-yaml is not installed', 'it': 'python3-yaml non installato'},
+    'lyrion.prefsNotFound': {'en': 'Lyrion prefs file not found. Check that Lyrion is running '
+                                    '(systemctl status lyrionmusicserver).',
+                             'it': 'File prefs di Lyrion non trovato. Verifica che Lyrion sia avviato '
+                                   '(systemctl status lyrionmusicserver).'},
+    'lyrion.diskNotMounted': {'en': 'Disk not mounted: {disks}. Check the connection before applying.',
+                              'it': 'Disco non montato: {disks}. Verifica il collegamento prima di applicare.'},
+    'lyrion.applied': {'en': '{count} source(s) applied. Lyrion restarted and scanning.',
+                       'it': '{count} sorgenti applicate. Lyrion riavviato e in scansione.'},
+    'lyrion.appliedLive': {'en': '{count} source(s) applied.', 'it': '{count} sorgenti applicate.'},
+    'lyrion.applyBackground': {'en': 'Lyrion is not answering yet: the sources will be applied as soon as it restarts.',
+                               'it': 'Lyrion non risponde ancora: le sorgenti verranno applicate appena si riavvia.'},
+
+    # ── sources_server.py: backup creation ──────────────────────────
+    'backup.systemUpdateRequired': {'en': 'A system update is required',
+                                    'it': 'Aggiornamento di sistema richiesto'},
+    'backup.alreadyInProgress': {'en': 'A backup is already in progress', 'it': 'Backup già in corso'},
+    'restore.alreadyInProgress': {'en': 'A restore is already in progress', 'it': 'Ripristino già in corso'},
+    'backup.createFailed': {'en': 'Backup creation failed', 'it': 'Creazione backup fallita'},
+    'backup.invalidPassphrase': {'en': 'Invalid password', 'it': 'Password non valida'},
+    # The one password every backup is encrypted with (hifi_backup.save_passphrase)
+    'backup.passphraseMissing': {'en': 'Choose the backup password first: every backup is encrypted with it.',
+                                 'it': 'Prima scegli la password dei backup: ogni backup viene cifrato con quella.'},
+    'backup.passphraseUnreadable': {'en': 'The saved backup password can no longer be read on this device. Choose it again.',
+                                    'it': 'La password dei backup salvata non si legge più su questo apparecchio. Sceglila di nuovo.'},
+    'backup.passphraseTooShort': {'en': 'The backup password needs at least {n} characters.',
+                                  'it': 'La password dei backup deve avere almeno {n} caratteri.'},
+    'backup.passphraseSaveFailed': {'en': 'Could not save the backup password.',
+                                    'it': 'Non sono riuscito a salvare la password dei backup.'},
+    'backup.noCategoriesSelected': {'en': 'No category selected', 'it': 'Nessuna categoria selezionata'},
+    'backup.startFailedDetail': {'en': 'Starting the backup failed: {detail}',
+                                 'it': 'Avvio del backup fallito: {detail}'},
+    'backup.startFailed': {'en': 'Starting the backup failed', 'it': 'Avvio del backup fallito'},
+    # ── The system disk's reserve (hifi_diskguard.py) ──────────────────
+    'disk.noRoom': {
+        'en': 'Not enough room on the system disk: this needs {need} GB and {room} GB are left, '
+              'because {reserve} GB always stay free for Lyrion and the system. '
+              'Free some space or use another disk.',
+        'it': 'Non c\'è abbastanza spazio sul disco di sistema: servono {need} GB e ne restano {room}, '
+              'perché {reserve} GB restano sempre liberi per Lyrion e il sistema. '
+              'Libera un po\' di spazio o usa un altro disco.'},
+    'disk.noRoomPlain': {
+        'en': 'Not enough room on this disk: this needs {need} GB and only {room} GB are free. '
+              'Free some space or use another disk.',
+        'it': 'Non c\'è abbastanza spazio su questo disco: servono {need} GB e ne sono liberi solo {room}. '
+              'Libera un po\' di spazio o usa un altro disco.'},
+    'disk.noRoomStoppedPlain': {
+        'en': 'Stopped: this disk is full. What was not finished has been removed.',
+        'it': 'Interrotto: questo disco è pieno. Quel che non era finito è stato tolto.'},
+    'disk.noRoomInstall': {
+        'en': 'Not enough room on the system disk to install Lyrion: it needs {need} GB free and there are {free}. Free some space and try again.',
+        'it': 'Non c\'è abbastanza spazio sul disco di sistema per installare Lyrion: servono {need} GB liberi e ce ne sono {free}. Libera un po\' di spazio e riprova.'},
+    'disk.noRoomStopped': {
+        'en': 'Stopped: the system disk reached the {reserve} GB kept free for Lyrion and the system. '
+              'What was not finished has been removed.',
+        'it': 'Interrotto: il disco di sistema è arrivato ai {reserve} GB tenuti liberi per Lyrion e il sistema. '
+              'Quel che non era finito è stato tolto.'},
+    'backup.notFound': {'en': 'Backup not found', 'it': 'Backup non trovato'},
+    'backup.unreadable': {'en': 'Backup is not readable', 'it': 'Backup non leggibile'},
+    'backup.deleted': {'en': 'Backup deleted', 'it': 'Backup eliminato'},
+    'backup.saveFailed': {'en': 'Saving failed: {err}', 'it': 'Salvataggio fallito: {err}'},
+    'backup.noSpace': {'en': 'Not enough free disk space: about {mb} MB needed',
+                       'it': 'Spazio su disco insufficiente: servono circa {mb} MB'},
+    'backup.scheduleFailed': {'en': 'Could not turn on the weekly backup: {detail}',
+                              'it': 'Impossibile attivare il backup settimanale: {detail}'},
+    # hifi_backup.BackupError codes (encryption)
+    'backup.opensslMissing': {'en': 'openssl is not available: encrypted backup refused',
+                              'it': 'openssl non disponibile: backup cifrato rifiutato'},
+    'backup.cryptoTimeout': {'en': 'Encryption timed out', 'it': 'Timeout durante la cifratura'},
+    'backup.cryptoFailed': {'en': 'Encryption/decryption failed (wrong password?)',
+                            'it': 'Cifratura/decifratura fallita (password sbagliata?)'},
+    # hifi-backup-run.py: progress and failures of a backup job. The worker
+    # writes the code into the status file and /api/backup/status translates
+    # it for whoever is asking (a scheduled run has nobody to ask a language of).
+    'backup.moduleMissing': {'en': 'The backup module is not available: {err}',
+                             'it': 'Modulo di backup non disponibile: {err}'},
+    'backup.jobUnreadable': {'en': 'The backup request could not be read: {err}',
+                             'it': 'Richiesta di backup illeggibile: {err}'},
+    'backup.badInvocation': {'en': 'Invalid backup request', 'it': 'Richiesta di backup non valida'},
+    'backup.preparing': {'en': 'Preparing…', 'it': 'Preparazione…'},
+    'backup.checkingSpace': {'en': 'Checking free disk space…', 'it': 'Verifica spazio disponibile…'},
+    'backup.archiving': {'en': 'Creating the archive…', 'it': 'Creazione archivio…'},
+    'backup.encrypting': {'en': 'Encrypting…', 'it': 'Cifratura…'},
+    'backup.finishing': {'en': 'Finishing…', 'it': 'Finalizzazione…'},
+    'backup.completed': {'en': 'Backup completed: {count} file(s).', 'it': 'Backup completato: {count} file.'},
+    'backup.storeFailed': {'en': 'Could not create the backup folder: {err}',
+                           'it': 'Impossibile creare la cartella dei backup: {err}'},
+    'backup.generationFailed': {'en': 'Could not create the backup: {err}',
+                                'it': 'Impossibile creare il backup: {err}'},
+    'backup.archiveFailed': {'en': 'Creating the archive failed: {err}',
+                             'it': 'Creazione archivio fallita: {err}'},
+    'backup.noFiles': {'en': 'Nothing to back up', 'it': 'Nessun file da salvare'},
+    'backup.encryptFailed': {'en': 'Encryption failed: {err}', 'it': 'Cifratura fallita: {err}'},
+    'backup.manifestFailed': {'en': 'Writing the manifest failed: {err}',
+                              'it': 'Scrittura manifest fallita: {err}'},
+
+    # ── sources_server.py: restore ───────────────────────────────────
+    'restore.openingArchive': {'en': 'Opening archive…', 'it': 'Apertura archivio…'},
+    'restore.newerVersion': {'en': 'Backup created by a newer version: update the device before restoring it',
+                             'it': 'Backup creato da una versione più recente: aggiorna il dispositivo '
+                                   'prima di ripristinarlo'},
+    'restore.noCategories': {'en': 'No category to restore', 'it': 'Nessuna categoria da ripristinare'},
+    'restore.stoppingLyrion': {'en': 'Stopping Lyrion…', 'it': 'Arresto di Lyrion…'},
+    'restore.restoringFiles': {'en': 'Restoring files… ({done}/{total})',
+                               'it': 'Ripristino file… ({done}/{total})'},
+    'restore.startingLyrion': {'en': 'Starting Lyrion…', 'it': 'Riavvio di Lyrion…'},
+    'restore.applyingChanges': {'en': 'Applying changes (network, DSP, services)…',
+                                'it': 'Applicazione modifiche (rete, DSP, servizi)…'},
+    'restore.lyrionScanning': {'en': "Lyrion is finishing its library scan in the background.",
+                               'it': 'Lyrion sta terminando la scansione della libreria in background.'},
+    'restore.filesRestored': {'en': '{count} file(s) restored.', 'it': '{count} file ripristinati.'},
+    'restore.warningsPrefix': {'en': ' Warnings: ', 'it': ' Avvisi: '},
+    'restore.preparing': {'en': 'Preparing…', 'it': 'Preparazione…'},
+    'restore.snapshotting': {'en': 'Pre-restore safety backup…', 'it': 'Backup di sicurezza pre-ripristino…'},
+    'restore.completed': {'en': 'Restore completed.', 'it': 'Ripristino completato.'},
+    'restore.rebootingLoginReplaced': {'en': 'The web admin login now comes from the backup: the device restarts '
+                                             'by itself, then sign in with the username and password of the backup.',
+                                       'it': "L'accesso all'amministrazione web ora è quello del backup: il dispositivo "
+                                             'si riavvia da solo, poi accedi con nome utente e password del backup.'},
+    'restore.failed': {'en': 'Restore failed', 'it': 'Ripristino fallito'},
+    'restore.failedDetail': {'en': 'Restore failed: {err}', 'it': 'Ripristino fallito: {err}'},
+    'restore.prepareFailed': {'en': 'Preparing the restore failed: {err}',
+                              'it': 'Preparazione ripristino fallita: {err}'},
+    'restore.archiveInvalid': {'en': 'Invalid or corrupt archive', 'it': 'Archivio non valido o corrotto'},
+    'restore.encryptedInvalid': {'en': 'Invalid encrypted archive', 'it': 'Archivio cifrato non valido'},
+    'restore.passphraseRequired': {'en': 'This backup is encrypted: type its password',
+                                   'it': 'Questo backup è cifrato: scrivi la sua password'},
+    'restore.wrongPassphrase': {'en': 'Wrong password or tampered archive',
+                                'it': 'Password sbagliata o archivio manomesso'},
+    'restore.otherPassphrase': {'en': 'This backup was made with another password: type the one it was made with.',
+                                'it': "Questo backup è stato fatto con un'altra password: scrivi quella con cui è stato fatto."},
+    'restore.archiveInvalidTooManyFiles': {'en': 'Invalid archive (too many files)',
+                                           'it': 'Archivio non valido (troppi file)'},
+    'restore.memberTooLarge': {'en': '{name}: too large, skipped', 'it': '{name}: troppo grande, saltato'},
+    'restore.archiveTooLarge': {'en': 'The backup is too large to restore (over {mb} MB once unpacked)',
+                                'it': 'Il backup è troppo grande da ripristinare (oltre {mb} MB una volta estratto)'},
+    'restore.memberNoSpace': {'en': '{name}: not enough free disk space, skipped',
+                              'it': '{name}: spazio su disco insufficiente, saltato'},
+    'restore.noSnapshot': {'en': 'The safety backup of the current settings could not be made first.',
+                           'it': 'Non è stato possibile salvare prima le impostazioni attuali (backup di sicurezza).'},
+    'restore.checksumInvalid': {'en': '{name}: invalid checksum', 'it': '{name}: checksum non valido'},
+    'restore.memberFailed': {'en': '{name}: restore failed', 'it': '{name}: ripristino fallito'},
+    'restore.sourcesFailed': {'en': 'Sources: {msg}', 'it': 'Sorgenti: {msg}'},
+    'restore.sourcesNotReapplied': {'en': 'Sources not reapplied', 'it': 'Sorgenti non riapplicate'},
+    'restore.squeezeliteRestarted': {'en': 'squeezelite restarted', 'it': 'squeezelite riavviato'},
+    'restore.camillaRestarted': {'en': 'CamillaDSP restarted', 'it': 'CamillaDSP riavviato'},
+    'restore.wifiReloaded': {'en': 'Wi-Fi networks reloaded', 'it': 'Reti Wi-Fi ricaricate'},
+    'restore.smbResynced': {'en': 'SMB credentials resynced', 'it': 'Credenziali SMB risincronizzate'},
+    'restore.metaArchiveAdopted': {'en': 'Album and artist information put back',
+                                   'it': 'Informazioni su album e artisti rimesse a posto'},
+    'restore.timezoneApplied': {'en': 'Timezone re-applied ({tz})', 'it': 'Fuso orario riapplicato ({tz})'},
+    'restore.hostnameApplied': {'en': 'Hostname re-applied ({name})', 'it': 'Nome host riapplicato ({name})'},
+
+    # ── sources_server.py: SMB / adopted-disk mounting ───────────────
+    'mount.invalidFields': {'en': 'Invalid value in server/share/credentials',
+                            'it': 'Valore non valido in server/condivisione/credenziali'},
+    'mount.invalidMountpoint': {'en': 'Invalid mount point', 'it': 'Mountpoint non valido'},
+    'mount.alreadyMounted': {'en': 'Already mounted', 'it': 'Già montato'},
+    'mount.smbUnreachable': {'en': "Can't reach {server} on the network (port 445)",
+                             'it': 'Impossibile raggiungere {server} sulla rete (porta 445)'},
+    'mount.loginUnreadable': {'en': 'The saved username and password for this folder can no longer be read on this device: add the folder again to enter them',
+                              'it': 'Nome utente e password salvati per questa cartella non si possono più leggere su questo dispositivo: aggiungi di nuovo la cartella per reinserirli'},
+    'mount.mountedSmb': {'en': 'Mounted (SMB {vers})', 'it': 'Montato (SMB {vers})'},
+    'mount.mountedSmbRo': {'en': 'Mounted read-only (SMB {vers}): the other device does not allow writing into this folder',
+                           'it': 'Montato in sola lettura (SMB {vers}): l\'altro dispositivo non consente di scrivere in questa cartella'},
+    'mount.genericFailed': {'en': 'Mount failed', 'it': 'Mount fallito'},
+    'mount.systemDisk': {'en': 'This partition belongs to the disk Osmium runs from: it is not a music source',
+                         'it': 'Questa partizione fa parte del disco da cui parte Osmium: non è una sorgente musicale'},
+    'mount.missingIdentifiers': {'en': 'Missing partuuid/uuid or mount point',
+                                 'it': 'partuuid/uuid o mountpoint mancante'},
+    'mount.mounted': {'en': 'Mounted', 'it': 'Montato'},
+
+    # ── webui_server.py: api_server proxy unreachable ───────────────
+    'proxy.serviceUnavailable': {'en': 'Service unavailable', 'it': 'Servizio non disponibile'},
+    'proxy.serviceUnreachable': {'en': 'Service unreachable', 'it': 'Servizio non raggiungibile'},
+    'request.tooLarge': {'en': 'The request is too large', 'it': 'La richiesta è troppo grande'},
+    'auth.required': {'en': 'Authentication required', 'it': 'Autenticazione richiesta'},
+    'auth.accountExists': {'en': 'Account already exists', 'it': 'Account già esistente'},
+    'provision.invalidMode': {'en': 'Invalid mode', 'it': 'Modalità non valida'},
+    'provision.modeAlreadyClaimed': {'en': 'Mode already claimed', 'it': 'Modalità già scelta'},
+    'auth.wrongPassword': {'en': 'Wrong password', 'it': 'Password non valida'},
+    'network.scanFailed': {'en': 'Wi-Fi scan failed', 'it': 'Scansione WiFi fallita'},
+    'audio.listDevicesFailed': {'en': 'Reading audio devices failed', 'it': 'Lettura dispositivi audio fallita'},
+    'tailscale.statusUnavailable': {'en': 'Status unavailable', 'it': 'Stato non disponibile'},
+    'network.hotspotUnsupported': {'en': "This Wi-Fi card doesn't support hotspot mode",
+                                   'it': 'La scheda Wi-Fi non supporta la modalità hotspot'},
+    'network.hotspotActivateFailed': {'en': 'Hotspot activation failed', 'it': 'Attivazione hotspot fallita'},
+    'auth.csrfInvalid': {'en': 'Missing or invalid CSRF token', 'it': 'CSRF token mancante o non valido'},
+    'auth.invalidCredentials': {'en': 'Invalid credentials', 'it': 'Credenziali non valide'},
+    'provision.notInProgress': {'en': 'Not in provisioning', 'it': 'Non in provisioning'},
+    'provision.notInstaller': {'en': 'Not booted from the installer', 'it': "Non avviato dall'installer"},
+    'provision.noWiredConnection': {'en': 'No wired connection detected',
+                                    'it': 'Nessuna connessione via cavo rilevata'},
+    'netrecovery.notActive': {'en': 'No network recovery in progress', 'it': 'Nessun recupero rete in corso'},
+    'sources.pairUnavailable': {'en': 'Pairing is unavailable.', 'it': 'Abbinamento non disponibile.'},
+    'proxy.endpointNotAllowed': {'en': 'Endpoint not allowed', 'it': 'Endpoint non consentito'},
+    'proxy.unknownEndpoint': {'en': 'Unknown endpoint', 'it': 'Endpoint sconosciuto'},
+    'pairing.tokenInvalid': {'en': 'Missing or invalid pairing token', 'it': 'Token di pairing mancante o non valido'},
+    'network.ssidInvalidChars': {'en': 'Invalid SSID', 'it': 'SSID non valido'},
+    'network.noWifiForRecoveryAp': {'en': 'No Wi-Fi adapter available for the recovery hotspot',
+                                    'it': "Nessuna scheda Wi-Fi disponibile per l'hotspot di recupero"},
+    'network.recoveryApFailed': {'en': 'Could not start the recovery hotspot',
+                                 'it': 'Attivazione hotspot di recupero fallita'},
+    'auth.setupFieldsTooShort': {'en': 'Username needs at least 3 characters, password at least 8.',
+                                 'it': 'Utente ≥3 e password ≥8 caratteri'},
+    'auth.tooManyAttempts': {'en': 'Too many attempts, try again later', 'it': 'Troppi tentativi, riprova più tardi'},
+    'auth.wrongCurrentPassword': {'en': 'Current password is incorrect', 'it': 'Password attuale errata'},
+    'system.infoFetchFailed': {'en': 'Failed to retrieve system information',
+                               'it': 'Errore nel recupero delle informazioni di sistema'},
+    # ── Timezone ───────────────────────────────────────────────────
+    'timezone.invalid': {'en': 'Unknown timezone', 'it': 'Fuso orario sconosciuto'},
+    'timezone.changeFailed': {'en': 'Could not change the timezone', 'it': 'Cambio fuso orario fallito'},
+    'timezone.updated': {'en': 'Timezone set to {tz}', 'it': 'Fuso orario impostato su {tz}'},
+
+    # ── Virtual keyboard (on-screen keyboard helper) ─────────────────
+    'keyboard.started': {'en': 'Virtual keyboard {cmd} started', 'it': 'Tastiera virtuale {cmd} avviata'},
+    'keyboard.noneFound': {'en': 'No system virtual keyboard found. Install onboard, florence, xvkbd or matchbox-keyboard',
+                           'it': 'Nessuna tastiera virtuale di sistema trovata. Installa onboard, florence, xvkbd o matchbox-keyboard'},
+    'keyboard.startFailed': {'en': 'Could not start the virtual keyboard', 'it': "Errore nell'avvio della tastiera virtuale"},
+    'keyboard.closed': {'en': 'Virtual keyboard closed', 'it': 'Tastiera virtuale chiusa'},
+    'keyboard.closeFailed': {'en': 'Could not close the virtual keyboard', 'it': 'Errore nella chiusura della tastiera virtuale'},
+
+    # ── Library editor: tags inside the files (hifi_tags.py) ─────────
+    'library.remoteServer': {'en': 'This player uses the music library of another server: the files are not on this device, so their tags cannot be changed here.',
+                             'it': 'Questo apparecchio usa la libreria musicale di un altro server: i file non sono qui, quindi i loro tag non si possono modificare da qui.'},
+    'library.lyrionUnreachable': {'en': 'The music library is not answering right now. Try again in a moment.',
+                                  'it': 'La libreria musicale non risponde in questo momento. Riprova tra poco.'},
+    'library.albumRequired': {'en': 'Missing album.', 'it': 'Album mancante.'},
+    'library.unknownAlbum': {'en': 'This album is no longer in the library.', 'it': 'Questo album non è più nella libreria.'},
+    'library.noCover': {'en': 'No cover art.', 'it': 'Nessuna copertina.'},
+    'library.badRequest': {'en': 'The request is not valid.', 'it': 'La richiesta non è valida.'},
+    'library.nothingToChange': {'en': 'There is nothing to change.', 'it': "Non c'è niente da modificare."},
+    'library.tooManyTracks': {'en': 'Too many tracks in one change (at most {max}).',
+                              'it': 'Troppe tracce in una sola modifica (al massimo {max}).'},
+    'library.trackNotInAlbum': {'en': 'A track is not part of this album.', 'it': 'Una traccia non fa parte di questo album.'},
+    'library.badKey': {'en': 'The tag {key} cannot be changed here.', 'it': 'Il tag {key} non si può modificare qui.'},
+    'library.valueTooLong': {'en': '{key} is too long (at most {max} characters).',
+                             'it': '{key} è troppo lungo (al massimo {max} caratteri).'},
+    'library.tooManyValues': {'en': '{key} has too many values (at most {max}).',
+                              'it': '{key} ha troppi valori (al massimo {max}).'},
+    'library.badNumber': {'en': '{key} must be a number, or number/total (for example 3 or 3/12).',
+                          'it': '{key} deve essere un numero, oppure numero/totale (per esempio 3 o 3/12).'},
+    'library.badTotal': {'en': '{key} must be a number.', 'it': '{key} deve essere un numero.'},
+    'library.badMbid': {'en': '{key} must be a MusicBrainz identifier.',
+                        'it': '{key} deve essere un identificativo MusicBrainz.'},
+    'library.badCompilation': {'en': '{key} must be 1 (compilation) or 0.',
+                               'it': '{key} deve essere 1 (compilation) oppure 0.'},
+    'library.badDate': {'en': '{key} must be a date like 1973, 1973-03 or 1973-03-01.',
+                        'it': '{key} deve essere una data come 1973, 1973-03 o 1973-03-01.'},
+    'library.setAndRemove': {'en': '{key} cannot be changed and removed at the same time.',
+                             'it': '{key} non può essere modificato e rimosso insieme.'},
+    'library.trackNotWritable': {'en': 'Some tracks cannot be changed: {reason}.',
+                                 'it': 'Alcune tracce non si possono modificare: {reason}.'},
+    'library.reason.readonly': {'en': 'the folder is read-only', 'it': 'la cartella è in sola lettura'},
+    'library.reason.unsupported_format': {'en': 'tags cannot be written into this kind of file',
+                                          'it': 'in questo tipo di file non si possono scrivere i tag'},
+    'library.reason.cue_track': {'en': 'the track is part of a single file split by a cue sheet',
+                                 'it': 'il brano fa parte di un unico file diviso da un cue sheet'},
+    'library.reason.unreadable': {'en': 'the file could not be read', 'it': 'il file non si riesce a leggere'},
+    'library.reason.not_a_file': {'en': 'the track is not a file on this player',
+                                  'it': 'il brano non è un file di questo lettore'},
+    'library.reason.streamed': {'en': 'the track comes from an online streaming service',
+                                'it': 'il brano arriva da un servizio di streaming online'},
+    'library.reason.outside_sources': {'en': 'the file is outside the music folders',
+                                       'it': 'il file è fuori dalle cartelle della musica'},
+    'library.reason.missing': {'en': 'the file was not found', 'it': 'il file non è stato trovato'},
+    'library.reason.remote_server': {'en': 'the files are on another server', 'it': 'i file sono su un altro server'},
+    'library.busy': {'en': 'Another change to the tags is still being written. Wait for it to finish.',
+                           'it': "Un'altra modifica dei tag è ancora in corso. Aspetta che finisca."},
+    'library.jobNotFound': {'en': 'This change is no longer in the history.',
+                            'it': 'Questa modifica non è più nella cronologia.'},
+    'library.notUndoable': {'en': 'This change cannot be undone.', 'it': 'Questa modifica non si può annullare.'},
+    'library.changed_since': {'en': '{count} files were changed again after this edit: undoing it would overwrite those changes.',
+                             'it': '{count} file sono stati cambiati di nuovo dopo questa modifica: annullarla sovrascriverebbe quei cambiamenti.'},
+    'library.writeFailed': {'en': 'Could not write the tags: {detail}', 'it': 'Impossibile scrivere i tag: {detail}'},
+    'library.readFailed': {'en': 'Could not read the file: {detail}', 'it': 'Impossibile leggere il file: {detail}'},
+    'library.fileNotWritable': {'en': 'The file cannot be changed: {reason}.',
+                                'it': 'Il file non si può modificare: {reason}.'},
+    'library.interrupted': {'en': 'Interrupted: the service restarted while the tags were being written.',
+                            'it': 'Interrotta: il servizio si è riavviato mentre scriveva i tag.'},
+
+    # ── Library editor: corrections to the online information ────────
+    'meta.albumRequired': {'en': 'Missing album.', 'it': 'Album mancante.'},
+    'meta.artistRequired': {'en': 'Missing artist.', 'it': 'Artista mancante.'},
+    'meta.artistPinRequired': {'en': 'Missing artist or choice.', 'it': 'Artista o scelta mancante.'},
+    'meta.badMbid': {'en': 'Not a valid MusicBrainz identifier.', 'it': 'Identificativo MusicBrainz non valido.'},
+    'meta.badQuery': {'en': 'Type at least 2 characters (at most 100).',
+                      'it': 'Scrivi almeno 2 caratteri (al massimo 100).'},
+    'meta.badOverrides': {'en': 'The corrections could not be saved: {detail}',
+                          'it': 'Impossibile salvare le correzioni: {detail}'},
+
+    # ── Where the downloaded information is kept ─────────────────────
+    'meta.cacheDirUnknown': {'en': 'That place is not available any more. Pick another one.',
+                             'it': 'Quel posto non c\u2019\u00e8 pi\u00f9. Scegline un altro.'},
+    'meta.cacheDirNetwork': {'en': 'A network folder cannot hold this archive: choose a disk '
+                                   'connected to the player, or leave it on the player itself.',
+                             'it': 'Una cartella di rete non pu\u00f2 tenere questo archivio: scegli un '
+                                   'disco collegato al lettore, oppure lascialo sul lettore stesso.'},
+    'meta.cacheDirReadonly': {'en': 'That disk cannot be written to.',
+                              'it': 'Su quel disco non si pu\u00f2 scrivere.'},
+    'meta.cacheDirNoSpace': {'en': 'There is not enough room on that disk.',
+                             'it': 'Su quel disco non c\u2019\u00e8 spazio a sufficienza.'},
+    'meta.cacheDirFailed': {'en': 'The information could not be moved: {detail}',
+                            'it': 'Impossibile spostare le informazioni: {detail}'},
+}
+
+
+def t(code, lang, **variables):
+    """Translate `code` into `lang` ('en' or 'it'), with {placeholder}
+    interpolation via `variables`. Falls back to English when `lang` isn't
+    supported or the specific translation is missing, and to the bare code
+    string when the code itself is unknown — this never raises, so a typo'd
+    or not-yet-added code degrades to a readable-enough fallback instead of
+    crashing the request that was trying to report an error."""
+    entry = MESSAGES.get(code)
+    if not entry:
+        return code
+    text = entry.get(lang) or entry.get('en') or code
+    if variables:
+        try:
+            text = text.format(**variables)
+        except (KeyError, IndexError):
+            pass
+    return text

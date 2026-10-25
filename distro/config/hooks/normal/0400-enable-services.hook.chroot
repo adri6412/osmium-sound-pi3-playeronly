@@ -1,0 +1,142 @@
+#!/bin/sh
+# HiFi Player appliance — enable all services and boot straight into the kiosk.
+set -e
+
+echo "I: [hifi] enabling graphical target + display manager"
+systemctl set-default graphical.target || true
+# 🚨 Da 2.5.24 l'interfaccia è quella Qt (hifi-qt.service, che disegna da sé
+# su DRM/KMS e non ha bisogno di lightdm), e dal 2026-10-02 è l'unica: l'app
+# Electron non esiste più nel repository. Senza il programma Qt la build si
+# ferma qui, perché un'immagine senza interfaccia sarebbe uno schermo nero.
+# La scelta scritta in /etc/hifi-player/ui-engine è quella che l'aggiornamento
+# non tocca mai (un apparecchio legacy può ancora dire "electron").
+if [ -x /opt/hifi-qt/hifi-qt ]; then
+    echo "I: [hifi] on-screen UI = Qt (hifi-qt.service)"
+    mkdir -p /etc/hifi-player
+    printf 'qt\n' > /etc/hifi-player/ui-engine
+    systemctl enable hifi-qt.service || true
+    systemctl disable lightdm || true
+else
+    echo "E: [hifi] /opt/hifi-qt/hifi-qt is missing or not executable: no on-screen interface. Aborting." >&2
+    exit 1
+fi
+# Sceglie il protocollo della sessione kiosk (Wayland dove c'è una GPU vera, X11
+# in VM/software, dove wlroots rifiuta il renderer GLES2 e il kiosk resterebbe a
+# schermo nero) e lo scrive per lightdm PRIMA che parta — vedi
+# /usr/local/sbin/hifi-kiosk-session.sh.
+echo "I: [hifi] enabling kiosk session selector (Wayland/X11)"
+systemctl enable hifi-kiosk-session.service || true
+
+echo "I: [hifi] enabling HiFi services"
+systemctl enable hifi-api.service     || true
+systemctl enable hifi-vumeter.service || true
+systemctl enable hifi-sources.service || true
+# Web admin + first-boot provisioning gateway (HTTPS :443 / :80). Serves the web
+# UI and, when the provisioning-pending marker is present (fresh install), the
+# setup hotspot + captive portal. Safe everywhere: it's a no-op portwise on a
+# configured unit and the marker gates the hotspot behaviour.
+systemctl enable hifi-webui.service   || true
+# A live session of the ISO runs the slot image itself, which has no marker in
+# /etc and no data partition: this puts both back (boot=live only).
+systemctl enable hifi-live-state.service || true
+
+echo "I: [hifi] enabling audio backend (squeezelite + Lyrion Music Server)"
+systemctl enable squeezelite.service        || true
+systemctl enable lyrionmusicserver.service  || true
+# Audio zones (one more player per DAC) and Lyrion's PCM to DSD rules: written
+# before Lyrion at every boot from /etc/hifi-player (carried over by an A/B
+# swap), so like hifi-bt-out the unit is always on and the choice is the file.
+systemctl enable hifi-zones.service         || true
+systemctl enable hifi-disk-reserve.service  || true
+# Network audio receivers (AirPlay/UPnP/Spotify Connect) are Lyrion plugins,
+# not system services — nothing to enable here.
+
+echo "I: [hifi] enabling first-boot finalisation (re-installs Lyrion after the"
+echo "          installer's remove-live-packages purge; self-disables on success)"
+systemctl enable hifi-firstboot.service || true
+
+echo "I: [hifi] enabling audio quiesce before any shutdown/reboot (DMA panic workaround)"
+systemctl enable hifi-playback-quiesce.service || true
+
+echo "I: [hifi] enabling OTA stage-resume (finishes a download interrupted by a reboot;"
+echo "          no-op on every boot without a pending stage plan)"
+systemctl enable hifi-update-stage-resume.service || true
+echo "I: [hifi] enabling OTA apply (only ever scheduled during a boot already redirected"
+echo "          into system-update.target — see hifi-update-stage-runner.sh; a no-op enable"
+echo "          symlink otherwise, never pulled into a normal graphical/multi-user boot)"
+systemctl enable hifi-update-apply.service || true
+
+echo "I: [hifi] enabling mDNS/ARP keepalive (a router silently drops this device's"
+echo "          ARP/mDNS entry after long network silence otherwise — see apply.d/0041)"
+systemctl enable hifi-mdns-keepalive.timer || true
+
+echo "I: [hifi] defaulting timezone to UTC (deterministic — otherwise every install would"
+echo "          silently inherit whatever the ISO build host happened to have; Settings ->"
+echo "          System lets the user pick their real one)"
+ln -sf /usr/share/zoneinfo/UTC /etc/localtime
+echo 'Etc/UTC' > /etc/timezone
+
+echo "I: [hifi] enabling NTP time sync (systemd-timesyncd — a separate package on Debian"
+echo "          12, NOT bundled into systemd itself; see the package list). This appliance"
+echo "          has no on-screen clock/timezone setup step, and units built from"
+echo "          old/refurbished hardware can have a dead CMOS battery, so without this the"
+echo "          clock (and any TLS/OTA signature checks that depend on it) silently drifts."
+echo "          live-build's policy-rc.d blocks the package-postinst auto-enable during the"
+echo "          chroot build, so this must be explicit even with the package present."
+systemctl enable systemd-timesyncd.service || true
+
+echo "I: [hifi] SSH installed but OFF by default (user enables it from Settings)"
+systemctl disable ssh.service || true
+
+echo "I: [hifi] Samba installed but OFF by default (enabled when an internal disk is adopted)"
+systemctl disable smbd.service nmbd.service || true
+# Same for the WS-Discovery/LLMNR responder that makes those shares show up in
+# Windows' "Network": sources_server.py turns it on together with smbd.
+systemctl disable wsdd2.service || true
+
+echo "I: [hifi] Bluetooth speakers: supervisor ON, everything else OFF by default"
+# 🚨 hifi-bt-out.service is the ONLY Bluetooth unit enabled here, and that is
+# the whole design: unit enablement does not survive an A/B image swap, so the
+# owner's choice is kept in /etc/hifi-player/bluetooth.json (which IS carried
+# over) and this daemon re-applies it on every boot — starting bluetoothd,
+# BlueALSA, the pairing agent and one squeezelite per speaker only when the
+# choice is on. With the choice off it costs one idle Python process and
+# leaves the adapter powered down.
+systemctl enable hifi-bt-out.service || true
+# Debian auto-enables these on install; ours replace them (a source-role
+# BlueALSA started on demand), and two daemons fighting over the same adapter
+# is the kind of failure nobody debugs from a listening room.
+systemctl disable bluetooth.service || true
+systemctl disable bluealsa.service bluealsa-aplay.service || true
+
+echo "I: [hifi] disabling getty on tty1 (no text console flashes)"
+systemctl mask getty@tty1.service || true
+
+echo "I: [hifi] creating /var/log/hifi (persistent, rotated logs for support bundle)"
+mkdir -p /var/log/hifi
+chmod 0750 /var/log/hifi
+chown root:root /var/log/hifi
+
+echo "I: [hifi] enabling systemd-oomd and the memory log"
+# The package enables oomd on install; said again here so a later packaging
+# change cannot leave the policy in the slice drop-ins with nobody to apply it.
+systemctl enable systemd-oomd.service || true
+systemctl enable hifi-memlog.timer || true
+
+echo "I: [hifi] enabling the weekly backup timer"
+# Enabled, yet the backup stays off by default: the decision is
+# /etc/hifi-player/backup.json ("scheduled", false when absent), which
+# hifi-backup-run.py --scheduled reads first and exits on. Enabled here because
+# an image never runs apply.d/0033 (which used to be the only thing creating
+# and enabling these units): on every A/B install the toggle in Settings
+# said "saved" and nothing ever ran. With the timer already there, an owner
+# who turned the schedule on back then gets backups without touching anything.
+# The Settings toggle still enables/disables the timer itself, and 0033 does
+# the same on legacy installs.
+systemctl enable hifi-backup.timer || true
+
+echo "I: [hifi] making journald persistent across reboots"
+mkdir -p /var/log/journal
+systemd-tmpfiles --create --prefix /var/log/journal || true
+
+echo "I: [hifi] enable-services hook done"

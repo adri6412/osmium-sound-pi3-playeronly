@@ -1,0 +1,123 @@
+// Osmium Sound boot splash: the mark builds up (frame-0 .. frame-79, played
+// once, 3.2 s at 25 fps), then shimmers (frame-80 .. frame-134, 2.2 s, looped)
+// until the interface takes over. No text, ever: a commercial appliance look.
+//
+// The frames are drawn for a 1920 px wide screen (850 x 244, transparent) and
+// are scaled to other widths; the background is the near-black of the UI.
+// logo.png is still shipped next to them for the legacy single-image splash
+// (apply.d/0003 keeps it in place on devices updated the old way).
+
+INTRO = 80;
+TOTAL = 135;
+DESIGN_WIDTH = 1920;
+
+Window.SetBackgroundTopColor(0.043, 0.043, 0.047);
+Window.SetBackgroundBottomColor(0.043, 0.043, 0.047);
+
+screen_w = Window.GetWidth();
+screen_h = Window.GetHeight();
+ratio = screen_w / DESIGN_WIDTH;
+
+for (i = 0; i < TOTAL; i++) {
+    img = Image("frame-" + i + ".png");
+    if (screen_w != DESIGN_WIDTH) {
+        img = img.Scale(Math.Int(img.GetWidth() * ratio), Math.Int(img.GetHeight() * ratio));
+    }
+    frames[i] = img;
+}
+
+mark.sprite = Sprite(frames[0]);
+mark.sprite.SetX(Window.GetX() + Math.Int((screen_w - frames[0].GetWidth()) / 2));
+mark.sprite.SetY(Window.GetY() + Math.Int((screen_h - frames[0].GetHeight()) / 2));
+mark.sprite.SetZ(10);
+
+// Isolated-update-mode progress bar (see hifi-update-apply-runner.sh, which is
+// the only thing that ever calls `plymouth system-update --progress=N`).
+// Hidden (zero width) on every ordinary boot — nothing calls that command
+// then, so this costs nothing outside update-mode.
+progress_track.image  = Image("progress-track.png");
+progress_fill.image   = Image("progress-fill.png");
+progress_fill_error.image = Image("progress-fill-error.png");
+
+progress_bar_width  = 320;
+progress_bar_height = 6;
+progress_bar_y = mark.sprite.GetY() + frames[0].GetHeight() + 40;
+progress_bar_x = Window.GetWidth() / 2 - progress_bar_width / 2;
+
+progress_track.sprite = Sprite(progress_track.image.Scale(progress_bar_width, progress_bar_height));
+progress_track.sprite.SetX(progress_bar_x);
+progress_track.sprite.SetY(progress_bar_y);
+progress_track.sprite.SetZ(9);
+progress_track.sprite.SetOpacity(0);
+
+progress_fill.sprite = Sprite();
+progress_fill.sprite.SetX(progress_bar_x);
+progress_fill.sprite.SetY(progress_bar_y);
+progress_fill.sprite.SetZ(10);
+progress_fill.sprite.SetOpacity(0);
+
+update_mode = 0;
+update_error = 0;
+update_percent = 0;
+
+fun redraw_progress_fill() {
+    w = Math.Int(progress_bar_width * update_percent / 100);
+    if (w < 1) w = 1;
+    if (update_error) {
+        img = progress_fill_error.image;
+    } else {
+        img = progress_fill.image;
+    }
+    progress_fill.sprite.SetImage(img.Scale(w, progress_bar_height));
+}
+
+// Called by `plymouth system-update --progress=N` — see hifi-update-apply-runner.sh.
+// Only ever invoked while genuinely applying a staged update; a normal boot
+// never triggers this, so the bar stays invisible then.
+fun system_update_callback(progress) {
+    update_mode = 1;
+    update_percent = progress;
+    progress_track.sprite.SetOpacity(1);
+    progress_fill.sprite.SetOpacity(1);
+    redraw_progress_fill();
+}
+Plymouth.SetSystemUpdateFunction(system_update_callback);
+
+// The animation: Plymouth refreshes 50 times a second, one frame every two
+// refreshes makes 25 fps. Frozen on the complete mark once an update-mode
+// error is signalled (see message_callback below), so it reads as "stopped"
+// rather than "still working".
+tick = 0;
+fun refresh_callback() {
+    if (update_error) {
+        mark.sprite.SetImage(frames[INTRO - 1]);
+        return;
+    }
+    f = Math.Int(tick / 2);
+    if (f >= TOTAL) {
+        f = INTRO + ((f - INTRO) % (TOTAL - INTRO));
+    }
+    mark.sprite.SetImage(frames[f]);
+    tick++;
+}
+Plymouth.SetRefreshFunction(refresh_callback);
+
+// Swallow boot/quit messages so no text is ever shown — EXCEPT one sentinel
+// hifi-update-apply-runner.sh sends on a failed apply (`plymouth
+// display-message --text=HIFI_UPDATE_ERROR`): freeze the mark and turn the
+// progress bar red, so a device parked in update-mode after a failure reads
+// as "stopped, needs attention" instead of "still working". Everything else
+// keeps being silently swallowed, preserving the no-text look.
+fun message_callback(text) {
+    if (text == "HIFI_UPDATE_ERROR") {
+        update_error = 1;
+        redraw_progress_fill();
+    }
+}
+Plymouth.SetMessageFunction(message_callback);
+
+// Password prompt (e.g. disk unlock) — minimal, only if ever needed.
+fun display_password_callback(prompt, bullets) {
+    mark.sprite.SetImage(frames[INTRO - 1]);
+}
+Plymouth.SetDisplayPasswordFunction(display_password_callback);

@@ -1,0 +1,11 @@
+# Osmium Sound — squeezelite arguments. GENERATED FILE, do not edit.
+#
+# Rendered by hifi_squeezelite.py from /etc/hifi-player/squeezelite.json at
+# every start of squeezelite.service (ExecStartPre), so anything written here
+# by hand is gone at the next start. Change the settings from Settings → Audio
+# (on screen or in the web admin), or edit the JSON and run
+# `systemctl restart squeezelite`. `hifi_squeezelite.py show` prints both.
+#
+# -v is always on: it exports /dev/shm/squeezelite-* for the VU meters.
+# -o uses the stable ALSA card name (hw:CARD=<name>,DEV=<n>), never a number.
+ARGS='-o default -D -v -C 5 -s 127.0.0.1 -n OsmiumSound -M Osmium'

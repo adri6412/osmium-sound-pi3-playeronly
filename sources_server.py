@@ -1,0 +1,9771 @@
+#!/usr/bin/env python3
+"""
+HiFi Player — Music Sources manager.
+
+A small self-contained web service (port 8080) that lets the user add music
+sources to Lyrion Music Server from a browser on their phone/PC:
+
+  * Local folders  → added directly to Lyrion's mediadirs
+  * SMB shares     → mounted on /mnt/hifi-sources/<name> (cifs) then added
+                     to mediadirs (Lyrion sees them as local folders)
+
+State is persisted in /etc/hifi-sources.json; SMB shares are re-mounted when
+this service starts (so they survive reboots without touching /etc/fstab).
+
+Runs as root (needs mount.cifs and to restart Lyrion).
+"""
+from flask import Flask, jsonify, request, Response
+import json
+import os
+import re
+import glob
+import time
+import socket
+import subprocess
+import threading
+import io
+import tarfile
+import hashlib
+import secrets
+import shutil
+import stat
+import tempfile
+import urllib.request
+import urllib.error
+import ipaddress
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+
+import hifi_backup as hb
+import hifi_metadata as hmeta
+import hifi_tags as htags
+import hifi_cdrip as hcd
+import hifi_diskguard as hdg
+from hifi_logging import tee_stdio_to_file
+from hifi_i18n import t as _ht
+# Every print() below keeps reaching the console/journald unchanged AND now also
+# lands in a size-rotated file at /var/log/hifi/sources.log (journald alone is
+# volatile on this image) — picked up by the support-bundle endpoint.
+tee_stdio_to_file('sources')
+
+app = Flask(__name__)
+# Hard ceiling on any request body (restore archive, FIR filter upload) BEFORE
+# Werkzeug buffers it into request.files/request.form. Without this, a client
+# can stream an unbounded body and it gets fully received/spooled to disk
+# before any of this file's own per-route size checks ever run — those checks
+# are still kept below as the real business-logic limits, this is just the
+# outer backstop. 80MB comfortably covers a couple of FIR filters. The
+# restore upload is the exception: a backup carrying the album/artist archive
+# is far bigger, so /api/restore parses its body itself, to disk and with its
+# own limits (see _receive_restore_upload).
+app.config['MAX_CONTENT_LENGTH'] = 80 * 1024 * 1024
+
+
+@app.errorhandler(413)
+def _request_too_large(_e):
+    return _err("msg.fileTooLarge", 413)
+
+
+# The Electron UI now talks to this service natively (cross-origin from the
+# file:// renderer), so allow CORS like api_server does. Falls back gracefully
+# if flask_cors isn't present.
+try:
+    from flask_cors import CORS
+    CORS(app)
+except Exception:
+    @app.after_request
+    def _cors(resp):
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        return resp
+
+STATE_FILE = "/etc/hifi-sources.json"
+MOUNT_ROOT = "/mnt/hifi-sources"
+INTERNAL_MOUNT_ROOT = "/mnt/hifi-internal"
+# Adopted USB disks (type "usb") mount here, read-write, keyed by stable
+# PARTUUID/UUID. This is the only mountpoint a USB stick ever gets — see the
+# USB drives section below.
+USB_ADOPTED_ROOT = "/mnt/hifi-usb"
+# The data partition of the A/B layout, and the folder on it that holds music
+# kept on the appliance itself. On an image slot this is the ONLY place a
+# local library can live: everything else is either read-only or thrown away
+# at the next boot. hifi-ab-media.py moves the folders of a converted device
+# in here, and _ensure_music_root() makes it for the ones installed from the
+# ISO, so "add a local folder" has somewhere to point at.
+DATA_MNT = "/data"
+DATA_MUSIC_ROOT = "/data/music"
+IMAGE_MARKER = "/usr/lib/osmium/IMAGE_VERSION"
+# Local music folders may only be added from these base directories. This
+# keeps the (root-privileged) service from being pointed at arbitrary paths
+# such as /etc or /root via the add-local-source API.
+#
+# 🚨 On an A/B image slot the list is shorter, and it has to be: the system is
+# a read-only squashfs, /mnt and /media are tmpfs and /srv comes from the
+# image. Offering those would mean a share people copy a library into that
+# fills the RAM and is empty again at the next boot, or a folder that cannot
+# be written at all — so what is left is /data/music, /home (bind-mounted from
+# /data) and the roots where disks and network shares are mounted.
+ALLOWED_LOCAL_ROOTS = (
+    (DATA_MUSIC_ROOT, "/home") if os.path.exists(IMAGE_MARKER)
+    else (DATA_MUSIC_ROOT, "/mnt", "/media", "/srv", "/home")
+) + (MOUNT_ROOT, INTERNAL_MOUNT_ROOT, USB_ADOPTED_ROOT)
+LYRION_SERVICE = "lyrionmusicserver.service"
+SAMBA_SHARES_FILE = "/etc/samba/hifi-shares.conf"
+SAMBA_CRED_FILE = "/etc/hifi-player/samba-cred.json"
+SAMBA_USER = "hifimusic"
+# Group shared by the two accounts that write into the same folders: the Samba
+# forced user above and Lyrion (squeezeboxserver).
+#
+# 🚨 Without it the two fought over ownership of any folder that is both a
+# network share and something Lyrion writes into — a playlist folder shared
+# over SMB is exactly that. Whichever was configured last chowned the folder to
+# itself and the other one lost write access, so either "save queue as
+# playlist" silently stopped working, or playlists could be copied in from a PC
+# and edited but never deleted again ("you don't have permission"), leaving
+# `sudo rm` over SSH as the only way. The image seeds the same group through
+# sysusers.d/osmium.conf; this is the runtime equivalent for devices that
+# predate it.
+SHARE_GROUP = "hifishare"
+# LAN discovery for those shares (see _publish_smb_discovery): a Bonjour record
+# for macOS/Linux and the wsdd2 daemon (WS-Discovery + LLMNR) for Windows. Both
+# are published only while the shares actually exist.
+AVAHI_SMB_SERVICE = "/etc/avahi/services/hifi-smb.service"
+WSDD_UNIT = "wsdd2.service"
+FORMAT_STATUS = "/run/hifi-format-status.json"
+FORMAT_UNIT = "hifi-format-disk"
+FORMAT_SCRIPT = "/usr/local/sbin/hifi-format-disk.sh"
+CD_DEVICE = "/dev/cdrom"
+RIP_STATUS = "/run/hifi-rip-status.json"
+RIP_PLAN = "/run/hifi-rip-plan.json"
+RIP_COVER = "/run/hifi-rip-cover.jpg"
+RIP_UNIT = "hifi-rip-cd"
+RIP_SCRIPT = "/usr/local/sbin/hifi-rip-cd.py"
+# Settings → CD ripping (hifi_cdrip.py): Daphile's page, field by field.
+CDRIP_CONF = hcd.CONF
+LYRION_RPC = "http://127.0.0.1:9000/jsonrpc.js"
+PREFS_GLOBS = [
+    "/var/lib/squeezeboxserver/prefs/server.prefs",
+    "/var/lib/lyrion*/prefs/server.prefs",
+    "/var/lib/lyrionmusicserver/prefs/server.prefs",
+]
+# The appliance skips Lyrion's web setup wizard, so `playlistdir` is never set
+# and "save queue as playlist" silently fails. We provision a writable folder.
+DEFAULT_PLAYLISTDIR = "/var/lib/squeezeboxserver/playlists"
+
+_lock = threading.Lock()
+
+
+# ─────────────────────────── state ──────────────────────────────────
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"sources": []}
+
+
+def save_state(state):
+    # A share's login never reaches the disk in the clear, whichever path
+    # built this state (see hifi_backup.seal_login). Costs nothing when every
+    # login is already sealed.
+    hb.seal_plain_logins(state)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, STATE_FILE)
+    try:
+        os.chmod(STATE_FILE, 0o600)
+    except Exception:
+        pass
+
+
+def _slug(*parts):
+    s = "-".join(p for p in parts if p)
+    # strip leading/trailing dots too, so a value like ".." can never survive
+    # and turn os.path.join(MOUNT_ROOT, slug) into a path-traversal.
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", s).strip("_.") or "share"
+
+
+def _free_source_id(sources, base, salt):
+    """A source id derived from a name, made unique.
+
+    The ids are slugs of a folder name or of server+share, and a slug is not
+    unique: /data/music/_a/Jazz and /data/music/_b/Jazz are both "local-Jazz",
+    and so are the shares "Musica" and "Musica è", or "Rock Pop" and
+    "Rock_Pop". The second add used to replace the first in our state while
+    Lyrion kept scanning both, and the first could no longer be removed.
+
+    `base` is returned as it is when no source has it yet, so every id that
+    already exists keeps working and the first source of a name keeps the
+    old format. Otherwise a short hash of `salt` (the full path, or the UNC)
+    goes after it: stable, so the same folder always gets the same id.
+    Callers look for the source with the same path/share first and reuse
+    its id — this is only for a different one."""
+    taken = {s.get("id") for s in sources}
+    if base not in taken:
+        return base
+    digest = hashlib.sha1(str(salt).encode("utf-8", "surrogateescape")).hexdigest()
+    cand = f"{base}-{digest[:6]}"
+    n = 2
+    while cand in taken:
+        cand = f"{base}-{digest[:6]}-{n}"
+        n += 1
+    return cand
+
+
+def _same_local_path(src, path):
+    """Is `src` the `local` source for the (already resolved) `path`?"""
+    return (src.get("type") == "local" and bool(src.get("path"))
+            and os.path.normpath(src["path"]) == os.path.normpath(path))
+
+
+def _same_smb_share(src, server, share):
+    """Is `src` the SMB source for //server/share? Both names are
+    case-insensitive on every SMB server."""
+    return (src.get("type") == "smb"
+            and (src.get("server") or "").strip().strip("/").lower() == server.lower()
+            and (src.get("share") or "").strip().strip("/").lower() == share.lower())
+
+
+def _field_ok(value):
+    """True if `value` is safe to pass as a mount option / command argument.
+
+    The SMB fields below are interpolated into mount(8) `-o` options and into
+    the command argv; a comma, newline or a leading '-' would let a malicious
+    value add arbitrary mount options or be parsed as a flag, so only allow a
+    conservative character set and reject leading dashes.
+    """
+    v = "" if value is None else str(value)
+    return bool(re.fullmatch(r"[^\x00-\x1f,]*", v)) and not v.startswith("-")
+
+
+def _password_ok(value):
+    """True if `value` can be an SMB password.
+
+    Unlike the other SMB fields, the password never reaches an `-o` option or
+    argv: it only ever goes into the credentials file (_smb_cred_file()), one
+    "password=..." line read up to its end, so a comma or a leading '-' is just
+    part of the password — and refusing them locked out every NAS account that
+    happened to have one. Only a line break (or another control character)
+    would end the line early and break that file."""
+    v = "" if value is None else str(value)
+    return not re.search(r"[\x00-\x1f\x7f]", v)
+
+
+def _label_ok(value):
+    """Safe volume label: alphanumerics, space, underscore, dot, hyphen."""
+    v = "" if value is None else str(value)
+    return bool(re.fullmatch(r"[A-Za-z0-9 _.-]{1,16}", v))
+
+
+def _path_ok(value):
+    """Safe block-device path: must start with /dev/ and contain no shell metas."""
+    v = "" if value is None else str(value)
+    return bool(re.fullmatch(r"/dev/[A-Za-z0-9/_-]+", v))
+
+
+def _oserror_detail(e):
+    """Short, user-facing reason for a failed filesystem operation: the
+    errno's own text ("Permission denied", "Read-only file system"), never
+    the exception's full string with its path and internals."""
+    try:
+        return os.strerror(e.errno) if getattr(e, "errno", None) else "error"
+    except Exception:
+        return "error"
+
+
+def _exc_detail(e):
+    """What a failed call may say about itself to a client: the errno's text
+    for a filesystem error, the status for an HTTP one, else just the kind.
+    Never the exception's own string, which can carry paths and internals."""
+    if isinstance(e, OSError) and getattr(e, "errno", None):
+        return _oserror_detail(e)
+    code = getattr(e, "code", None)
+    if isinstance(code, int):
+        return f"HTTP {code}"
+    return type(e).__name__
+
+
+def _run(cmd, timeout=30):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def _systemctl_lyrion(action, timeout=60):
+    """systemctl start/restart/stop for Lyrion. A deliberate (re)start first
+    clears the unit's start-rate counter.
+
+    The unit allows five starts in five minutes (StartLimitBurst), meant to
+    stop a server that keeps crashing from spinning forever. But systemd counts
+    OUR starts too, and the first-run setup takes Lyrion down and up that many
+    times on its own: boot, remote-access prefs, skin, plugins, playlist
+    folder, sources. The sixth was refused with start-limit-hit and Lyrion
+    stayed off until the next reboot, right when the wizard sends the owner to
+    its web player (reproduced on a fresh install: six restarts in a row, the
+    sixth fails). reset-failed before a start we mean keeps the crash-loop
+    guard for Restart=on-failure while never letting it veto an intentional
+    start."""
+    if action in ("start", "restart"):
+        try:
+            _run(["systemctl", "reset-failed", LYRION_SERVICE], timeout=15)
+        except Exception:
+            pass
+    return _run(["systemctl", action, LYRION_SERVICE], timeout=timeout)
+
+
+def _run_json(cmd, timeout=30):
+    r = _run(cmd, timeout=timeout)
+    if r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout or "{}")
+    except Exception:
+        return None
+
+
+# ─────────────────────── mount table, bounded probes ────────────────
+# 🚨 A NAS switched off while its share is mounted turns every stat() of
+# that mountpoint — os.path.ismount(), realpath(), statvfs(), isdir() — into
+# a wait of tens of seconds or minutes in the kernel. Done under _lock that
+# froze every route taking it (USB adoption, adding and removing sources),
+# and the kiosk asks for /api/sources every four seconds, so threads piled
+# up behind it. Whether something is mounted therefore comes from the
+# kernel's mount table, which never asks the filesystem, and whatever has to
+# look inside a network mount goes through _bounded_probe().
+MOUNTINFO = "/proc/self/mountinfo"
+_NET_FSTYPES = frozenset(("cifs", "smb3", "smbfs", "nfs", "nfs4", "9p", "ceph",
+                          "fuse.sshfs", "fuse.glusterfs", "glusterfs", "davfs", "fuse.davfs2"))
+_PROBE_TIMEOUT = 2.0
+
+
+def _unescape_mountinfo(field):
+    """mountinfo writes space, tab, newline and backslash as \\040 and so on."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def _mount_table():
+    """{mountpoint: [(fstype, options), ...]} from /proc/self/mountinfo, the
+    first mount of a stack first; None when the table cannot be read."""
+    table = {}
+    try:
+        with open(MOUNTINFO, encoding="utf-8", errors="surrogateescape") as f:
+            for line in f:
+                pre, sep, post = line.partition(" - ")
+                fields = pre.split(" ")
+                rest = post.split(" ")
+                if not sep or len(fields) < 6 or not rest:
+                    continue
+                table.setdefault(_unescape_mountinfo(fields[4]), []).append(
+                    (rest[0], fields[5]))
+    except OSError:
+        return None
+    return table
+
+
+def _mp_key(path):
+    """`path` as the mount table spells it, without stat-ing `path` itself:
+    the folder holding it is resolved (our mount roots, on a local disk) and
+    the last component is kept as written."""
+    p = os.path.normpath(os.path.abspath(path))
+    return os.path.join(os.path.realpath(os.path.dirname(p)), os.path.basename(p))
+
+
+def _mount_depth(path, table=None):
+    """How many mounts sit on `path`: 0 for none, 2 or more for a stack (the
+    same disk mounted twice on one folder — see _mountpoint_lock())."""
+    if not path:
+        return 0
+    if table is None:
+        table = _mount_table()
+    if table is None:
+        return 1 if os.path.ismount(path) else 0
+    return len(table.get(_mp_key(path), ()))
+
+
+def _mount_entry(path, table=None):
+    """(fstype, options) of the top mount ON `path`, or None."""
+    if table is None:
+        table = _mount_table()
+    stack = (table or {}).get(_mp_key(path)) if path else None
+    return stack[-1] if stack else None
+
+
+def _holding_fstype(path, table=None):
+    """Type of the filesystem `path` lies on, from the mount table and the
+    path as written (the deepest mount above it); None when unknown."""
+    if not path:
+        return None
+    if table is None:
+        table = _mount_table()
+    if not table:
+        return None
+    p = os.path.normpath(os.path.abspath(path))
+    best = None
+    for mp in table:
+        if (p == mp or p.startswith(mp.rstrip("/") + "/")) and (best is None or len(mp) > len(best)):
+            best = mp
+    return table[best][-1][0] if best is not None else None
+
+
+def _on_network_fs(path, table=None):
+    """True when `path` lies on a network filesystem (SMB, NFS…), judged from
+    the mount table and the path as written — nothing is stat-ed."""
+    return _holding_fstype(path, table) in _NET_FSTYPES
+
+
+# Filesystems that live in memory.
+_RAM_FSTYPES = frozenset(("tmpfs", "ramfs"))
+
+
+def _on_ram_fs(path, table=None):
+    """True when `path` lies on a filesystem kept in memory, judged from the
+    mount table and the path as written -- nothing is stat-ed, so it also
+    answers for a folder that does not exist yet.
+
+    🚨 On an A/B image /mnt is a tmpfs, and the roots disks and network shares
+    are mounted under (/mnt/hifi-internal and the others) are folders in it.
+    A folder there that is not inside a mounted disk is RAM: picked as a
+    "local folder" and shared over SMB, it would take a library copied from a
+    PC into the memory of the box, and be empty again at the next boot."""
+    return _holding_fstype(path, table) in _RAM_FSTYPES
+
+
+_probes = {}
+_probes_lock = threading.Lock()
+
+
+def _bounded_probe(fn, path, default=None, timeout=_PROBE_TIMEOUT):
+    """fn(path) in a helper thread, waited for at most `timeout` seconds;
+    `default` when it does not answer in time or raises. One probe per
+    (fn, path) at a time: while one is still stuck on a dead server, the next
+    caller gets `default` straight away instead of leaving another thread
+    stuck beside it."""
+    key = (getattr(fn, "__name__", repr(fn)), path)
+    box = {}
+
+    def run():
+        try:
+            box["v"] = fn(path)
+        except Exception:
+            pass
+    with _probes_lock:
+        old = _probes.get(key)
+        if old is not None and old.is_alive():
+            return default
+        t = threading.Thread(target=run, daemon=True, name="fs-probe")
+        _probes[key] = t
+        t.start()
+    t.join(timeout)
+    if t.is_alive():
+        print(f"[sources] {key[0]}({path}) did not answer in {timeout:g}s: server gone?")
+        return default
+    with _probes_lock:
+        if _probes.get(key) is t:
+            del _probes[key]
+    return box.get("v", default)
+
+
+def _fs_probe(fn, path, default=None, table=None, network=False):
+    """fn(path) directly on a local filesystem, through _bounded_probe() on a
+    network one (or when the caller already knows it is one)."""
+    if not path:
+        return default
+    if network or _on_network_fs(path, table):
+        return _bounded_probe(fn, path, default)
+    try:
+        return fn(path)
+    except Exception:
+        return default
+
+
+def _resolve_quick(path, table=None, net_roots=()):
+    """realpath() of `path`, except on a network filesystem (or under one of
+    `net_roots`, the mountpoints of our SMB sources), where it is only
+    normalised: realpath() stats every component, and that is what hangs."""
+    p = os.path.normpath(os.path.abspath(path))
+    if any(p == r or p.startswith(r.rstrip("/") + "/") for r in net_roots) or _on_network_fs(p, table):
+        return p
+    return os.path.realpath(path)
+
+
+def _resolve_mountpoint(mountpoint, table=None):
+    """The resolved path of a source's mountpoint. Something mounted on it is
+    a real directory by definition, so it is taken from the mount table
+    without a stat; an unmounted one is a plain local folder and safe to
+    realpath() (which also catches a mountpoint that is a symlink)."""
+    if table is None:
+        table = _mount_table()
+    key = _mp_key(mountpoint)
+    if table and key in table:
+        return key
+    return os.path.realpath(mountpoint)
+
+
+_mount_locks = {}
+_mount_locks_guard = threading.Lock()
+
+
+def _mountpoint_lock(mountpoint):
+    """One lock per mountpoint, held from the "is it mounted?" check to the
+    mount itself. At boot remount_all() and usb_sync() both mount the same
+    adopted USB disk; ext4 and vfat accept a second mount stacked on the
+    first, and "Remove" then took off only the top one."""
+    key = _mp_key(mountpoint)
+    with _mount_locks_guard:
+        return _mount_locks.setdefault(key, threading.Lock())
+
+
+# ─────────────────────────── SMB mounting ───────────────────────────
+def _smb_wants_rw(src):
+    """Is this SMB source meant to be writable? The one place that answers it.
+
+    Missing key = yes: read-write is the default for every source type, and a
+    source stored before that changed carries an explicit "rw" either way, so
+    nobody's deliberate read-only choice is overridden by this."""
+    return bool(src.get("rw", True))
+
+
+def mount_smb(src):
+    """Mount one SMB source. Returns (ok, message, detail).
+
+    `message` is always something the owner can act on ("Wrong username or
+    password"); `detail` carries the raw mount.cifs output for the UI's
+    "technical details" line -- handing someone NT_STATUS_LOGON_FAILURE as
+    the whole error is exactly what this replaces.
+
+    Read-write by default, like every other source type (adopted internal
+    and USB disks already mount rw): a share someone adds here is their own
+    NAS folder, and an appliance that cannot rip a CD onto it or delete a
+    file from it surprised owners far more often than the read-only default
+    protected anyone. The mount carries the same uid=/gid= mapping the
+    FAT-like adopted-disk mounts use (mount.cifs presents every file under
+    that uid/gid regardless of what wrote it, so unlike ext4 there's no
+    post-write chown step needed).
+
+    src["rw"]=False mounts read-only instead. So does a server that refuses
+    to hand the share over writable at all: rather than leave the owner
+    unable to add a share their NAS exports read-only, the read-only options
+    are tried before giving up, and src["rw"] is flipped to False so the
+    stored state tells the truth about what they got (the list shows it
+    read-only, and _rip_writable_sources() won't offer it as a rip
+    destination).
+
+    A login the server refuses ends the attempt at the first protocol
+    version: the version does not fix a password, and every refused login
+    counts towards the lockout of the account (see remount_all()).
+
+    Serialized per mountpoint (_mountpoint_lock()): the boot-time remount and
+    an "add" of the same share must not both mount it."""
+    with _mountpoint_lock(src["mountpoint"]):
+        return _mount_smb_locked(src)
+
+
+def _mount_smb_locked(src):
+    server = src["server"].strip().strip("/")
+    share = src["share"].strip().strip("/")
+    try:
+        username, password = _smb_login(src)
+    except hb.LoginUnreadable as e:
+        print(f"[sources] login of {server}/{share} cannot be opened: {e}")
+        return False, _ht('mount.loginUnreadable', _hlang()), ""
+    for value in (server, share, username):
+        if not _field_ok(value):
+            return False, _ht('mount.invalidFields', _hlang()), ""
+    if not _password_ok(password):
+        return False, _ht('mount.invalidFields', _hlang()), ""
+
+    # The mountpoint is derived from user-supplied server/share; resolve it and
+    # make sure it can never escape MOUNT_ROOT before we create or mount onto it.
+    root = os.path.realpath(MOUNT_ROOT)
+    mountpoint = _resolve_mountpoint(src["mountpoint"])
+    # Strictly below the root: the slug is never empty, so a mountpoint equal
+    # to MOUNT_ROOT itself could only be a bug, never a legitimate share.
+    if not mountpoint.startswith(root + os.sep):
+        return False, _ht('mount.invalidMountpoint', _hlang()), ""
+    # From the mount table, before anything stats the folder: a share whose
+    # server has gone away answers a stat() only minutes later.
+    if _mount_depth(mountpoint):
+        return True, _ht('mount.alreadyMounted', _hlang()), ""
+    os.makedirs(mountpoint, exist_ok=True)
+
+    # mount.cifs against an unreachable/silently-dropping host can block the
+    # kernel-level mount() syscall in uninterruptible sleep (D state) for far
+    # longer than _run()'s own timeout — a SIGKILL can't interrupt that until
+    # the blocking syscall itself gives up, which can take minutes or hang
+    # indefinitely, wedging the request. A plain TCP probe on the SMB port
+    # first fails fast (5s) instead of ever reaching that risky call when the
+    # server just isn't there.
+    if not _smb_reachable(server):
+        return False, _ht('mount.smbUnreachable', _hlang(), server=server), ""
+
+    unc = f"//{server}/{share}"
+    want_rw = _smb_wants_rw(src)
+    ro_opts = "uid=0,gid=0,iocharset=utf8,ro,file_mode=0644,dir_mode=0755"
+    passes = [(ro_opts, False)]
+    if want_rw:
+        uid, gid = _ensure_samba_uid_gid()
+        rw_opts = f"uid={uid},gid={gid},iocharset=utf8,rw,file_mode=0664,dir_mode=0775"
+        passes = [(rw_opts, True), (ro_opts, False)]
+
+    cred_path = None
+    try:
+        if username:
+            # Credentials go in a private temp file rather than the -o string,
+            # so the password never shows up in argv / `ps aux` output.
+            cred_path = _smb_cred_file(username, password)
+            cred_opt = f",credentials={cred_path}"
+        else:
+            cred_opt = ",guest"
+
+        last = ""
+        code = None
+        for base_opts, writable in passes:
+            for vers in ("3.1.1", "3.0", "2.1", "1.0"):
+                opts = f"{base_opts}{cred_opt},vers={vers}"
+                r = _run(["mount", "-t", "cifs", unc, mountpoint, "-o", opts])
+                if r.returncode == 0:
+                    if want_rw and not writable:
+                        # Writable was asked for and refused: keep the share
+                        # rather than the error, and record what it really is
+                        # (api_add_smb() saves this dict right after we
+                        # return, so the flip is persisted with it).
+                        src["rw"] = False
+                        return True, _ht('mount.mountedSmbRo', _hlang(), vers=vers), last
+                    return True, _ht('mount.mountedSmb', _hlang(), vers=vers), ""
+                last = (r.stderr or r.stdout).strip()
+                if _smb_reason(last) in _SMB_AUTH_CODES:
+                    # The server negotiated this version and turned the login
+                    # down: an older one would only be another refused login
+                    # on an account that NAS boxes lock after a handful.
+                    break
+            code = _smb_reason(last)
+            if code:
+                # A password, a share name or a server that isn't answering:
+                # the read-only pass would fail the same way, four mounts and
+                # four timeouts later. Only an unrecognised failure (which is
+                # what "mount error(30): Read-only file system" comes out as)
+                # is worth retrying without the write options.
+                break
+        return False, (_m(code) if code else _ht('mount.genericFailed', _hlang())), last
+    finally:
+        if cred_path:
+            try:
+                os.remove(cred_path)
+            except OSError:
+                pass
+
+
+_SMB_AUTH_CODES = ("msg.smbBadCredentials", "msg.smbPasswordExpired", "msg.smbAccountLocked")
+
+
+def umount(mountpoint):
+    """Lazy unmount of a network share. Mounted or not is read from the mount
+    table, and umount(8) is told not to canonicalize the path (-c): either
+    would stat a share whose server is gone and wait minutes for it. Every
+    mount stacked on the folder goes."""
+    if not mountpoint:
+        return
+    key = _mp_key(mountpoint)
+    for _ in range(max(0, min(_mount_depth(key), 8))):
+        if _run(["umount", "-l", "-c", key], timeout=15).returncode != 0:
+            break
+
+
+def umount_clean(mountpoint):
+    """Unmount an adopted disk the way a removable device deserves: flush
+    first, then a plain umount, and the lazy detach only as a fallback.
+
+    `umount -l` on its own (what umount() does, and what removing a source
+    used to call) returns immediately and leaves the writeback to happen
+    whenever the kernel gets round to it. On a USB stick — which the user
+    pulls out the moment the entry disappears from the list — that is
+    precisely how a FAT filesystem ends up corrupted. `sync` first, so
+    there is nothing left to write back; the plain umount then fails loudly
+    if something still holds the mount (the Lyrion scanner walking it, an
+    open Samba handle), and only then do we detach lazily rather than leave
+    the user with a source that refuses to go away.
+
+    The flush is `sync -f` on this disk alone, not a global `sync`: that one
+    also waits for whatever is still to be written to a network share, and
+    with its NAS switched off it never came back — under _lock, with every
+    other route queued behind it. A disk mounted twice on the same folder
+    (see _mountpoint_lock()) is unmounted as many times as it is stacked.
+
+    Returns (ok, lazy_used)."""
+    if not mountpoint or not _mount_depth(mountpoint):
+        return True, False
+    lazy = False
+    with _mountpoint_lock(mountpoint):
+        for _ in range(8):
+            if not _mount_depth(mountpoint):
+                break
+            _run(["sync", "-f", mountpoint], timeout=60)
+            if _run(["umount", mountpoint], timeout=30).returncode == 0:
+                continue
+            lazy = True
+            if _run(["umount", "-l", mountpoint], timeout=30).returncode != 0:
+                return False, lazy
+    return not _mount_depth(mountpoint), lazy
+
+
+def _drop_adopted_mountpoint(mountpoint):
+    """Remove the now-unused mountpoint directory of an adopted disk.
+
+    Not housekeeping for its own sake: an empty /mnt/hifi-usb/<LABEL>-<id>
+    left behind is indistinguishable, to os.path.isdir(), from a real folder,
+    and _sync_from_lyrion() takes exactly that test as permission to offer a
+    stale Lyrion mediadir back as a new `local` source. Seen in the field: an
+    Osmium install stick adopted as a music source, unplugged, its source
+    deleted — and the entry reappearing on the very next poll, for good.
+
+    Confined to the two roots we create ourselves, and only when the
+    directory is really unmounted and really empty, so this can never eat a
+    user's folder."""
+    if not mountpoint:
+        return
+    roots = (os.path.realpath(USB_ADOPTED_ROOT), os.path.realpath(INTERNAL_MOUNT_ROOT))
+    # Judged on the path as written first, so an SMB mountpoint (whose server
+    # may be gone) is never stat-ed here at all.
+    lexical = os.path.normpath(os.path.abspath(mountpoint))
+    if not any(lexical.startswith(root + os.sep) for root in roots):
+        return
+    if _mount_depth(mountpoint):
+        return
+    p = os.path.realpath(mountpoint)
+    if not any(p.startswith(root + os.sep) for root in roots):
+        return
+    try:
+        os.rmdir(p)                      # fails, harmlessly, if not empty
+    except OSError:
+        pass
+
+
+def _system_disk_paths():
+    """Return a set of disk paths that are part of the running system and must
+    never be offered for adoption or formatting."""
+    system = set()
+    for target in ("/", "/boot/efi"):
+        try:
+            r = _run(["findmnt", "-no", "SOURCE", target], timeout=5)
+            if r.returncode != 0 or not r.stdout.strip():
+                continue
+            src = r.stdout.strip()
+            # findmnt returns the partition; resolve to the parent disk via lsblk.
+            if src.startswith("/dev/"):
+                pr = _run(["lsblk", "-no", "PKNAME", src], timeout=5)
+                if pr.returncode == 0 and pr.stdout.strip():
+                    system.add("/dev/" + pr.stdout.strip().split()[0])
+            elif src.startswith("UUID=") or src.startswith("PARTUUID="):
+                # resolve to a device node
+                pr = _run(["findfs", src], timeout=5)
+                if pr.returncode == 0 and pr.stdout.strip().startswith("/dev/"):
+                    dev = pr.stdout.strip()
+                    pr2 = _run(["lsblk", "-no", "PKNAME", dev], timeout=5)
+                    if pr2.returncode == 0 and pr2.stdout.strip():
+                        system.add("/dev/" + pr2.stdout.strip().split()[0])
+        except Exception:
+            pass
+    return system
+
+
+def _lsblk_full():
+    return _run_json(["lsblk", "-J", "-b", "-o",
+                        "PATH,NAME,TYPE,SIZE,MODEL,SERIAL,TRAN,ROTA,RM,FSTYPE,LABEL,UUID,PARTUUID,"
+                        "PKNAME,MOUNTPOINT,PARTTYPENAME"],
+                       timeout=10)
+
+
+def _is_efi_partition(part):
+    """True for an EFI System Partition, on GPT or MBR alike. Identified by
+    lsblk's own PARTTYPENAME (util-linux resolves both the GPT ESP GUID
+    c12a7328-f81f-11d2-ba4b-00a0c93ec93b and the MBR 0xEF type code to a name
+    containing "EFI"), not by filesystem label -- a user's own USB stick can
+    be vfat-formatted and labeled anything, but its partition *type* is set by
+    whatever tool made it bootable and isn't something a music folder would
+    ever legitimately have. Seen in the field: a bootable installer USB stick
+    plugged in for something unrelated got its ESP auto-adopted as a music
+    source alongside the real data partition, cluttering "Music sources" with
+    a permanently-empty/junk entry."""
+    return "efi" in (part.get("parttypename") or "").lower()
+
+
+def _internal_disks():
+    """Enumerate internal (non-USB, non-optical, non-system) block devices.
+    Returns a list of dicts with partitions and adoption state."""
+    data = _lsblk_full() or {}
+    system_disks = _system_disk_paths()
+
+    # Build a map of mounted partitions outside allowed roots.
+    mounted_outside = set()
+    for dev in data.get("blockdevices", []):
+        for part in dev.get("children") or []:
+            mp = part.get("mountpoint")
+            if mp:
+                try:
+                    rp = os.path.realpath(mp)
+                    allowed = False
+                    for root in ("/mnt", "/media", INTERNAL_MOUNT_ROOT):
+                        if rp == root or rp.startswith(root + os.sep):
+                            allowed = True
+                            break
+                    if not allowed:
+                        mounted_outside.add(dev.get("path"))
+                except Exception:
+                    mounted_outside.add(dev.get("path"))
+            if part.get("fstype") == "swap":
+                system_disks.add(dev.get("path"))
+
+    state = load_state()
+    by_partuuid = {}
+    by_uuid = {}
+    for s in state.get("sources", []):
+        if s.get("type") == "internal":
+            if s.get("partuuid"):
+                by_partuuid[s["partuuid"].lower()] = s
+            if s.get("fsuuid"):
+                by_uuid[s["fsuuid"].lower()] = s
+
+    out = []
+    for dev in data.get("blockdevices", []):
+        if dev.get("type") != "disk":
+            continue
+        if dev.get("tran") == "usb" or dev.get("rm") or dev.get("type") == "rom":
+            continue
+        path = dev.get("path")
+        if not path or path in system_disks or path in mounted_outside:
+            continue
+        if dev.get("size", 0) <= 0:
+            continue
+
+        partitions = []
+        has_data = False
+        adopted = False
+        source_id = None
+        for part in dev.get("children") or []:
+            if part.get("type") != "part":
+                continue
+            if _is_efi_partition(part):
+                continue
+            p = {
+                "path": part.get("path"),
+                "name": part.get("name"),
+                "fstype": part.get("fstype"),
+                "label": part.get("label"),
+                "uuid": part.get("uuid"),
+                "partuuid": part.get("partuuid"),
+                "size": part.get("size"),
+                "mountpoint": part.get("mountpoint"),
+            }
+            partitions.append(p)
+            if part.get("fstype"):
+                has_data = True
+            pu = (part.get("partuuid") or "").lower()
+            uu = (part.get("uuid") or "").lower()
+            if pu in by_partuuid or uu in by_uuid:
+                adopted = True
+                source_id = (by_partuuid.get(pu) or by_uuid.get(uu) or {}).get("id")
+
+        serial = dev.get("serial") or ""
+        size = dev.get("size") or 0
+        confirm = hashlib.sha256(f"{path}:{serial}:{size}".encode()).hexdigest()[:12]
+        out.append({
+            "path": path,
+            "model": (dev.get("model") or "").strip(),
+            "serial": serial,
+            "size": size,
+            "fstype": dev.get("fstype"),
+            "label": dev.get("label"),
+            "has_data": has_data,
+            "adopted": adopted,
+            "source_id": source_id,
+            "confirm": confirm,
+            "partitions": partitions,
+        })
+    return out
+
+
+def _adopted_disk_sources():
+    """Adopted internal disks, adopted (read-write) USB disks, and local
+    rootfs folders opted into Samba sharing (`type == "local"` with
+    `samba: true`) -- every source type that gets a Samba share. Only the
+    first two get a stable mountpoint/CD-rip-destination status; a shared
+    local folder is just a plain rootfs path (see api_add_local())."""
+    return [s for s in load_state().get("sources", [])
+            if s.get("type") in ("internal", "usb")
+            or (s.get("type") == "local" and s.get("samba"))]
+
+
+def _share_name(label):
+    base = _slug(label or "Musica")
+    if not base:
+        base = "Musica"
+    # Share names are case-insensitive to Samba and to every client, and a
+    # section called [global] (a disk labelled "GLOBAL") would rewrite the
+    # server's own settings instead of adding a share.
+    names = set(_SMB_RESERVED_SHARES)
+    for s in _adopted_disk_sources():
+        names.add((s.get("share") or "Musica").lower())
+    if base.lower() not in names:
+        return base
+    n = 2
+    while f"{base}-{n}".lower() in names:
+        n += 1
+    return f"{base}-{n}"
+
+
+def _existing_adopted_source(source_type, partuuid, fsuuid):
+    """An already-adopted "internal"/"usb" source for this exact physical
+    partition, if any — matched by partuuid, falling back to fsuuid for a
+    "superfloppy" disk with no partition table. Re-adopting an
+    already-adopted disk (a double tap, a retry after a slow response)
+    should reuse that source's id/share/mountpoint, not mint a second one
+    under a different share name via _share_name() — the id is derived from
+    the share, so a fresh share means a fresh id, and the old entry never
+    gets cleaned up since nothing then matches its id."""
+    for s in _adopted_disk_sources():
+        if s.get("type") != source_type:
+            continue
+        if partuuid and s.get("partuuid") == partuuid:
+            return s
+        if not partuuid and fsuuid and s.get("fsuuid") == fsuuid:
+            return s
+    return None
+
+
+def _in_group(user, gid):
+    """True if `user` is in the group `gid` (primary or supplementary), None if
+    there is no such user. grp's member list alone is not enough: it does not
+    list users whose *primary* group it is."""
+    import pwd
+    try:
+        ent = pwd.getpwnam(user)
+    except KeyError:
+        return None
+    try:
+        return gid in os.getgrouplist(user, ent.pw_gid)
+    except Exception:
+        return False
+
+
+_share_group_gid = None       # last resolved gid, None until we have one
+_share_group_done = False     # group exists AND both memberships confirmed
+_share_group_next_try = 0.0   # don't re-run groupadd/usermod on every call
+
+
+def _ensure_share_group():
+    """Ensure SHARE_GROUP exists and both writers belong to it. Returns its
+    gid, or None while there isn't one.
+
+    Called from the ownership path, which runs on every mount and every share
+    regeneration, so once everything is in place this is a single flag test —
+    and while something is still missing (Lyrion not installed yet, an /etc
+    that would not take the write) it retries at most once a minute instead of
+    forking groupadd/usermod each time.
+
+    Adding Lyrion to the group also restarts it, in the background: a running
+    process keeps the supplementary groups it was started with, so until it
+    restarts it still cannot write into a folder that is now handed to it
+    through the group. That happens once in a device's life."""
+    global _share_group_gid, _share_group_done, _share_group_next_try
+    if _share_group_done:
+        return _share_group_gid
+    now = time.time()
+    if now < _share_group_next_try:
+        return _share_group_gid
+    _share_group_next_try = now + 60
+
+    import grp
+    try:
+        ent = grp.getgrnam(SHARE_GROUP)
+    except KeyError:
+        _run(["groupadd", "-r", SHARE_GROUP], timeout=10)
+        try:
+            ent = grp.getgrnam(SHARE_GROUP)
+        except KeyError:
+            print(f"[sources] group {SHARE_GROUP} could not be created")
+            return _share_group_gid
+    gid = _share_group_gid = ent.gr_gid
+
+    complete = True
+    lyrion_added = False
+    for user in (SAMBA_USER, "squeezeboxserver"):
+        member = _in_group(user, gid)
+        if member:
+            continue
+        if member is None:
+            # No such user yet — Lyrion is installed on demand, so this is the
+            # normal state of a device that follows another server. Try again.
+            complete = False
+            continue
+        if _run(["usermod", "-aG", SHARE_GROUP, user], timeout=10).returncode == 0:
+            print(f"[sources] added {user} to group {SHARE_GROUP}")
+            lyrion_added = lyrion_added or user == "squeezeboxserver"
+        else:
+            complete = False
+    if lyrion_added:
+        threading.Thread(target=_restart_lyrion_for_group, daemon=True,
+                         name="lyrion-group-restart").start()
+    _share_group_done = complete
+    return gid
+
+
+def _restart_lyrion_for_group():
+    """Restart Lyrion so it picks up its new SHARE_GROUP membership — but only
+    if it is actually running, and never at the cost of a silent failure."""
+    try:
+        if _run(["systemctl", "is-active", "--quiet", LYRION_SERVICE], timeout=10).returncode != 0:
+            return
+        print(f"[sources] restarting {LYRION_SERVICE} to pick up group {SHARE_GROUP}")
+        _systemctl_lyrion("restart", timeout=120)
+    except Exception as e:
+        print(f"[sources] lyrion restart for {SHARE_GROUP} failed: {e}")
+
+
+def _ensure_samba_uid_gid():
+    """Ensure the dedicated music/Samba user exists; return the (uid, gid)
+    shared folders are owned by. exFAT/vfat mount options require numeric ids,
+    not a username.
+
+    The gid is SHARE_GROUP's, not hifimusic's own: see the constant. Falling
+    back to the user's primary group keeps a device where the group cannot be
+    created behaving exactly as before."""
+    import pwd
+    try:
+        ent = pwd.getpwnam(SAMBA_USER)
+    except KeyError:
+        _run(["useradd", "-r", "-M", "-s", "/usr/sbin/nologin", "-N", SAMBA_USER], timeout=10)
+        try:
+            ent = pwd.getpwnam(SAMBA_USER)
+        except KeyError:
+            return 0, 0
+    gid = _ensure_share_group()
+    return ent.pw_uid, (ent.pw_gid if gid is None else gid)
+
+
+def _samba_account_exists():
+    try:
+        r = subprocess.run(["pdbedit", "-L", "-u", SAMBA_USER], capture_output=True, text=True, timeout=10)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _create_samba_user(force_new_password=False):
+    """Ensure a dedicated local + Samba user exists; return its password."""
+    # Samba does not recreate its own state folders: without private/ both
+    # smbpasswd ("Failed to open .../secrets.tdb") and smbd fail. Every device
+    # installed straight as an image started with an empty /var (see
+    # scripts/local-bottom/hifi-state), so they are made here if missing.
+    for d, mode in (("/var/lib/samba", 0o755), ("/var/lib/samba/private", 0o700),
+                    ("/var/cache/samba", 0o755), ("/var/log/samba", 0o750)):
+        try:
+            if not os.path.isdir(d):
+                os.makedirs(d, exist_ok=True)
+                os.chmod(d, mode)
+        except OSError as e:
+            print(f"[sources] cannot create {d}: {e}")
+    _ensure_samba_uid_gid()
+    cred = {}
+    if os.path.exists(SAMBA_CRED_FILE):
+        try:
+            with open(SAMBA_CRED_FILE) as f:
+                cred = json.load(f)
+        except Exception:
+            pass
+    password = None if force_new_password else cred.get("password")
+    if not password:
+        password = secrets.token_urlsafe(9)
+        cred = {"username": SAMBA_USER, "password": password, "synced": False}
+
+    # Only re-run smbpasswd when we haven't confirmed it actually took — a
+    # transient failure here must not leave the credential file showing a
+    # password Samba never accepted (which is exactly what happened before:
+    # the smbpasswd call's result was discarded, so a failure was silent).
+    if not cred.get("synced"):
+        try:
+            # `-a` (add) fails on some Samba versions if the account already
+            # exists — use it only for the very first creation, otherwise
+            # just reset the existing account's password.
+            args = ["smbpasswd", "-s"] + ([] if _samba_account_exists() else ["-a"]) + [SAMBA_USER]
+            r = subprocess.run(
+                args, input=f"{password}\n{password}\n", text=True,
+                capture_output=True, timeout=10,
+            )
+            # Don't trust the exit code alone — confirm the account is
+            # actually present in the passdb afterwards.
+            cred["synced"] = r.returncode == 0 and _samba_account_exists()
+            if not cred["synced"]:
+                print(f"[sources] smbpasswd did not take effect for {SAMBA_USER} "
+                      f"(rc={r.returncode}): {(r.stderr or r.stdout).strip()}")
+        except Exception as e:
+            cred["synced"] = False
+            print(f"[sources] smbpasswd error for {SAMBA_USER}: {e}")
+
+    os.makedirs(os.path.dirname(SAMBA_CRED_FILE), exist_ok=True)
+    tmp = SAMBA_CRED_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cred, f)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, SAMBA_CRED_FILE)
+    return password
+
+
+# Announced as the host's own mDNS name (%h -> hifiplayer.local), so it follows
+# a renamed device for free. _device-info._tcp carries no port of its own (0 is
+# the Bonjour convention for a record that only describes the host); it exists
+# purely so Finder draws a server icon instead of a generic PC.
+_AVAHI_SMB_XML = """<?xml version="1.0" standalone='no'?><!--*-nxml-*-->
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<!-- HiFi Player - written by sources_server.py, do not edit by hand. -->
+<service-group>
+  <name replace-wildcards="yes">%h</name>
+  <service>
+    <type>_smb._tcp</type>
+    <port>445</port>
+  </service>
+  <service>
+    <type>_device-info._tcp</type>
+    <port>0</port>
+    <txt-record>model=RackMac</txt-record>
+  </service>
+</service-group>
+"""
+
+
+def _unit_available(unit):
+    """True if systemd knows a unit file by that name (i.e. pkg installed)."""
+    r = _run(["systemctl", "list-unit-files", unit], timeout=5)
+    return r.returncode == 0 and unit in (r.stdout or "")
+
+
+def _publish_smb_discovery(enabled):
+    """Make the shares show up in the network browser of the three OSes.
+
+    None of them browses SMB servers over SMB itself: Windows Explorer's
+    "Network" uses WS-Discovery (the wsdd2 daemon — NetBIOS browsing died with
+    SMB1, and nmbd is masked here for boot speed, see apply.d/0031), while
+    macOS Finder and GNOME's "Networks" use the Bonjour `_smb._tcp` record.
+    Publish neither and the shares still work, but the device is invisible and
+    the user has to type \\\\<ip>\\<share> by hand.
+
+    Tied to the shares existing rather than left permanently on: with no
+    adopted disk smbd is stopped, and advertising a server that refuses every
+    connection is worse than advertising nothing.
+    """
+    try:
+        if enabled:
+            os.makedirs(os.path.dirname(AVAHI_SMB_SERVICE), exist_ok=True)
+            cur = None
+            try:
+                with open(AVAHI_SMB_SERVICE) as f:
+                    cur = f.read()
+            except OSError:
+                pass
+            if cur != _AVAHI_SMB_XML:
+                tmp = AVAHI_SMB_SERVICE + ".tmp"
+                with open(tmp, "w") as f:
+                    f.write(_AVAHI_SMB_XML)
+                os.chmod(tmp, 0o644)
+                # avahi-daemon watches this directory and reloads on its own.
+                os.replace(tmp, AVAHI_SMB_SERVICE)
+        elif os.path.exists(AVAHI_SMB_SERVICE):
+            os.remove(AVAHI_SMB_SERVICE)
+    except Exception as e:
+        print(f"[sources] avahi smb service: {e}")
+
+    # wsdd2 is left disabled by the OS update that installs it (a daemon idling
+    # for nothing costs boot time), and is missing outright on a device that
+    # hasn't taken that update yet — either way it only costs Windows browsing,
+    # never the shares themselves, so a failure here is not fatal.
+    try:
+        if not _unit_available(WSDD_UNIT):
+            return
+        action = "enable" if enabled else "disable"
+        _run(["systemctl", action, "--now", WSDD_UNIT], timeout=30)
+    except Exception as e:
+        print(f"[sources] {WSDD_UNIT}: {e}")
+
+
+def _share_group_name():
+    """Name of SHARE_GROUP for smb.conf's force group, or None."""
+    import grp
+    gid = _ensure_share_group()
+    if gid is None:
+        return None
+    try:
+        return grp.getgrgid(gid).gr_name
+    except KeyError:
+        return None
+
+
+def _ensure_music_root():
+    """Make /data/music on a device that has a data partition, owned by the
+    shared group and setgid, so both Samba (as hifimusic) and Lyrion can write
+    inside it and anything created there keeps that group -- the same
+    treatment a published local folder gets in api_add_local().
+
+    Only when /data is really mounted: on a device still on the old single-root
+    layout that path means nothing, and an empty folder of that name would show
+    up in the picker as a place to put music that is not one."""
+    if not os.path.ismount(DATA_MNT):
+        return
+    try:
+        os.makedirs(DATA_MUSIC_ROOT, exist_ok=True)
+        gid = _ensure_share_group()
+        if gid is not None:
+            os.chown(DATA_MUSIC_ROOT, 0, gid)
+        os.chmod(DATA_MUSIC_ROOT, 0o2775)
+    except OSError as e:
+        print(f"[sources] {DATA_MUSIC_ROOT}: {e}")
+
+
+# Section names smb.conf gives a meaning of its own.
+_SMB_RESERVED_SHARES = ("global", "homes", "printers")
+# 🚨 What must never reach smb.conf in a share's path. A newline ends the
+# `path =` line, and whatever follows is parsed as more configuration: a
+# folder made over the network as "x\n[evil]\n  root preexec = …" and then
+# published added a share that runs commands as root (reproduced on a
+# device). The backslash continues a line, a %-letter is a macro Samba
+# expands (%H is a home folder, %$(VAR) an environment variable), and
+# leading or trailing blanks are trimmed by the parser — the share would
+# then point at a different folder from the one shown.
+_SMB_CONF_UNSAFE_PATH = re.compile(r"[\x00-\x1f\x7f\\]|%[A-Za-z$(]|^\s|\s$")
+_SMB_SHARE_NAME = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._ -]{0,79}")
+# The same control characters, for every name the API creates or renames.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _smb_conf_problem(share, path):
+    """Why `share`/`path` cannot be written into smb.conf, or None. Checked
+    where the file is written, whatever the source of the values: a folder
+    with such a name can be made over SSH or from a PC, and a state file can
+    come from a restored backup."""
+    if not isinstance(share, str) or not _SMB_SHARE_NAME.fullmatch(share) \
+            or share.lower() in _SMB_RESERVED_SHARES:
+        return "share name"
+    if not isinstance(path, str) or not path.startswith("/") or _SMB_CONF_UNSAFE_PATH.search(path):
+        return "path"
+    return None
+
+
+def _samba_share_block(share, path, group):
+    """The smb.conf stanza for one published folder, as a list of lines --
+    none at all (and a line in the log) when the name or the path could
+    change the meaning of the file, see _smb_conf_problem()."""
+    problem = _smb_conf_problem(share, path)
+    if problem:
+        print(f"[sources] not sharing {share!r} -> {path!r}: unsafe {problem} for smb.conf")
+        return []
+    lines = [
+        f"\n[{share}]",
+        f"   path = {path}",
+        "   read only = no",
+        "   browseable = yes",
+        f"   valid users = {SAMBA_USER}",
+        f"   force user = {SAMBA_USER}",
+    ]
+    if group:
+        # Everything created here lands in the group Lyrion is in too, so the
+        # two can edit and delete each other's files (see SHARE_GROUP).
+        lines.append(f"   force group = {group}")
+    # `force ...` (OR'd on after the mask) rather than the mask alone: a
+    # Windows client that asks for 0644/0755 must still end up group-writable,
+    # and the setgid bit has to survive into new subfolders so the whole tree
+    # keeps the shared group.
+    lines += [
+        "   create mask = 0664",
+        "   force create mode = 0664",
+        "   directory mask = 2775",
+        "   force directory mode = 2775",
+        # 🚨 The reason "copying works, editing works, deleting says you don't
+        # have permission". Samba reports a file the connecting user cannot
+        # write as DOS READ ONLY, and with the default (no) it then refuses to
+        # delete it — which is every file written by the *other* account, e.g.
+        # a playlist Lyrion saved into a folder that is also a share. Unix
+        # permissions still decide: this only stops Samba from vetoing a delete
+        # the filesystem itself allows.
+        "   delete readonly = yes",
+    ]
+    return lines
+
+
+def regen_samba_shares():
+    """Rewrite the included shares file and start/stop smbd accordingly."""
+    disks = _adopted_disk_sources()
+    group = _share_group_name()
+    lines = []
+    seen = set()
+    for src in disks:
+        share = src.get("share") or "Musica"
+        mp = src.get("mountpoint") or src.get("path")  # "path" for a shared local folder
+        if not mp:
+            continue
+        if str(share).lower() in seen:
+            # A second section with the same name would be merged into the
+            # first by Samba, its path silently replacing the other one.
+            print(f"[sources] not sharing {mp!r}: share name {share!r} already in use")
+            continue
+        block = _samba_share_block(share, mp, group)
+        if block:
+            seen.add(str(share).lower())
+        lines += block
+
+    os.makedirs(os.path.dirname(SAMBA_SHARES_FILE), exist_ok=True)
+    tmp = SAMBA_SHARES_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, SAMBA_SHARES_FILE)
+
+    smbd = _run(["which", "smbd"], timeout=5).returncode == 0
+    if not disks:
+        if smbd:
+            _run(["systemctl", "disable", "--now", "smbd"], timeout=30)
+        _publish_smb_discovery(False)
+        return
+    if smbd:
+        _create_samba_user()
+        _run(["systemctl", "enable", "--now", "smbd"], timeout=30)
+        _run(["systemctl", "reload", "smbd"], timeout=10)
+    _publish_smb_discovery(smbd)
+
+
+def _ip_addresses():
+    addrs = []
+    try:
+        r = _run(["hostname", "-I"], timeout=5)
+        if r.returncode == 0:
+            addrs = r.stdout.strip().split()
+    except Exception:
+        pass
+    return addrs
+
+
+def _mount_adopted_disk(src, root):
+    """Mount one adopted (internal or USB) source by stable PARTUUID — or, for
+    a "superfloppy" USB stick with no partition table (common on cheap USB
+    flash drives), by filesystem UUID instead. Always read-write. Returns
+    (ok, message).
+
+    The "already mounted?" check and the mount itself happen under the
+    mountpoint's own lock (_mountpoint_lock()): at boot remount_all() and
+    usb_sync() reach the same disk at the same moment, and both used to find
+    it unmounted and both mount it — one stacked on the other."""
+    mountpoint = src.get("mountpoint")
+    if not mountpoint:
+        return False, _ht('mount.missingIdentifiers', _hlang())
+    with _mountpoint_lock(mountpoint):
+        return _mount_adopted_disk_locked(src, root)
+
+
+def _mount_adopted_disk_locked(src, root):
+    partuuid = src.get("partuuid")
+    fsuuid = src.get("fsuuid")
+    fstype = (src.get("fstype") or "").lower()
+    mountpoint = src.get("mountpoint")
+    if (not partuuid and not fsuuid) or not mountpoint:
+        return False, _ht('mount.missingIdentifiers', _hlang())
+    root = os.path.realpath(root)
+    p = os.path.realpath(mountpoint)
+    if p != root and not p.startswith(root + os.sep):
+        return False, _ht('mount.invalidMountpoint', _hlang())
+    os.makedirs(mountpoint, exist_ok=True)
+    depth = _mount_depth(mountpoint)
+    if depth:
+        if depth > 1:
+            print(f"[sources] {mountpoint} is mounted {depth} times over")
+        return True, _ht('mount.alreadyMounted', _hlang())
+
+    if fstype == "ext4":
+        opts = "rw,noatime,nosuid,nodev"
+    elif fstype in _FAT_LIKE:
+        # These filesystems (exFAT/vFAT/NTFS via the in-kernel ntfs3 driver)
+        # require numeric ids, not a username, and carry no POSIX perms.
+        uid, gid = _ensure_samba_uid_gid()
+        opts = f"rw,noatime,nosuid,nodev,uid={uid},gid={gid},fmask=0113,dmask=0002,iocharset=utf8"
+    else:
+        opts = "rw,noatime,nosuid,nodev"
+
+    spec = f"PARTUUID={partuuid}" if partuuid else f"UUID={fsuuid}"
+    mount_type = _fs_mount_type(fstype)
+    r = _run(["mount", "-t", mount_type, "-o", opts, spec, mountpoint], timeout=30)
+    if r.returncode != 0 and mount_type == "ntfs3":
+        # The in-kernel ntfs3 driver chokes on some real-world NTFS quirks (a
+        # dirty $LogFile from an unclean Windows shutdown, older NTFS
+        # versions, ...) that the far more forgiving FUSE ntfs-3g driver
+        # handles fine -- see os-update/apply.d/0053-ntfs-support.sh for what
+        # installs it. Same mount options: ntfs-3g understands the same
+        # uid=/gid=/fmask=/dmask=/iocharset= as ntfs3.
+        r = _run(["mount", "-t", "ntfs-3g", "-o", opts, spec, mountpoint], timeout=30)
+    if r.returncode != 0:
+        return False, (r.stderr or r.stdout or _ht('mount.genericFailed', _hlang())).strip()
+
+    if fstype == "ext4":
+        # mkfs.ext4 leaves the root dir owned by root:root, which the Samba
+        # forced user (hifimusic) cannot write into. exFAT/vfat/ntfs get this
+        # via the uid/gid mount options above instead.
+        try:
+            uid, gid = _ensure_samba_uid_gid()
+            os.chown(mountpoint, uid, gid)
+            os.chmod(mountpoint, 0o2775)
+        except Exception:
+            pass
+    return True, _ht('mount.mounted', _hlang())
+
+
+def mount_internal(src):
+    return _mount_adopted_disk(src, INTERNAL_MOUNT_ROOT)
+
+
+def _usb_source_on_system_disk(src):
+    """True when an adopted USB source is a partition of the disk the system
+    runs from (see _usb_scan()). Resolved through the udev links and sysfs,
+    no process: this runs for every USB source at every boot."""
+    for link in (("/dev/disk/by-partuuid/", src.get("partuuid")),
+                 ("/dev/disk/by-uuid/", src.get("fsuuid"))):
+        if not link[1]:
+            continue
+        dev = os.path.realpath(link[0] + link[1])
+        name = os.path.basename(dev)
+        if not dev.startswith("/dev/") or not os.path.exists(dev):
+            continue
+        sysdir = os.path.realpath(os.path.join(_SYS_BLOCK, name))
+        if os.path.exists(os.path.join(sysdir, "partition")):
+            name = os.path.basename(os.path.dirname(sysdir))
+        return "/dev/" + name in _usb_system_disks()
+    return False
+
+
+def mount_usb_adopted(src):
+    # Never again for a source adopted before _usb_scan() skipped the system
+    # disk: left unmounted, usb_sync() drops it like an unplugged stick
+    # instead of mounting the spare root slot that RAUC must write.
+    if _usb_source_on_system_disk(src):
+        return False, _ht('mount.systemDisk', _hlang())
+    return _mount_adopted_disk(src, USB_ADOPTED_ROOT)
+
+
+# SMB sources whose server refused the stored login during this run:
+# id -> (fingerprint of server, share and login; i18n code; raw detail).
+# 🚨 A wrong password used to be tried again every five seconds for five
+# minutes, four protocol versions each time — some 180 refused logins
+# from one box at every boot, which is how a Windows PC locks the account
+# and a Synology bans the address. One refusal is enough to know: the source
+# is left alone until its login changes (adding the share again with the
+# right password, or a restore) or the service starts again.
+_smb_auth_failed = {}
+
+
+def _smb_login_fingerprint(src):
+    raw = json.dumps([src.get("server"), src.get("share"), src.get("login"),
+                      src.get("username"), src.get("password")], default=str)
+    return hashlib.sha256(raw.encode("utf-8", "surrogateescape")).hexdigest()
+
+
+def _smb_auth_blocked(src):
+    """(code, detail) when the server already refused this source's current
+    login, else None."""
+    entry = _smb_auth_failed.get(src.get("id"))
+    if entry and entry[0] == _smb_login_fingerprint(src):
+        return entry[1], entry[2]
+    return None
+
+
+def _remount_smb(src):
+    """mount_smb() for the boot-time remount, recording a refused login."""
+    if _smb_auth_blocked(src):
+        return
+    ok, _msg, detail = mount_smb(src)
+    code = None if ok else _smb_reason(detail)
+    if code in _SMB_AUTH_CODES:
+        _smb_auth_failed[src.get("id")] = (_smb_login_fingerprint(src), code, (detail or "")[:800])
+        print(f"[sources] {src.get('server')}/{src.get('share')}: login refused ({code}), "
+              f"not tried again until it changes")
+    elif ok:
+        _smb_auth_failed.pop(src.get("id"), None)
+
+
+def remount_all():
+    state = load_state()
+    for src in state.get("sources", []):
+        t = src.get("type")
+        try:
+            if t == "smb":
+                _remount_smb(src)  # the loop retries what is worth retrying
+            elif t == "internal":
+                mount_internal(src)
+            elif t == "usb":
+                mount_usb_adopted(src)
+        except Exception as e:
+            print(f"[sources] remount failed for {src.get('name')}: {e}")
+    regen_samba_shares()
+
+
+def _all_smb_mounted():
+    """True if every configured SMB source is currently mounted (or none
+    exist), a source whose login was refused counting as done: retrying it
+    is exactly what must not happen."""
+    table = _mount_table()
+    for src in load_state().get("sources", []):
+        if src.get("type") == "smb" and not _smb_auth_blocked(src):
+            try:
+                if not _mount_depth(src["mountpoint"], table):
+                    return False
+            except Exception:
+                return False
+    return True
+
+
+def remount_all_retry(attempts=60, delay=5, max_delay=60):
+    """Mount SMB shares, retrying in the background until they all mount.
+
+    Boot no longer waits for the network (NetworkManager-wait-online is masked
+    for speed), so at startup the LAN / NAS may not be reachable yet and a
+    one-shot mount fails with -101 (ENETUNREACH). Keep retrying so the shares
+    come up on their own once the network is available — without ever delaying
+    boot or the UI (this runs in a daemon thread).
+
+    Every `delay` seconds for the first minute, which is when the network
+    comes up; then the wait doubles up to `max_delay`, so a NAS that is off
+    for the evening is not knocked on every five seconds. A refused login is
+    never retried (see _smb_auth_failed).
+    """
+    wait = delay
+    for i in range(attempts):
+        try:
+            remount_all()
+        except Exception as e:
+            print(f"[sources] remount attempt {i + 1} error: {e}")
+        if _all_smb_mounted():
+            if i:
+                print(f"[sources] SMB shares mounted after {i + 1} attempt(s)")
+            return
+        time.sleep(wait)
+        if (i + 1) * delay >= 60:
+            wait = min(max_delay, wait * 2)
+    print("[sources] gave up mounting SMB shares (network/server unreachable)")
+
+
+# ─────────────────────────── USB drives ─────────────────────────────
+# USB sticks / external drives are auto-adopted the moment they're plugged
+# in: mounted read-write under USB_ADOPTED_ROOT and Samba-shared, with no
+# user action needed (see usb_sync() below). This is deliberately more
+# aggressive than the "mount read-only, ask before enabling read-write" model
+# some similar appliances use — chosen so a device is immediately usable
+# without a trip to Settings. The only thing that still needs an explicit
+# tap is the (rarer) manual retry for a device whose auto-mount failed, and
+# joining Lyrion's actual media library scan ("Apply & rescan"), which stays
+# manual so plugging in a stick never interrupts playback with a forced
+# Lyrion restart. There used to also be a separate ephemeral, automatic,
+# read-only browse mount under /media/hifi-usb so a stick would show up
+# before adoption; it was removed because it gave every USB drive two
+# different paths (one read-only, one read-write) and users kept pointing
+# Lyrion's playlist/media folders at the read-only one, where writes silently
+# fail.
+_FAT_LIKE = ("vfat", "exfat", "ntfs", "ntfs3", "fuseblk", "msdos")
+# Legacy mountpoint root from the removed ephemeral browse mount — kept only
+# so _migrate_stale_usb_sources() can recognize and drop old "local" sources
+# that pointed into it.
+_LEGACY_USB_MOUNT_ROOT = "/media/hifi-usb"
+# Latest snapshot from usb_sync(), refreshed by the background usb_monitor thread
+# every few seconds — USB devices that still need attention (no filesystem, or
+# auto-mount failed). /api/usb serves this instead of running the full lsblk
+# scan on every poll (the web UI polls /api/usb every 4s and the monitor
+# already scans that often). None = no scan has completed yet.
+_usb_state = None
+
+
+def _fs_mount_type(fstype):
+    """Explicit `mount -t` type for a given fstype, used by the adopted
+    (internal/USB) read-write mount so it gets a consistent kernel-driver
+    mapping rather than relying on autodetection.
+
+    NTFS tries the in-kernel ntfs3 driver first (no extra package, and fast)
+    -- _mount_adopted_disk() falls back to the ntfs-3g FUSE driver itself if
+    that mount actually fails, since ntfs3 is pickier about real-world NTFS
+    quirks than ntfs-3g."""
+    if fstype == "ntfs":
+        return "ntfs3"
+    if fstype in ("vfat", "exfat", "ntfs3", "msdos"):
+        return fstype
+    return "auto"
+
+
+def _adopted_usb_ids():
+    """(partuuid, fsuuid) lowercased sets of already-adopted "usb" sources —
+    used to drop them from _usb_partitions() once they're mounted read-write
+    under USB_ADOPTED_ROOT, so usb_sync() doesn't try to adopt them again."""
+    partuuids, fsuuids = set(), set()
+    for s in load_state().get("sources", []):
+        if s.get("type") == "usb":
+            if s.get("partuuid"):
+                partuuids.add(s["partuuid"].lower())
+            if s.get("fsuuid"):
+                fsuuids.add(s["fsuuid"].lower())
+    return partuuids, fsuuids
+
+
+def _ignored_usb_ids():
+    """(partuuid, fsuuid) lowercased sets the user explicitly removed (via
+    DELETE /api/sources/<id>) while the device was still connected — kept out
+    of auto-adoption so removing a source actually sticks instead of usb_sync()
+    silently re-mounting it a few seconds later. Pruned once the device is no
+    longer physically present (see usb_sync()), mirroring the client-side
+    "forget the dismissal once it's unplugged" behaviour already used for the
+    insertion toast in App.jsx."""
+    partuuids, fsuuids = set(), set()
+    for e in load_state().get("usb_ignored", []):
+        if e.get("partuuid"):
+            partuuids.add(e["partuuid"].lower())
+        if e.get("fsuuid"):
+            fsuuids.add(e["fsuuid"].lower())
+    return partuuids, fsuuids
+
+
+_SYS_BLOCK = "/sys/class/block"
+
+
+def _block_fingerprint():
+    """Cheap summary of what the kernel currently has as block devices: every
+    name under /sys/class/block plus its size and removable flag. It changes
+    on any plug, unplug or repartition, and costs a handful of reads from a
+    virtual filesystem instead of a process.
+
+    Returns None when /sys can't be read at all -- callers must then fall
+    back to the real scan, never treat it as "nothing changed"."""
+    try:
+        names = sorted(os.listdir(_SYS_BLOCK))
+    except OSError:
+        return None
+    out = []
+    for name in names:
+        attrs = []
+        for attr in ("size", "removable"):
+            try:
+                with open(os.path.join(_SYS_BLOCK, name, attr)) as f:
+                    attrs.append(f.read().strip())
+            except OSError:
+                # Partitions have no `removable`, and a device can vanish
+                # mid-listing; either way its absence is part of the state.
+                attrs.append("")
+        out.append(name + ":" + ",".join(attrs))
+    return "|".join(out)
+
+
+# Last successful _usb_scan() result and the _block_fingerprint() it was taken
+# with. Both None at startup, so the first tick always runs a real scan.
+_usb_scan_cache = None
+_usb_scan_fingerprint = None
+_usb_scan_ts = 0.0
+# The cache is also refreshed on a timer even when the fingerprint is
+# unchanged: if lsblk once caught a device mid-enumeration (blank FSTYPE on a
+# perfectly good filesystem), sysfs never changes again afterwards, and
+# without this the stick would stay "needs formatting" until reboot.
+_USB_SCAN_MAX_AGE = 60
+
+# Partition labels of the A/B image layout (distro/build-image.sh). A disk
+# carrying either root slot is an Osmium system disk, ours or another one
+# plugged in, and none of its partitions is a music source.
+_SYSTEM_PARTLABELS = {"hifi-root-a", "hifi-root-b"}
+# _system_disk_paths() once it has found something: the disk the system runs
+# from does not change while it runs, and the scan below would otherwise fork
+# findmnt/lsblk again on every plug and unplug.
+_system_disks_cache = None
+
+
+def _usb_system_disks():
+    global _system_disks_cache
+    if not _system_disks_cache:
+        _system_disks_cache = _system_disk_paths() or None
+    return _system_disks_cache or set()
+
+
+def _usb_scan():
+    """Every USB block device that could carry a filesystem, no adopted/
+    ignored filtering → [{path,name,fstype,label,size,uuid,partuuid}].
+    `fstype` is empty/missing for a blank/unformatted device. Handles
+    partitioned (sdX1) and whole-disk filesystems; skips optical drives
+    (type 'rom'), any non-USB transport (internal SATA/eMMC), and EFI System
+    Partitions (see _is_efi_partition) -- a bootable installer stick has one
+    alongside its real data partition, and it's never a legitimate music
+    source.
+
+    Also skips the disk the system itself runs from, and any disk carrying
+    the A/B root slots. Osmium can be installed on a USB stick, and then
+    its own partitions are USB partitions too: seen in the field, both root
+    slots and the data partition adopted as "USB" sources, mounted under
+    USB_ADOPTED_ROOT and shared over Samba. The mount of the spare slot is
+    what broke every system update afterwards -- RAUC refuses to write a
+    slot that is mounted ("Destination device '/dev/sda3' already
+    mounted"). Sources adopted that way before this check existed are no
+    longer in the scan, so usb_sync() tears them down like an unplugged
+    stick once _USB_GONE_GRACE has passed.
+
+    lsblk only runs when _block_fingerprint() differs from the previous call
+    (or can't be computed, or the cache is too old): usb_monitor calls this
+    every 4 seconds forever, and forking lsblk to be told nothing happened was
+    a constant slice of the appliance's idle CPU. Detection latency is
+    unchanged -- the fingerprint moves in the same tick the device appears or
+    disappears.
+
+    Returns None -- not [] -- when the scan itself failed (lsblk missing,
+    timed out, unparseable output). "The scan did not work" and "no USB
+    device is plugged in" must never collapse into the same value now that
+    usb_sync() *removes* things for devices it no longer sees."""
+    global _usb_scan_cache, _usb_scan_fingerprint, _usb_scan_ts
+    fingerprint = _block_fingerprint()
+    if (fingerprint is not None
+            and fingerprint == _usb_scan_fingerprint
+            and _usb_scan_cache is not None
+            and time.monotonic() - _usb_scan_ts < _USB_SCAN_MAX_AGE):
+        return list(_usb_scan_cache)
+    try:
+        r = _run(["lsblk", "-J", "-o",
+                  "PATH,NAME,TYPE,FSTYPE,LABEL,SIZE,TRAN,UUID,PARTUUID,PARTTYPENAME,PARTLABEL"],
+                 timeout=10)
+        data = json.loads(r.stdout or "{}")
+    except Exception:
+        _usb_scan_fingerprint = None
+        return None
+    system_disks = _usb_system_disks()
+    out = []
+    for dev in data.get("blockdevices", []):
+        if dev.get("tran") != "usb" or dev.get("type") != "disk":
+            continue
+        kids = dev.get("children") or []
+        if dev.get("path") in system_disks or any(
+                (p.get("partlabel") or "") in _SYSTEM_PARTLABELS for p in kids):
+            continue
+        if kids:
+            out.extend(p for p in kids if p.get("type") == "part" and not _is_efi_partition(p))
+        else:
+            out.append(dev)
+    _usb_scan_cache = out
+    _usb_scan_fingerprint = fingerprint
+    _usb_scan_ts = time.monotonic()
+    return list(out)
+
+
+def _usb_raw_partitions():
+    """_usb_scan() with a failed scan flattened to "found nothing" — for the
+    callers that only ever enumerate and have no absence to react to."""
+    return _usb_scan() or []
+
+
+def _usb_partitions():
+    """USB partitions not yet adopted and not explicitly ignored — the pool
+    usb_sync() auto-adopts from and api_usb_adopt() (manual retry) picks
+    from."""
+    adopted_partuuids, adopted_fsuuids = _adopted_usb_ids()
+    ignored_partuuids, ignored_fsuuids = _ignored_usb_ids()
+    return [
+        p for p in _usb_raw_partitions()
+        if (p.get("partuuid") or "").lower() not in adopted_partuuids
+        and (p.get("uuid") or "").lower() not in adopted_fsuuids
+        and (p.get("partuuid") or "").lower() not in ignored_partuuids
+        and (p.get("uuid") or "").lower() not in ignored_fsuuids
+    ]
+
+
+def _usb_key(p):
+    return (p.get("partuuid") or p.get("uuid") or p.get("path") or "").lower()
+
+
+def _detach_source(state, src, remember_ignored):
+    """Unmount, unshare and forget one source, in place on `state` — the
+    caller holds _lock and does the save. Shared by DELETE /api/sources/<id>
+    and by the disconnected-USB cleanup in usb_sync(), so a source is torn
+    down exactly the same way whether the user asked for it or the device
+    simply vanished.
+
+    `remember_ignored` records the device in `usb_ignored`: right when the
+    user removed it by hand and the stick may well still be plugged in
+    (without it, usb_sync() auto-adopts the thing back within seconds),
+    wrong when the device is already physically gone — there is nothing left
+    to suppress, and the entry would only sit there until it is pruned
+    again."""
+    t = src.get("type")
+    if t == "smb":
+        umount(src["mountpoint"])
+    elif t in ("internal", "usb"):
+        ok, lazy = umount_clean(src.get("mountpoint"))
+        if not ok:
+            print(f"[sources] umount failed for {src.get('mountpoint')}")
+        elif lazy:
+            print(f"[sources] {src.get('mountpoint')} was busy — detached lazily")
+    # Leftover mountpoint directory, for every type — `path` and not just
+    # `mountpoint` because that is how these usually present: a stale Lyrion
+    # mediadir pointing at the mountpoint of a device long unplugged,
+    # re-imported by _sync_from_lyrion() as a `local` source. The call is
+    # inert anywhere else (SMB mounts, a real music folder): it only ever
+    # touches an empty, unmounted directory under the two roots we create
+    # ourselves.
+    _drop_adopted_mountpoint(src.get("mountpoint") or src.get("path"))
+    if t == "usb" and remember_ignored:
+        # Auto-adoption (usb_sync()) would otherwise re-mount this within a
+        # few seconds, since the device is still plugged in and no longer in
+        # `sources`. Remember it as ignored until it's unplugged (pruned
+        # there once it's gone).
+        state.setdefault("usb_ignored", []).append(
+            {"partuuid": src.get("partuuid"), "fsuuid": src.get("fsuuid")})
+    state["sources"] = [s for s in state.get("sources", []) if s.get("id") != src.get("id")]
+
+
+# In-memory backoff for failed auto-adopt attempts: _usb_key(part) -> (last
+# attempt time (monotonic), error message). Stops a stubbornly-broken
+# filesystem from spamming `mount`/the logs on every usb_monitor() tick;
+# cleared once the device is no longer plugged in.
+_usb_fail_backoff = {}
+_USB_RETRY_BACKOFF = 15
+
+# How long a USB device has to stay unseen before usb_sync() acts on its
+# absence, and when each currently-missing identifier was first missed.
+_USB_GONE_GRACE = 30
+_usb_missing_since = {}
+
+
+def _usb_gone_for_good(ids, raw_ids):
+    """True once every identifier in `ids` has been missing from the USB scan
+    for _USB_GONE_GRACE seconds straight. Any scan that sees the device again
+    clears its timer.
+
+    The grace period is the whole point. sources_server is up well before
+    udev has finished enumerating USB, so the first scans after a reboot come
+    back empty for perfectly healthy hardware — acting on that immediately
+    would delete every adopted USB source on every single boot, and throw
+    away the usb_ignored entries whose only job is to stop a hand-removed
+    stick from being auto-adopted seconds later. A device with no identifier
+    at all is never considered gone: there is nothing to match it by, so its
+    absence can't be told apart from a scan that simply reports less."""
+    ids = [i.lower() for i in ids if i]
+    if not ids:
+        return False
+    if any(i in raw_ids for i in ids):
+        for i in ids:
+            _usb_missing_since.pop(i, None)
+        return False
+    now = time.monotonic()
+    return now - min(_usb_missing_since.setdefault(i, now) for i in ids) >= _USB_GONE_GRACE
+
+
+def _drop_disconnected_usb(state, raw_ids):
+    """Forget every adopted USB source whose device is no longer physically
+    there — the stick pulled out without going through "Remove" first.
+
+    Left alone, such a source stays in Music Sources for good: red and
+    unmounted, its Samba share still declared, and its mountpoint still in
+    Lyrion's mediadirs pointing at an empty directory — which is exactly what
+    makes the next library scan prune those tracks, and what
+    _sync_from_lyrion() later re-imports as a bogus `local` source once the
+    directory outlives the source (see _drop_adopted_mountpoint()). Tearing
+    it down the same way an explicit removal does — same _detach_source(),
+    same live mediadir drop, no Lyrion restart — is the only state that
+    matches reality.
+
+    A drive merely unplugged for a while therefore does go away, and comes
+    back on its own once it is plugged in again: auto-adoption is the normal
+    path for every healthy USB device, and it reuses the same share name and
+    mountpoint (see _existing_adopted_source()).
+
+    Caller holds _lock. Returns True if anything was dropped."""
+    gone = [
+        s for s in state.get("sources", [])
+        if s.get("type") == "usb"
+        and _usb_gone_for_good((s.get("partuuid"), s.get("fsuuid")), raw_ids)
+    ]
+    if not gone:
+        return False
+    for src in gone:
+        _detach_source(state, src, remember_ignored=False)
+        print(f"[sources] USB source dropped, device disconnected: "
+              f"{src.get('name')} ({src.get('mountpoint')})")
+    save_state(state)
+    regen_samba_shares()
+    # Lyrion last and still inside the lock, exactly as api_remove() does: a
+    # GET /api/sources landing between the save and this call would see a
+    # mediadir belonging to no source and re-import it as a `local` one.
+    roots = [r for src in gone for r in _source_lyrion_roots(src)]
+    if roots:
+        try:
+            _lyrion_remove_mediadir_live(roots)
+        except Exception as e:
+            print(f"[sources] could not drop {roots} from Lyrion mediadirs: {e}")
+    return True
+
+
+def _remount_reconnected_usb(raw_ids):
+    """Re-mount an already-adopted USB source whose device has just
+    reappeared (unplugged, then plugged back in). usb_sync()'s adoption loop
+    below never touches it: _usb_partitions() explicitly excludes anything
+    already in the adopted set, so without this a reconnected drive stayed
+    "not mounted" — requiring the user to open Settings and press "Apply &
+    rescan library" (which doesn't even mount anything itself, it only checks
+    and refuses if a disk isn't mounted) — until the whole box was next
+    rebooted (remount_all_retry only ever runs once, at startup). Mirrors
+    _adopt_usb_partition()'s post-mount step (live mediadir add, no Lyrion
+    restart) but skips the state/Samba-share writes, which are already in
+    place for a source that's merely reconnecting, not being adopted fresh."""
+    for src in load_state().get("sources", []):
+        if src.get("type") != "usb":
+            continue
+        ids = [i.lower() for i in (src.get("partuuid"), src.get("fsuuid")) if i]
+        mountpoint = src.get("mountpoint")
+        # Only a hint: mount_usb_adopted() checks again under the
+        # mountpoint's lock, since remount_all() may be mounting it right now.
+        if not any(i in raw_ids for i in ids) or not mountpoint or _mount_depth(mountpoint):
+            continue
+        ok, msg = mount_usb_adopted(src)
+        if not ok:
+            print(f"[sources] reconnected USB remount failed for {src.get('name')}: {msg}")
+            continue
+        print(f"[sources] reconnected USB source remounted: {src.get('name')}")
+        try:
+            _lyrion_add_mediadir_live(mountpoint)
+        except Exception as e:
+            print(f"[sources] live mediadir add/rescan failed for {mountpoint}: {e}")
+
+
+def usb_sync():
+    """Auto-adopt every USB partition with a recognized filesystem as soon as
+    it's seen (mount read-write + Samba share — see _adopt_usb_partition()),
+    no user action needed. Partitions with no filesystem, or whose last
+    auto-adopt attempt failed, are left for /api/usb to surface as "needs
+    attention" instead. Also drops sources whose device has been physically
+    disconnected, and prunes usb_ignored entries for devices no longer
+    present. Publishes the needs-attention list to _usb_state for /api/usb to
+    read cheaply."""
+    global _usb_state
+    with _lock:
+        raw = _usb_scan()
+        # Everything below that reacts to a device being *absent* runs only
+        # on a scan that actually worked — see _usb_scan()'s None contract.
+        scan_ok = raw is not None
+        raw = raw or []
+        raw_keys = {_usb_key(p) for p in raw}
+        # Both identifiers of every device present, not just the one
+        # _usb_key() picks: a source stores partuuid *and* fsuuid, and it is
+        # still plugged in if either of them turns up.
+        raw_ids = {v.lower() for p in raw
+                   for v in (p.get("partuuid"), p.get("uuid")) if v}
+
+        if scan_ok:
+            state = load_state()
+            _drop_disconnected_usb(state, raw_ids)
+            ignored = state.get("usb_ignored", [])
+            still_present = [
+                e for e in ignored
+                if not _usb_gone_for_good((e.get("partuuid"), e.get("fsuuid")), raw_ids)
+            ]
+            if len(still_present) != len(ignored):
+                state["usb_ignored"] = still_present
+                save_state(state)
+
+            for key in list(_usb_fail_backoff):
+                if key not in raw_keys:
+                    _usb_fail_backoff.pop(key, None)
+
+    # _adopt_usb_partition() takes _lock itself (a plain, non-reentrant
+    # threading.Lock()) to save state, so it must run outside the block
+    # above — calling it while already holding _lock here previously
+    # self-deadlocked the whole thread on the very first successful mount:
+    # mount_usb_adopted() succeeded (so the drive showed up mounted), but
+    # the thread then hung forever trying to re-acquire _lock to persist
+    # that source, silently — no exception, no log — and every other part of
+    # the service that needs _lock (adding/removing sources, etc.) froze
+    # right along with it until the process was restarted.
+    _remount_reconnected_usb(raw_ids)
+
+    needs_attention = []
+    for p in _usb_partitions():
+        if not p.get("fstype"):
+            needs_attention.append({**p, "needs_format": True})
+            continue
+        key = _usb_key(p)
+        last_ts, last_msg = _usb_fail_backoff.get(key, (None, None))
+        if last_ts is not None and time.monotonic() - last_ts < _USB_RETRY_BACKOFF:
+            needs_attention.append({**p, "error": last_msg})
+            continue
+        ok, msg, _src = _adopt_usb_partition(p)
+        if not ok:
+            if key not in _usb_fail_backoff:
+                print(f"[sources] auto-adopt failed for {p.get('path')}: {msg}")
+            _usb_fail_backoff[key] = (time.monotonic(), msg)
+            needs_attention.append({**p, "error": msg})
+
+    _usb_state = needs_attention
+    return needs_attention
+
+
+def _migrate_stale_usb_sources():
+    """One-time startup cleanup: drop "local" sources whose path lives under
+    the removed ephemeral read-only USB browse mount (_LEGACY_USB_MOUNT_ROOT).
+    That mountpoint is never recreated anymore, so these are permanently dead
+    — left in place they'd keep getting handed to Lyrion as nonexistent
+    mediadirs on every apply. No-op once a device has been upgraded once."""
+    with _lock:
+        state = load_state()
+        prefix = _LEGACY_USB_MOUNT_ROOT + os.sep
+        stale = [
+            s for s in state.get("sources", [])
+            if s.get("type") == "local"
+            and (s.get("path") or "").startswith(prefix)
+        ]
+        if not stale:
+            return
+        stale_ids = {s.get("id") for s in stale}
+        state["sources"] = [s for s in state["sources"] if s.get("id") not in stale_ids]
+        save_state(state)
+    for s in stale:
+        print(f"[sources] dropped stale local source under {_LEGACY_USB_MOUNT_ROOT}: {s.get('path')}")
+
+
+def usb_monitor(interval=4):
+    while True:
+        try:
+            usb_sync()
+        except Exception as e:
+            print(f"[sources] usb monitor error: {e}")
+        time.sleep(interval)
+
+
+# ─────────────────────────── Lyrion mediadirs ───────────────────────
+def _prefs_dir_from_service():
+    """Read the real PREFSDIR from the lyrionmusicserver systemd unit."""
+    try:
+        r = _run(["systemctl", "show", LYRION_SERVICE, "-p", "Environment"])
+        m = re.search(r"PREFSDIR=(\S+)", r.stdout)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return None
+
+def _find_prefs():
+    candidates = []
+    pd = _prefs_dir_from_service()
+    if pd:
+        candidates.append(os.path.join(pd, "server.prefs"))
+    candidates += [
+        "/var/lib/squeezeboxserver/prefs/server.prefs",
+        "/var/lib/lyrionmusicserver/prefs/server.prefs",
+    ]
+    for pat in PREFS_GLOBS:
+        candidates += glob.glob(pat)
+    for c in candidates:
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+def _ensure_prefs():
+    """Find server.prefs; if missing (fresh install), start Lyrion and wait
+    for it to create the file on first run."""
+    prefs = _find_prefs()
+    if prefs:
+        return prefs
+    _systemctl_lyrion("start", timeout=30)
+    for _ in range(20):  # up to ~40s
+        time.sleep(2)
+        prefs = _find_prefs()
+        if prefs:
+            return prefs
+    return None
+
+
+def _lyrion_present():
+    """Whether a LOCAL Lyrion exists on this device at all.
+
+    Deliberately NOT `bool(_find_prefs())`. server.prefs only appears the first
+    time Lyrion actually RUNS, so on a device where the setup wizard has just
+    installed the package — which is exactly the moment the wizard then asks
+    about the web-player skin — prefs are still missing and the prefs-based
+    check reported "Lyrion is not installed on this device" about a Lyrion that
+    was installed and simply had not started yet.
+
+    Ask dpkg (then the unit) instead, and leave the waiting to _ensure_prefs().
+    A device in external/"follow" mode still answers False here, which is the
+    case the message was written for."""
+    if _find_prefs():
+        return True
+    try:
+        r = _run(["dpkg-query", "-W", "-f=${db:Status-Status}", "lyrionmusicserver"])
+        if r.returncode == 0 and (r.stdout or "").strip() == "installed":
+            return True
+    except Exception:
+        pass
+    try:
+        r = _run(["systemctl", "list-unit-files", LYRION_SERVICE])
+        return r.returncode == 0 and LYRION_SERVICE in (r.stdout or "")
+    except Exception:
+        return False
+
+
+def _squeezebox_ids():
+    """(uid, gid) of the squeezeboxserver user, or (None, None)."""
+    try:
+        import pwd
+        ent = pwd.getpwnam("squeezeboxserver")
+        return ent.pw_uid, ent.pw_gid
+    except Exception:
+        return None, None
+
+
+# Playlist files: what the separator normaliser and the permission repair
+# below recognise. Lyrion reads all of these out of the playlist folder.
+PLAYLIST_EXTS = (".m3u", ".m3u8", ".pls", ".xspf")
+
+
+def _fix_playlist_perms(root, limit=5000):
+    """Hand what is already inside the playlist folder to the shared group.
+
+    Without this, only files created *after* the folder was fixed up are
+    shared-group ones: playlists Lyrion had already saved (or an earlier owner
+    left) stay unreadable/undeletable from a PC. Deliberately narrow — it only
+    touches directories (to carry the group and setgid down the tree) and files
+    that are actually playlists, never the user's music — and bounded, so
+    pointing the playlist folder at a whole library cannot turn this into a
+    minutes-long walk."""
+    uid, gid = _ensure_samba_uid_gid()
+    seen = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in dirnames + filenames:
+            seen += 1
+            if seen > limit:
+                return
+            path = os.path.join(dirpath, name)
+            try:
+                st = os.lstat(path)
+                if stat.S_ISDIR(st.st_mode):
+                    want = (st.st_mode & 0o7777) | 0o2775
+                elif name.lower().endswith(PLAYLIST_EXTS):
+                    want = (st.st_mode & 0o7777) | 0o0664
+                else:
+                    continue
+                if st.st_gid != gid:
+                    os.chown(path, st.st_uid, gid)
+                if (st.st_mode & 0o7777) != want:
+                    os.chmod(path, want)
+            except OSError:
+                pass    # FAT/exFAT/NTFS carry no POSIX ownership; a race is fine
+
+
+def _make_playlist_folder(target):
+    """Create `target` if needed and make it writable by BOTH Lyrion and the
+    network shares, so "save queue as playlist" works AND the same folder can
+    be published over SMB to drop playlists into — and delete them again.
+
+    🚨 Owned by the share user with SHARE_GROUP and the setgid bit, not by
+    Lyrion alone. Handing it to Lyrion is what used to make the folder
+    unshareable, and sharing it first is what used to stop Lyrion saving into
+    it; the two chowns fought and whoever ran last won. setgid means everything
+    created inside — by Lyrion or over the network — stays in the group both
+    accounts belong to.
+
+    Shared by the automatic provisioning below and the user-picked folder
+    (/api/playlistdir)."""
+    uid, gid = _ensure_samba_uid_gid()
+    try:
+        os.makedirs(target, exist_ok=True)
+    except OSError as e:
+        print(f"[sources] playlistdir mkdir failed: {e}")
+        return False
+    try:
+        os.chown(target, uid, gid)
+        os.chmod(target, 0o2775)
+        _fix_playlist_perms(target)
+    except OSError as e:
+        # FAT/exFAT/NTFS have no POSIX ownership to set — the uid/gid/fmask
+        # mount options already grant both accounts access there. Not a
+        # failure: refusing the folder over this is what used to stop a
+        # playlist folder on a Windows-formatted disk from working at all.
+        print(f"[sources] playlistdir {target}: ownership not settable ({e})")
+    return os.path.isdir(target)
+
+
+def _provision_playlistdir(data):
+    """Given the loaded prefs dict, make sure `playlistdir` points at an
+    existing, writable folder (creating it, and handing it to Lyrion and the
+    shares). Returns the (possibly updated) dict and a bool telling whether the
+    *pref* changed — the folder itself is re-asserted either way."""
+    cur = (data.get("playlistdir") or "").strip()
+    if cur and os.path.isdir(cur):
+        # Re-assert ownership/permissions on every pass: idempotent and cheap,
+        # and it is the only thing that reaches a device set up before the
+        # shared group existed (its folder is writable, so the check below
+        # would otherwise return "nothing to do" forever). It is also what
+        # repairs the folder after an A/B conversion, whose first boot chowns
+        # all of /var/lib/squeezeboxserver back to squeezeboxserver:nogroup
+        # (hifi-ab-firstboot.sh) before this service ever starts.
+        _make_playlist_folder(cur)
+        if os.access(cur, os.W_OK):
+            return data, False
+    target = cur or DEFAULT_PLAYLISTDIR
+    if not _make_playlist_folder(target):
+        return data, False
+    data["playlistdir"] = target
+    return data, True
+
+
+def ensure_playlistdir():
+    """Standalone provisioning used at service start (covers devices that were
+    set up before this feature and never re-apply their sources). Idempotent:
+    only stops/edits/starts Lyrion when the folder is missing/unset.
+    Returns True when it did restart Lyrion."""
+    try:
+        import yaml
+    except Exception:
+        return False
+    prefs = _find_prefs()
+    if not prefs:
+        return False
+    try:
+        with open(prefs) as f:
+            data = yaml.safe_load(f) or {}
+    except Exception:
+        return False
+    data, changed = _provision_playlistdir(data)
+    if not changed:
+        return False
+    _run(["systemctl", "stop", LYRION_SERVICE], timeout=60)
+    try:
+        # 🚨 Read the file AGAIN, now that Lyrion is stopped: it writes its
+        # prefs out on the way down, and the copy read above can be older than
+        # what it had in memory. In the setup wizard the skin step sets
+        # skin=material live seconds before this runs (1edc819 moved it
+        # first), and writing the stale copy back put the default skin back:
+        # "the wizard no longer turns on Material". Only playlistdir changes.
+        with open(prefs) as f:
+            data = yaml.safe_load(f) or {}
+        data, _ = _provision_playlistdir(data)
+        tmp = prefs + ".tmp"
+        with open(tmp, "w") as f:
+            yaml.safe_dump(data, f, default_flow_style=False, allow_unicode=True)
+        os.replace(tmp, prefs)
+        uid, gid = _squeezebox_ids()
+        if uid is not None:
+            try:
+                os.chown(prefs, uid, gid)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[sources] playlistdir prefs write failed: {e}")
+    finally:
+        _systemctl_lyrion("start")
+    print(f"[sources] playlistdir set to {data.get('playlistdir')}")
+    return True
+
+
+def _lyrion_wait_up(attempts=30, delay=2):
+    """True once Lyrion answers JSON-RPC after a start, i.e. it has loaded its
+    prefs. Stopping it before that is not harmless: it rewrites server.prefs
+    from memory on the way out."""
+    for _ in range(attempts):
+        try:
+            _lyrion_request(["version", "?"], timeout=5)
+            return True
+        except Exception:
+            time.sleep(delay)
+    return False
+
+
+# ── Playlist separators: Windows "\\" in a playlist copied onto the box ─────
+#
+# Reported by an owner who builds playlists in MusicBee on Windows and copies
+# them across (as they did on Daphile and DietPi before): after the find and
+# replace that fixes the NAS prefix, what is left is a working but ugly mix of
+# "/" and "\\" in the same file, and the ones with a backslash simply do not
+# play. Rewriting them by hand in a text editor is exactly the chore the
+# appliance should be doing itself, so it does: inside the playlist folder —
+# and only there — a Windows separator is turned into a Unix one.
+#
+# Deliberately nothing more than that. Translating a NAS or drive-letter prefix
+# to wherever that music actually lives on this box is a guess, and a wrong
+# guess is worse than the entry the owner can see is wrong.
+NORMALIZE_EXTS = (".m3u", ".m3u8", ".pls")
+# Enough for a very long playlist, small enough that something that is not one
+# (a stray file with a playlist extension) is never slurped into memory.
+NORMALIZE_MAX_BYTES = 8 * 1024 * 1024
+# A file still being written over SMB must not be rewritten mid-copy.
+NORMALIZE_SETTLE_S = 15
+NORMALIZE_INTERVAL_S = 60
+# The playlist folder is meant to hold playlists, but nothing stops an owner
+# from pointing it at the top of a music library — on a NAS, even. Walking all
+# of that once a minute kept the NAS from ever going to sleep, so a pass is
+# bounded: this many levels below the folder, this many folders and playlist
+# files at most, never into another filesystem mounted inside it, and a
+# folder whose mtime has not moved is not listed again (its playlists are
+# still stat-ed, for one rewritten in place).
+NORMALIZE_MAX_DEPTH = 4
+NORMALIZE_MAX_DIRS = 500
+NORMALIZE_MAX_FILES = 2000
+# A playlist folder that is itself on a network share is looked at this
+# often instead: even a stat() reaches the server.
+NORMALIZE_NET_INTERVAL_S = 15 * 60
+_URL_LINE_RE = re.compile(rb"^[A-Za-z][A-Za-z0-9+.\-]*://")
+_PLS_ENTRY_RE = re.compile(rb"^\s*[Ff]ile\d+\s*=")
+# A 0x5C right after a byte >= 0x80: in Shift-JIS, Big5 and GBK that is the
+# second half of a two-byte character, not a backslash.
+_MBCS_TRAIL_5C_RE = re.compile(rb"[\x80-\xff]\\")
+# path -> (mtime_ns, size) of the last content this loop looked at, so an
+# unchanged folder costs one stat() per file per pass and nothing else.
+_playlist_seen = {}
+# dirpath -> (mtime_ns, [subfolder names], [playlist names], settled) from
+# the last pass: a folder whose mtime is the same is not listed again.
+_playlist_dirs = {}
+_playlist_last_net_pass = 0.0
+
+
+def _playlist_separators_safe(raw):
+    """May the 0x5C bytes of this playlist be read as backslashes?
+
+    UTF-8 (and so plain ASCII): yes, 0x5C is never part of a multi-byte
+    sequence there. Anything else is a legacy code page the file does not
+    name. In the single-byte ones (cp1252, latin-1…) 0x5C is still the
+    backslash, but in Shift-JIS, Big5 and GBK it is also the second byte of
+    many characters (表, 能, 許…), and turning it into "/" broke the very
+    title it was part of. Those files are left alone whenever a 0x5C follows
+    a byte >= 0x80 — the only place such a trail byte can be — at the price
+    of not fixing a cp1252 playlist with a separator right after an accented
+    letter. NUL bytes mean UTF-16 or not text at all: left alone too."""
+    if b"\x00" in raw:
+        return False
+    try:
+        raw.decode("utf-8")
+        return True
+    except UnicodeDecodeError:
+        return not _MBCS_TRAIL_5C_RE.search(raw)
+
+
+def _normalize_playlist_bytes(raw, is_pls):
+    """Turn Windows separators into Unix ones on the path lines of a playlist.
+    Returns (new_bytes, changed).
+
+    Byte-level on purpose: a .m3u carries no encoding declaration and is as
+    likely to be cp1252 as UTF-8. 0x5C is the backslash in both, and can never
+    be a continuation byte of a UTF-8 sequence; a file where it may be half of
+    a double-byte character instead is returned untouched (see
+    _playlist_separators_safe()).
+    """
+    if b"\\" not in raw or not _playlist_separators_safe(raw):
+        return raw, False
+    out = []
+    changed = False
+    for line in raw.split(b"\n"):
+        core = line.rstrip(b"\r")
+        tail = line[len(core):]
+        if is_pls:
+            # .pls is an ini file: only the FileN= values are paths.
+            m = _PLS_ENTRY_RE.match(core)
+            if not m:
+                out.append(line)
+                continue
+            start = m.end()
+        else:
+            # .m3u/.m3u8: "#EXTINF:…" and friends are directives, not paths.
+            stripped = core.strip()
+            if not stripped or stripped.startswith(b"#"):
+                out.append(line)
+                continue
+            start = 0
+        head, value = core[:start], core[start:]
+        if b"\\" not in value or _URL_LINE_RE.match(value.strip()):
+            out.append(line)
+            continue
+        out.append(head + value.replace(b"\\", b"/") + tail)
+        changed = True
+    return b"\n".join(out), changed
+
+
+def _normalize_playlist_file(path):
+    """Rewrite one playlist in place if it has Windows separators. Atomic, and
+    the replacement keeps the original's owner and mode — the folder is shared
+    over SMB and a playlist that suddenly belonged to root would be the very
+    "you don't have permission to delete this" the shared group exists to
+    avoid. Returns True if the file was changed."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return False
+    new, changed = _normalize_playlist_bytes(raw, path.lower().endswith(".pls"))
+    if not changed:
+        return False
+    tmp = None
+    try:
+        st = os.stat(path)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".hifi-pl-")
+        with os.fdopen(fd, "wb") as f:
+            f.write(new)
+        try:
+            os.chown(tmp, st.st_uid, st.st_gid)
+            os.chmod(tmp, stat.S_IMODE(st.st_mode))
+        except OSError:
+            pass        # FAT/exFAT/NTFS: ownership comes from the mount
+        os.replace(tmp, path)
+        tmp = None
+    except OSError as e:
+        print(f"[sources] playlist rewrite failed for {path}: {e}")
+        return False
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    print(f"[sources] playlist {path}: Windows path separators converted")
+    return True
+
+
+def _playlist_folders(root):
+    """(dirpath, [playlist names]) for the folders one pass looks at, within
+    the bounds above (NORMALIZE_MAX_*), shallowest first. A folder whose
+    mtime is what it was last pass is not listed again — adding, removing or
+    renaming an entry is what moves it — and folders that are mountpoints
+    (a NAS share or a disk mounted inside the playlist folder) are never
+    entered: they are not the playlist folder, and on a NAS every look
+    inside wakes it up."""
+    try:
+        root = os.path.realpath(root)
+        root_dev = os.stat(root).st_dev
+    except OSError:
+        return []
+    table = _mount_table()
+    # Paths as the mount table spells them, below the root only: checked
+    # by name, so a dead share is never stat-ed just to be skipped.
+    inner_mounts = {mp for mp in (table or {}) if mp.startswith(root.rstrip("/") + "/")}
+    out = []
+    dirs = {}
+    queue = [(root, 0)]
+    i = 0
+    while i < len(queue) and i < NORMALIZE_MAX_DIRS:
+        dirpath, depth = queue[i]
+        i += 1
+        try:
+            st = os.stat(dirpath)
+        except OSError:
+            continue
+        if st.st_dev != root_dev:
+            continue        # a mount the table did not show (table unreadable)
+        cached = _playlist_dirs.get(dirpath)
+        # A listing taken while the mtime was still fresh is not trusted:
+        # FAT keeps it to 2 s, so a file landing in the same tick right after
+        # the listing would leave it unchanged (the "racy clean" case).
+        if cached and cached[0] == st.st_mtime_ns and cached[3]:
+            subdirs, names = cached[1], cached[2]
+        else:
+            subdirs, names = [], []
+            try:
+                with os.scandir(dirpath) as it:
+                    for entry in it:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                subdirs.append(entry.name)
+                            elif entry.name.lower().endswith(NORMALIZE_EXTS):
+                                names.append(entry.name)
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+            subdirs.sort()
+            names.sort()
+        settled = time.time() - st.st_mtime > NORMALIZE_SETTLE_S
+        dirs[dirpath] = (st.st_mtime_ns, subdirs, names, settled)
+        out.append((dirpath, names))
+        if depth < NORMALIZE_MAX_DEPTH:
+            for d in subdirs:
+                sub = os.path.join(dirpath, d)
+                if sub not in inner_mounts:
+                    queue.append((sub, depth + 1))
+    # Rebuilt, like _playlist_seen: folders that went away drop out.
+    _playlist_dirs.clear()
+    _playlist_dirs.update(dirs)
+    return out
+
+
+def _normalize_playlists(root):
+    """One pass over the playlist folder."""
+    now = time.time()
+    seen = {}
+    budget = NORMALIZE_MAX_FILES
+    for dirpath, filenames in _playlist_folders(root):
+        for name in filenames:
+            if budget <= 0:
+                break
+            budget -= 1
+            path = os.path.join(dirpath, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode) or st.st_size > NORMALIZE_MAX_BYTES:
+                continue
+            if now - st.st_mtime < NORMALIZE_SETTLE_S:
+                continue            # still landing, look again next pass
+            key = (st.st_mtime_ns, st.st_size)
+            if _playlist_seen.get(path) == key:
+                seen[path] = key
+                continue
+            if _normalize_playlist_file(path):
+                try:
+                    st = os.stat(path)
+                    key = (st.st_mtime_ns, st.st_size)
+                except OSError:
+                    continue
+            seen[path] = key
+    # Rebuilt rather than updated, so playlists the owner deletes don't keep
+    # an entry here for the life of the process.
+    _playlist_seen.clear()
+    _playlist_seen.update(seen)
+
+
+def _playlist_pass_due(root, now):
+    """False while a playlist folder on a network share was looked at less
+    than NORMALIZE_NET_INTERVAL_S ago. Judged from the mount table, before
+    anything stats the folder: a share whose server is off answers a stat()
+    only minutes later."""
+    global _playlist_last_net_pass
+    if not _on_network_fs(root):
+        return True
+    if now - _playlist_last_net_pass < NORMALIZE_NET_INTERVAL_S:
+        return False
+    _playlist_last_net_pass = now
+    return True
+
+
+def playlist_normalizer_loop():
+    while True:
+        try:
+            root = (_get_lms_pref("playlistdir") or "").strip()
+            if root and _playlist_pass_due(root, time.time()) and os.path.isdir(root):
+                _normalize_playlists(root)
+        except Exception as e:
+            print(f"[sources] playlist normaliser: {e}")
+        time.sleep(NORMALIZE_INTERVAL_S)
+
+
+# Tailscale's CGNAT range (100.64.0.0/10) isn't RFC1918, so appending it to
+# Lyrion's allowedHosts allow-list still left some Settings/config pages
+# unreachable for Tailscale-only clients (e.g. Lyrplay) -- LMS applies host
+# filtering in more than one place, not just that one pref. Since nothing on
+# the Osmium side restricts :9000 anyway (no firewall/reverse-proxy, see
+# webui_server.py), Lyrion's own IP filter buys this appliance no security,
+# so just turn it off outright instead of chasing every allow-list.
+#
+# `protectSettings` is the second of those places, and the one that produced
+# "403 Forbidden: settings/server/basic.html" when opening Server settings over
+# Tailscale. It is on by default (Slim/Utils/Prefs.pm) and is NOT exposed in
+# Lyrion's own Security settings page, so the operator cannot turn it off from
+# the UI. When it is on, Lyrion refuses every /settings/ page
+# (Slim/Web/HTTP.pm) *and* every pref/serverpref/stopserver/restartserver
+# JSON-RPC call (Slim/Web/JSONRPC.pm) whose client is "on a different network".
+# That test is ip_on_different_network(), i.e. "the server is RFC1918 but the
+# client isn't" -- which is exactly a Tailscale peer at 100.64.0.0/10. Same
+# reasoning as filterHosts: the tailnet is already an authenticated private
+# overlay and :9000 is unrestricted on the LAN anyway, so the check costs the
+# appliance its remote Settings pages and buys it nothing.
+LMS_OPEN_ACCESS_PREFS = {
+    # pref name      → (value we want, default when the key is absent)
+    "filterHosts": (0, 0),
+    "protectSettings": (0, 1),
+}
+
+
+def _disable_ip_filtering(data):
+    """Given the loaded prefs dict, turn OFF Lyrion's IP-based access controls
+    (filterHosts, protectSettings) if they are on. Returns the (possibly
+    updated) dict and a bool telling whether anything changed."""
+    changed = False
+    for key, (wanted, default) in LMS_OPEN_ACCESS_PREFS.items():
+        current = data.get(key, default)
+        if current == wanted:
+            continue
+        data[key] = wanted
+        changed = True
+    return data, changed
+
+
+def ensure_lms_trusted_networks():
+    """Standalone provisioning used at service start, same pattern as
+    ensure_playlistdir(): idempotent, only stops/edits/starts Lyrion when
+    something actually needs to change."""
+    try:
+        import yaml
+    except Exception:
+        return
+
+    prefs = _find_prefs()
+    if not prefs:
+        return
+
+    def _load():
+        try:
+            with open(prefs) as f:
+                return yaml.safe_load(f) or {}
+        except Exception:
+            return None
+
+    data = _load()
+    if data is None:
+        return
+    _, changed = _disable_ip_filtering(data)
+    if not changed:
+        return
+
+    _run(["systemctl", "stop", LYRION_SERVICE], timeout=60)
+    try:
+        # Re-read now that Lyrion is down: it keeps prefs in memory and flushes
+        # them on shutdown, so writing back the copy we loaded while it was
+        # still running would silently revert whatever it had just flushed.
+        data = _load()
+        if data is None:
+            return
+        data, changed = _disable_ip_filtering(data)
+        if not changed:
+            return
+        tmp = prefs + ".tmp"
+        with open(tmp, "w") as f:
+            yaml.safe_dump(data, f, default_flow_style=False, allow_unicode=True)
+        os.replace(tmp, prefs)
+        uid, gid = _squeezebox_ids()
+        if uid is not None:
+            try:
+                os.chown(prefs, uid, gid)
+            except Exception:
+                pass
+        print("[sources] disabled Lyrion's remote-access restrictions "
+              "(filterHosts, protectSettings)")
+    except Exception as e:
+        print(f"[sources] lms trusted-networks prefs write failed: {e}")
+    finally:
+        _systemctl_lyrion("start")
+
+
+# ─────────────────────────── LMS skin (Osmium / Material) ───────────────────
+# The appliance ships an "Osmium" look for Lyrion's web UI, built as a custom
+# theme + global css on top of the third-party Material Skin plugin (never a
+# from-scratch LMS skin). The user's choice lives in LMS_SKIN_FILE:
+#   osmium   → Material installed, root skin = material, global Osmium css on
+#   material → Material installed, root skin = material, global css removed
+#   (absent) → "unset": legacy device, nothing about its skin is ever touched,
+#              except that Material itself gets auto-installed (user decision
+#              2026-08-19) so the /material/ web remote the kiosk QR already
+#              points at actually works.
+LMS_SKIN_FILE = "/etc/hifi-player/lms-skin"
+LMS_SKIN_ASSET_DIRS = [
+    "/usr/local/share/hifi-lms-skin",
+    # Dev checkout fallback: the committed source of the same assets.
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "distro",
+                 "config", "includes.chroot", "usr", "local", "share",
+                 "hifi-lms-skin"),
+]
+LMS_SKIN_MARKER = "managed-by: osmium-appliance"
+# Material's documented hook for adding entries to its own menus: a json file
+# in the same prefs dir as the theme/css above. Each entry lands in the section
+# it is listed under ("settings" = the Impostazioni block of the nav drawer),
+# and an entry with an "iframe" url opens that url in Material's built-in
+# dialog — which is how the appliance gets an "Osmium Admin" button into Lyrion
+# without patching a single Material file (so it survives Material updates).
+# The file belongs to the user as much as to us: we own exactly the entries
+# whose id starts with LMS_SKIN_ACTION_ID_PREFIX and merge them into whatever
+# else is already in there.
+LMS_SKIN_ACTIONS_FILE = "actions.json"
+LMS_SKIN_ACTION_ID_PREFIX = "osmium-"
+LMS_PLUGIN_REPO_XML = \
+    "https://lms-community.github.io/lms-plugin-repository/extensions.xml"
+# The repository is served from GitHub Pages, which answers 403 to urllib's
+# default "Python-urllib/3.x" User-Agent (verified 2026-08-20 against the live
+# host, from the appliance and from a dev machine: default UA → 403, any other
+# UA → 200). Without this every repo lookup failed and Material only ever
+# installed from the pinned fallback below — silently, since the failure just
+# logged and fell through. Any non-default UA works; this one says who we are.
+LMS_HTTP_UA = "Osmium-Sound/1.0 (+https://osmiumsound.it)"
+# Last-resort pinned Material release, used only when the repo XML is
+# unreachable/unparseable. sha is SHA1 — that is what LMS's own
+# PluginDownloader verifies, and what the repo XML publishes.
+LMS_MATERIAL_FALLBACK = (
+    "https://github.com/CDrummond/lms-material/releases/download/6.4.6/lms-material-6.4.6.zip",
+    "8e7830a148acab4971b9acd0654ae2cee6254521",
+)
+# Pinned last-resort releases, by plugin name. Only Material has one: it is the
+# single plugin this appliance MUST be able to install even with the repo
+# unreachable (the whole web UI hangs off it). Everything else simply fails and
+# stays offered for a later retry.
+LMS_PLUGIN_FALLBACKS = {"MaterialSkin": LMS_MATERIAL_FALLBACK}
+
+# ── LMS first-run setup (the wizard hand-off) ───────────────────────────────
+# Lyrion ships its own setup wizard and redirects every visit to :9000 into it
+# until server.prefs' `wizardDone` is 1 (Slim/Web/Settings/Server/Wizard.pm).
+# That wizard asks four things — language, which plugins to install, the music
+# folder, the playlist folder — and this appliance already answers three of
+# them (Sources owns mediadirs, ensure_playlistdir() owns playlistdir, the skin
+# step owns Material). So the Osmium wizard asks the one remaining question in
+# a step of its own and finalises Lyrion through /api/lms_setup, instead of
+# handing the user over to a second, redundant wizard.
+#
+# The offered list mirrors Lyrion's own recommendations
+# (HTML/EN/settings/wizard.json) minus MaterialSkin (always installed, see the
+# skin section above) and minus Analytics (opt-in telemetry — see below).
+LMS_SETUP_PLUGINS = [           # (id, ticked by default)
+    ("MusicArtistInfo", True),  # Lyrion ticks this one by default too
+    ("Spotty", False),
+    ("TIDAL", False),
+    ("Qobuz", False),
+    ("Deezer", False),
+    ("RadioNowPlaying", False),
+    ("RadioNet", False),
+]
+# Bundled inside Lyrion itself (Slim/Plugin/<name>/), so there is nothing to
+# download: these are switched on by writing 'needs-enable' into their plugin
+# state, which LMS turns into 'enabled' on its next start
+# (Slim/Utils/PluginManager.pm::_needsEnable). Analytics is the usage report to
+# stats.lms-community.org; it ships `defaultState: disabled` and the wizard
+# only ever enables it on an explicit, unticked-by-default opt-in.
+LMS_ANALYTICS_PLUGIN = "Analytics"
+LMS_BUILTIN_PLUGINS = {LMS_ANALYTICS_PLUGIN}
+LMS_WIZARD_DONE_PREF = "wizardDone"
+
+_SKIN_LOCK = threading.Lock()
+_SKIN_STATUS = {"state": "idle"}
+# Serializes the actual install/apply work (user-triggered apply thread vs the
+# startup autoinstall thread) — both stop/start Lyrion, so they must not
+# overlap. _SKIN_LOCK above only guards the status dict.
+_SKIN_JOB_LOCK = threading.Lock()
+# Same split for the LMS first-run setup job: its own status dict + lock, but
+# the SAME _SKIN_JOB_LOCK for the work itself — it stops/starts Lyrion just
+# like the skin job does, and the two must never overlap.
+_LMS_SETUP_LOCK = threading.Lock()
+_LMS_SETUP_STATUS = {"state": "idle"}
+
+
+def _skin_status():
+    with _SKIN_LOCK:
+        return dict(_SKIN_STATUS)
+
+
+def _skin_status_set(state, progress, code, **extra):
+    payload = {"state": state, "progress": progress, "code": code,
+               "message": _m(code)}
+    payload.update(extra)
+    with _SKIN_LOCK:
+        _SKIN_STATUS.clear()
+        _SKIN_STATUS.update(payload)
+
+
+def _skin_job_running():
+    return _skin_status().get("state") in ("installing", "applying")
+
+
+def _lms_skin_choice():
+    try:
+        with open(LMS_SKIN_FILE) as f:
+            v = f.read().strip()
+        return v if v in ("osmium", "material") else None
+    except OSError:
+        return None
+
+
+def _skin_asset_dir():
+    for d in LMS_SKIN_ASSET_DIRS:
+        if os.path.isdir(d):
+            return d
+    return None
+
+
+def _plugin_prefs_dir():
+    """<prefsdir>/plugin — where Lyrion keeps state.prefs/extensions.prefs."""
+    prefs = _find_prefs()
+    return os.path.join(os.path.dirname(prefs), "plugin") if prefs else None
+
+
+def _plugin_state(name):
+    """`name`'s value in Lyrion's plugin/state.prefs ('enabled', 'disabled',
+    'needs-install', …), or None when the file/key isn't there."""
+    d = _plugin_prefs_dir()
+    if not d:
+        return None
+    try:
+        import yaml
+        with open(os.path.join(d, "state.prefs")) as f:
+            data = yaml.safe_load(f) or {}
+    except Exception:
+        return None
+    v = data.get(name)
+    return v if isinstance(v, str) else None
+
+
+def _builtin_plugin_enabled(name):
+    """Built-in plugins never land in InstalledPlugins/ — their state file is
+    the only record of whether they're on. 'needs-enable' counts as on: it is
+    the transition state LMS resolves to 'enabled' on its next start."""
+    return _plugin_state(name) in ("enabled", "needs-enable")
+
+
+def _plugin_installed(name):
+    if name in LMS_BUILTIN_PLUGINS:
+        return _builtin_plugin_enabled(name)
+    cache = _lyrion_cache_dir()
+    if not cache:
+        return False
+    return os.path.isfile(os.path.join(
+        cache, "InstalledPlugins", "Plugins", name, "install.xml"))
+
+
+def _material_installed():
+    return _plugin_installed("MaterialSkin")
+
+
+def _material_skin_dir():
+    """<prefsdir>/material-skin — where Material looks for user themes/css."""
+    prefs = _find_prefs()
+    if not prefs:
+        return None
+    return os.path.join(os.path.dirname(prefs), "material-skin")
+
+
+def _lms_skin_applied(choice):
+    """Whether the stored choice is fully reflected on disk (drives the
+    Settings UIs' retry affordance)."""
+    if not choice or not _material_installed():
+        return False
+    ms = _material_skin_dir()
+    if not ms:
+        return False
+    desktop = os.path.join(ms, "css", "desktop.css")
+    managed = _is_skin_managed_css(desktop)
+    return managed if choice == "osmium" else not managed
+
+
+def _is_skin_managed_css(path):
+    """True when `path` is a css file this appliance wrote (marker header).
+    A user's own hand-made custom css never carries the marker and is never
+    deleted by us."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return LMS_SKIN_MARKER in f.read(512)
+    except OSError:
+        return False
+
+
+def _plugin_repo_entry(name):
+    """`name`'s (zip_url, sha1) from the official LMS plugin repository — the
+    same metadata LMS's own extension manager consumes."""
+    req = urllib.request.Request(LMS_PLUGIN_REPO_XML,
+                                 headers={"User-Agent": LMS_HTTP_UA})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        xml = resp.read(8 * 1024 * 1024).decode("utf-8", "replace")
+    m = re.search(r'<plugin\s+[^>]*\bname="%s"[^>]*>' % re.escape(name), xml)
+    if not m:
+        raise ValueError(f"{name} not found in plugin repository")
+    tag = m.group(0)
+    url = re.search(r'\burl="([^"]+)"', tag)
+    sha = re.search(r'\bsha="([0-9a-fA-F]{40})"', tag)
+    # A sha1 is mandatory; the zip URL itself may be plain http. Several
+    # community plugins host their releases that way (RadioNowPlaying, for
+    # one), and refusing them outright would mean offering a plugin that can
+    # never install. Integrity does not rest on the payload's transport: the
+    # manifest that carries the sha1 comes over HTTPS, and the download is
+    # checked against it (_download_plugin_zip), so a tampered zip is rejected
+    # whatever the wire looked like. This is exactly the model LMS's own
+    # Slim::Utils::PluginDownloader uses for the same repository.
+    if not url or not sha or not re.match(r'https?://', url.group(1)):
+        raise ValueError(f"{name} repo entry malformed")
+    return url.group(1), sha.group(1).lower()
+
+
+def _yaml_pref_edit(path, mutate):
+    """Load one plugin prefs YAML (missing file → {}), run mutate(dict) → bool
+    changed, write back atomically + chown to the Lyrion user. Caller is
+    responsible for Lyrion being stopped (prefs are rewritten from memory on
+    exit — see _stop_lyrion)."""
+    import yaml
+    data = {}
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+    except OSError:
+        pass
+    if not mutate(data):
+        return False
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        yaml.safe_dump(data, f, default_flow_style=False, allow_unicode=True)
+    os.replace(tmp, path)
+    _chown_lyrion([path])
+    return True
+
+
+def _download_plugin_zip(name, cache):
+    """sha1-verified download of `name`'s zip into <cache>/DownloadedPlugins/,
+    where LMS's own PluginManager picks it up on its next start. Returns the
+    zip path; raises on any lookup/download/verification failure."""
+    try:
+        url, sha = _plugin_repo_entry(name)
+    except Exception as e:
+        fallback = LMS_PLUGIN_FALLBACKS.get(name)
+        if not fallback:
+            raise
+        print(f"[sources] lms-plugins: {name} repo lookup failed ({e}), "
+              "using pinned fallback")
+        url, sha = fallback
+    dl_dir = os.path.join(cache, "DownloadedPlugins")
+    os.makedirs(dl_dir, exist_ok=True)
+    zip_path = os.path.join(dl_dir, f"{name}.zip")
+    tmp = zip_path + ".tmp"
+    req = urllib.request.Request(url, headers={"User-Agent": LMS_HTTP_UA})
+    h = hashlib.sha1()
+    with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as out:
+        while True:
+            chunk = resp.read(65536)
+            if not chunk:
+                break
+            h.update(chunk)
+            out.write(chunk)
+            if out.tell() > 64 * 1024 * 1024:
+                raise ValueError(f"{name} download too large")
+    if h.hexdigest().lower() != sha:
+        os.remove(tmp)
+        raise ValueError(f"{name} download sha1 mismatch")
+    os.replace(tmp, zip_path)
+    _chown_lyrion([zip_path])
+    return zip_path
+
+
+def _ensure_plugins_installed(names, builtin_states=None):
+    """Install `names` and set the on/off state of the built-in plugins in
+    `builtin_states` ({name: bool}) — all inside ONE Lyrion stop/start, because
+    prefs written under a running server are overwritten from memory when it
+    exits (see _stop_lyrion).
+
+    Deterministic install path via LMS's own needs-install mechanism
+    (validated live on the test device, 2026-08-19):
+
+      1. sha1-verified zip → <cache>/DownloadedPlugins/<name>.zip
+      2. plugin/state.prefs:      <name>: needs-install
+         plugin/extensions.prefs: plugin: {<name>: 1}  (so the extension
+         manager keeps managing/updating it afterwards)
+      3. restart Lyrion → its PluginManager extracts and enables the plugin
+
+    Merely seeding extensions.prefs does NOT work: at startup LMS prunes
+    selected-but-missing plugins from that list instead of re-downloading them
+    (Slim::Utils::ExtensionsManager "failed to download... let's not re-try").
+
+    Built-in plugins (LMS_BUILTIN_PLUGINS) skip all of that: they ship inside
+    Lyrion, so they only need a state of 'needs-enable' (→ 'enabled' on the
+    next start) or 'disabled'.
+
+    Returns (installed, failed). A download that fails costs only its own
+    plugin — the rest still go in — so an offline device gets what it can and
+    the user can retry the others later from Lyrion. Raises nothing."""
+    builtin_states = dict(builtin_states or {})
+    prefs = _ensure_prefs()
+    cache = _lyrion_cache_dir()
+    if not prefs or not cache:
+        print("[sources] lms-plugins: no local Lyrion — nothing to install")
+        return [], list(names) + list(builtin_states)
+
+    installed, failed, to_seed = [], [], []
+    for name in names:
+        if name in LMS_BUILTIN_PLUGINS:
+            # Callers pass built-ins through `builtin_states`; ignore them here
+            # rather than trying to download something that has no zip.
+            continue
+        if _plugin_installed(name):
+            installed.append(name)
+            continue
+        try:
+            _download_plugin_zip(name, cache)
+            to_seed.append(name)
+        except Exception as e:
+            print(f"[sources] lms-plugins: {name} download failed: {e}")
+            failed.append(name)
+
+    # Only touch prefs whose state actually has to change: an unnecessary
+    # stop/start would interrupt playback for nothing.
+    builtin_todo = {n: bool(on) for n, on in builtin_states.items()
+                    if _plugin_state(n) != ("enabled" if on else "disabled")}
+    if not to_seed and not builtin_todo:
+        return installed, failed
+
+    plugin_prefs_dir = os.path.join(os.path.dirname(prefs), "plugin")
+    os.makedirs(plugin_prefs_dir, exist_ok=True)
+    _stop_lyrion()
+    try:
+        now = int(time.time())
+
+        def set_state(data):
+            for name in to_seed:
+                data[name] = "needs-install"
+                data["_ts_" + name] = now
+            for name, on in builtin_todo.items():
+                data[name] = "needs-enable" if on else "disabled"
+                data["_ts_" + name] = now
+            return True
+
+        def set_selected(data):
+            plugins = data.get("plugin")
+            if not isinstance(plugins, dict):
+                plugins = {}
+            for name in to_seed:
+                plugins[name] = 1
+            data["plugin"] = plugins
+            data["_ts_plugin"] = now
+            return True
+
+        _yaml_pref_edit(os.path.join(plugin_prefs_dir, "state.prefs"),
+                        set_state)
+        if to_seed:
+            _yaml_pref_edit(os.path.join(plugin_prefs_dir, "extensions.prefs"),
+                            set_selected)
+    except Exception as e:
+        print(f"[sources] lms-plugins: seeding plugin prefs failed: {e}")
+        failed += [n for n in to_seed if n not in failed]
+        to_seed = []
+    finally:
+        _start_lyrion()
+
+    for _ in range(60):  # up to ~120s
+        if all(_plugin_installed(n) for n in to_seed):
+            break
+        time.sleep(2)
+    for name in to_seed:
+        (installed if _plugin_installed(name) else failed).append(name)
+    if failed:
+        print(f"[sources] lms-plugins: not installed: {', '.join(failed)}")
+    return installed, failed
+
+
+def _ensure_material_installed():
+    """Material Skin specifically: install it if missing, then wait until it
+    actually serves /material/ — the plugin appearing on disk is a moment
+    earlier than its web endpoint being up, and the skin is only usable once
+    the latter is true. Returns True when Material is installed and serving.
+    Raises nothing — errors are printed and reported as False."""
+    if _material_installed():
+        return True
+    try:
+        installed, _ = _ensure_plugins_installed(["MaterialSkin"])
+        if "MaterialSkin" not in installed:
+            return False
+        for _ in range(60):  # up to ~120s
+            try:
+                req = urllib.request.Request(
+                    "http://127.0.0.1:9000/material/", method="HEAD")
+                with urllib.request.urlopen(req, timeout=3):
+                    return True
+            except Exception:
+                time.sleep(2)
+        print("[sources] lms-skin: Material did not come up after install")
+        return False
+    except Exception as e:
+        print(f"[sources] lms-skin: Material install failed: {e}")
+        return False
+
+
+def _install_skin_theme_files(choice):
+    """Sync the Osmium theme/css files (and our custom-action entries) under
+    <prefsdir>/material-skin.
+
+    Always installs themes/dark/Osmium.css (a harmless extra entry in
+    Material's own theme picker). The global css/desktop.css + css/mobile.css
+    — the lever that restyles EVERY client — are written only for the
+    'osmium' choice and removed (only if marker-managed) for 'material'.
+    choice=None (unset/legacy device) leaves the global css alone entirely.
+
+    Returns True when the sync actually ran, False when it could not. The
+    caller MUST honour False: this used to return None silently, so a device
+    missing the asset dir still reported "Skin applied." while installing
+    nothing at all — which is exactly how the OTA never shipping
+    /usr/local/share (see hifi-system-update.sh) stayed invisible."""
+    src = _skin_asset_dir()
+    ms = _material_skin_dir()
+    if not src:
+        print("[sources] lms-skin: asset dir missing "
+              f"(looked in {LMS_SKIN_ASSET_DIRS}) — nothing to install")
+        return False
+    if not ms:
+        print("[sources] lms-skin: no Lyrion prefs dir found — cannot install")
+        return False
+    uid, gid = _squeezebox_ids()
+
+    def put(rel_src, dest):
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copyfile(os.path.join(src, rel_src), dest)
+        try:
+            os.chmod(dest, 0o644)
+            if uid is not None:
+                os.chown(dest, uid, gid)
+        except OSError:
+            pass
+
+    # Material must be able to traverse the tree; _chown_lyrion's 0640 is for
+    # single prefs files, dirs need to stay listable.
+    for d in (ms, os.path.join(ms, "themes"), os.path.join(ms, "themes", "dark"),
+              os.path.join(ms, "css")):
+        try:
+            os.makedirs(d, exist_ok=True)
+            os.chmod(d, 0o755)
+            if uid is not None:
+                os.chown(d, uid, gid)
+        except OSError:
+            pass
+    put(os.path.join("themes", "Osmium.css"),
+        os.path.join(ms, "themes", "dark", "Osmium.css"))
+    if choice == "osmium":
+        put(os.path.join("css", "desktop.css"), os.path.join(ms, "css", "desktop.css"))
+        put(os.path.join("css", "mobile.css"), os.path.join(ms, "css", "mobile.css"))
+    elif choice == "material":
+        for name in ("desktop.css", "mobile.css"):
+            path = os.path.join(ms, "css", name)
+            if _is_skin_managed_css(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+    # Menu entry, not styling: installed for every choice (and for unset
+    # devices, like the theme file above) — it is what puts the appliance's own
+    # web admin one tap away from Lyrion's UI.
+    _install_skin_actions(src, ms, uid, gid)
+    return True
+
+
+def _install_skin_actions(src, ms, uid, gid):
+    """Merge our entries into Material's custom-actions file
+    (<prefsdir>/material-skin/actions.json).
+
+    Additive by design: entries already in the file are kept, ours (id prefixed
+    with LMS_SKIN_ACTION_ID_PREFIX) are replaced, so a user's own custom actions
+    survive every re-sync. Material eval()s this file, which means it is allowed
+    to hold hand-written javascript rather than strict json — anything we cannot
+    parse is left exactly as it is instead of being overwritten.
+
+    Failures here never fail the skin sync: the theme is the contract, this
+    button is a convenience on top of it."""
+    dest = os.path.join(ms, LMS_SKIN_ACTIONS_FILE)
+    try:
+        with open(os.path.join(src, LMS_SKIN_ACTIONS_FILE), encoding="utf-8") as f:
+            ours = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"[sources] lms-skin: no usable {LMS_SKIN_ACTIONS_FILE} asset ({e})")
+        return
+    current = {}
+    if os.path.exists(dest):
+        try:
+            with open(dest, encoding="utf-8") as f:
+                current = json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"[sources] lms-skin: {dest} is not plain json — left alone ({e})")
+            return
+        if not isinstance(current, dict):
+            print(f"[sources] lms-skin: unexpected shape in {dest} — left alone")
+            return
+    merged = {k: v for k, v in current.items()}
+    for section, entries in ours.items():
+        existing = merged.get(section, [])
+        if not isinstance(existing, list):
+            print(f"[sources] lms-skin: section '{section}' in {dest} is not a "
+                  "list — left alone")
+            continue
+        merged[section] = [e for e in existing
+                           if not _is_osmium_action(e)] + entries
+    if merged == current:
+        return
+    try:
+        tmp = dest + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(merged, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp, dest)
+        os.chmod(dest, 0o644)
+        if uid is not None:
+            os.chown(dest, uid, gid)
+        print(f"[sources] lms-skin: custom actions written to {dest}")
+    except OSError as e:
+        print(f"[sources] lms-skin: could not write {dest}: {e}")
+
+
+def _is_osmium_action(entry):
+    return (isinstance(entry, dict)
+            and str(entry.get("id", "")).startswith(LMS_SKIN_ACTION_ID_PREFIX))
+
+
+def _get_lms_pref(key, default=None):
+    """Read one server.prefs pref. Live JSON-RPC first — Lyrion keeps prefs in
+    memory and only flushes them to disk periodically, so a running server is
+    the authoritative source — with the prefs file as the fallback for when it
+    isn't running."""
+    try:
+        v = _lyrion_request(["pref", key, "?"]).get("_p2")
+        if v is not None:
+            return v
+    except Exception:
+        pass
+    prefs = _find_prefs()
+    if not prefs:
+        return default
+    try:
+        import yaml
+        with open(prefs) as f:
+            data = yaml.safe_load(f) or {}
+    except Exception:
+        return default
+    v = data.get(key)
+    return default if v is None else v
+
+
+def _set_lms_pref(key, value):
+    """Write one server.prefs pref. Live JSON-RPC first (no restart, LMS
+    persists it on its own); stop→edit→start fallback when LMS isn't
+    reachable."""
+    try:
+        _lyrion_request(["pref", key, value])
+        return True
+    except Exception:
+        pass
+    prefs = _find_prefs()
+    if not prefs:
+        return False
+    try:
+        import yaml
+        _stop_lyrion()
+        try:
+            with open(prefs) as f:
+                data = yaml.safe_load(f) or {}
+            data[key] = value
+            tmp = prefs + ".tmp"
+            with open(tmp, "w") as f:
+                yaml.safe_dump(data, f, default_flow_style=False,
+                               allow_unicode=True)
+            os.replace(tmp, prefs)
+            _chown_lyrion([prefs])
+        finally:
+            _start_lyrion()
+        return True
+    except Exception as e:
+        print(f"[sources] lms pref write failed ({key}): {e}")
+        return False
+
+
+def _set_root_skin_material():
+    """Make :9000/ serve Material instead of the classic Default skin."""
+    return _set_lms_pref("skin", "material")
+
+
+def _lms_skin_apply(choice):
+    """Worker thread behind POST /api/lms_skin. Every step idempotent."""
+    try:
+        _skin_status_set("installing", 10, "msg.skinInstalling")
+        with _SKIN_JOB_LOCK:
+            # Lyrion may have been installed minutes ago by the setup wizard and
+            # never started, in which case there is no prefs dir yet for Material
+            # or the theme files to land in. Start it and wait here, inside the
+            # lock, so every step below has one.
+            if not _ensure_prefs():
+                _skin_status_set("error", 0, "msg.skinLmsMissing")
+                return
+            if not _ensure_material_installed():
+                _skin_status_set("error", 0, "msg.skinInstallFailed")
+                return
+            _skin_status_set("applying", 70, "msg.skinApplying")
+            if not _install_skin_theme_files(choice):
+                _skin_status_set("error", 0, "msg.skinApplyFailed")
+                return
+            if not _set_root_skin_material():
+                _skin_status_set("error", 0, "msg.skinApplyFailed")
+                return
+        _skin_status_set("done", 100, "msg.skinApplied")
+    except Exception as e:
+        print(f"[sources] lms-skin apply failed: {e}")
+        _skin_status_set("error", 0, "msg.skinApplyFailed")
+
+
+def _lms_skin_autoinstall():
+    """Startup convergence thread (user requirement 2026-08-19: Material gets
+    installed automatically whenever missing). Waits for a local LMS, then
+    ensures Material + the Osmium theme file exist, and re-syncs the global
+    css to the stored choice if there is one. Never touches the root `skin`
+    pref or the global css on 'unset' devices — their look must not change
+    until the user actively picks a skin. Exits once converged; retries with
+    backoff while offline (boot without network)."""
+    delays = [60, 300, 1800, 21600]
+    attempt = 0
+    while True:
+        try:
+            if _find_prefs() and not _skin_job_running() \
+                    and _restore_status().get("state") in ("idle", "done", "error") \
+                    and _SKIN_JOB_LOCK.acquire(blocking=False):
+                try:
+                    # Only treat this as converged when the sync really ran:
+                    # returning here on a False would strand a device that has
+                    # the code but not the asset dir (it would never retry,
+                    # and /api/lms_skin would report applied=false forever).
+                    if _ensure_material_installed() \
+                            and _install_skin_theme_files(_lms_skin_choice()):
+                        print("[sources] lms-skin: converged "
+                              f"(choice={_lms_skin_choice() or 'unset'})")
+                        return
+                finally:
+                    _SKIN_JOB_LOCK.release()
+        except Exception as e:
+            print(f"[sources] lms-skin autoinstall error: {e}")
+        time.sleep(delays[min(attempt, len(delays) - 1)])
+        attempt += 1
+
+
+# Skin routes: control, not just data — so, like the /api/system/* proxy
+# below, they take a pairing token from the LAN (the companion app sends its
+# Bearer token). Loopback callers (kiosk UI, webui_server's forwarders, the
+# first-boot wizard) are exempt, see _require_pair_token().
+@app.route("/api/lms_skin", methods=["GET"])
+def api_lms_skin_get():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    choice = _lms_skin_choice()
+    return jsonify({
+        "success": True,
+        "skin": choice or "unset",
+        "lms_installed": _lyrion_present(),
+        "material_installed": _material_installed(),
+        "applied": _lms_skin_applied(choice),
+        "busy": _skin_job_running(),
+    })
+
+
+@app.route("/api/lms_skin", methods=["POST"])
+def api_lms_skin_set():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    skin = ((request.get_json(silent=True) or {}).get("skin") or "").strip()
+    if skin not in ("osmium", "material"):
+        return _err("msg.skinInvalid", 400)
+    if _skin_job_running():
+        return _err("msg.skinBusy", 409)
+    if not _lyrion_present():
+        # No local LMS at all (external/"follow" mode). A local Lyrion that has
+        # simply never run yet is NOT this case — the worker waits for it.
+        return _err("msg.skinLmsMissing", 409)
+    # Record the intent first: even if the apply fails (offline), the choice
+    # survives and Settings can retry.
+    try:
+        tmp = LMS_SKIN_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(skin + "\n")
+        os.replace(tmp, LMS_SKIN_FILE)
+        os.chmod(LMS_SKIN_FILE, 0o644)
+    except OSError:
+        return _err("msg.saveFailed", 500)
+    # Status is set here, not in the thread, so a poll that lands right after
+    # this response never sees a stale idle/done from a previous run.
+    _skin_status_set("installing", 5, "msg.skinInstalling")
+    threading.Thread(target=_lms_skin_apply, args=(skin,),
+                     daemon=True, name="lms-skin-apply").start()
+    return jsonify({"success": True, "started": True})
+
+
+@app.route("/api/lms_skin_status", methods=["GET"])
+def api_lms_skin_status():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    return jsonify(_skin_status())
+
+
+# ─────────────────── LMS first-run setup (wizard hand-off) ──────────────────
+# See LMS_SETUP_PLUGINS above for why this exists. Shape deliberately mirrors
+# the skin job right above: POST starts a worker thread, a status endpoint is
+# polled for progress, and the actual work takes _SKIN_JOB_LOCK so the two can
+# never stop/start Lyrion at the same time.
+
+def _lms_setup_status():
+    with _LMS_SETUP_LOCK:
+        return dict(_LMS_SETUP_STATUS)
+
+
+def _lms_setup_status_set(state, progress, code, **extra):
+    payload = {"state": state, "progress": progress, "code": code,
+               "message": _m(code)}
+    payload.update(extra)
+    with _LMS_SETUP_LOCK:
+        _LMS_SETUP_STATUS.clear()
+        _LMS_SETUP_STATUS.update(payload)
+
+
+def _lms_setup_job_running():
+    return _lms_setup_status().get("state") in ("installing", "applying")
+
+
+def _lms_wizard_done():
+    return bool(_get_lms_pref(LMS_WIZARD_DONE_PREF))
+
+
+def _lms_setup_apply(plugins, analytics, language):
+    """Worker thread behind POST /api/lms_setup.
+
+    Order matters twice over:
+      * playlistdir FIRST — ensure_playlistdir() stops Lyrion, reads the prefs
+        file it wrote on the way down and writes it back with the folder (it
+        used to read before stopping, and the stale copy undid the skin the
+        wizard had just set). It also used to
+        run right after the plugin install had restarted Lyrion, and stopped
+        the server two seconds into extracting the new plugins (a Perl panic
+        in the log of a fresh install). Before the install, the only start it
+        can cut short is its own, and it waits for that one to finish.
+      * wizardDone LAST — a device that dies halfway through then comes back
+        still showing Lyrion's own wizard (recoverable) instead of a
+        half-configured server with no wizard left to finish the job.
+
+    Every step is idempotent, so re-running this is harmless."""
+    try:
+        _lms_setup_status_set("installing", 10, "msg.lmsSetupInstalling")
+        with _SKIN_JOB_LOCK:
+            # Same first-run wait as the skin worker: everything below reads or
+            # writes server.prefs, which only exists once Lyrion has run.
+            if not _ensure_prefs():
+                _lms_setup_status_set("error", 0, "msg.skinLmsMissing")
+                return
+            try:
+                if ensure_playlistdir():
+                    _lyrion_wait_up()
+            except Exception as e:
+                print(f"[sources] lms-setup: playlistdir failed: {e}")
+            # MaterialSkin is normally already in by now (the skin step runs
+            # first); listing it here costs nothing and covers the case where
+            # that step was skipped or failed.
+            installed, failed = _ensure_plugins_installed(
+                ["MaterialSkin"] + list(plugins),
+                {LMS_ANALYTICS_PLUGIN: bool(analytics)})
+            _lms_setup_status_set("applying", 70, "msg.lmsSetupApplying")
+            _set_lms_pref("language", "IT" if language == "it" else "EN")
+            if not _set_lms_pref(LMS_WIZARD_DONE_PREF, 1):
+                _lms_setup_status_set("error", 0, "msg.lmsSetupFailed")
+                return
+        # Lyrion's own wizard ends with a library scan and nothing else does it
+        # for a first-boot device. Best-effort: a device whose sources are
+        # still empty simply has nothing to scan.
+        try:
+            _lyrion_rescan()
+        except Exception:
+            pass
+        _lms_setup_status_set("done", 100, "msg.lmsSetupDone",
+                              installed=installed, failed=failed)
+    except Exception as e:
+        print(f"[sources] lms-setup failed: {e}")
+        _lms_setup_status_set("error", 0, "msg.lmsSetupFailed")
+
+
+@app.route("/api/lms_setup", methods=["GET"])
+def api_lms_setup_get():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    return jsonify({
+        "success": True,
+        "lms_installed": _lyrion_present(),
+        "wizard_done": _lms_wizard_done(),
+        "analytics": _builtin_plugin_enabled(LMS_ANALYTICS_PLUGIN),
+        "plugins": [{"id": name, "default": default,
+                     "installed": _plugin_installed(name)}
+                    for name, default in LMS_SETUP_PLUGINS],
+        "busy": _lms_setup_job_running(),
+    })
+
+
+@app.route("/api/lms_setup", methods=["POST"])
+def api_lms_setup_set():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    data = request.get_json(silent=True) or {}
+    requested = data.get("plugins")
+    if not isinstance(requested, list):
+        requested = []
+    known = [name for name, _ in LMS_SETUP_PLUGINS]
+    # Allow-list, not free text: whatever survives here becomes a key in
+    # Lyrion's own plugin state file and a download URL looked up by name.
+    if any(n not in known for n in requested):
+        return _err("msg.lmsSetupBadPlugin", 400)
+    plugins = [n for n in known if n in set(requested)]
+    # Telemetry is a separate boolean rather than an id in the list above, so
+    # it can never be switched on by smuggling a plugin name through.
+    analytics = bool(data.get("analytics"))
+    language = "it" if (data.get("language") or _req_lang()) == "it" else "en"
+    if _lms_setup_job_running() or _skin_job_running():
+        return _err("msg.lmsSetupBusy", 409)
+    if not _lyrion_present():
+        # No local LMS at all (external/"follow" mode) — there is no wizard to
+        # skip and nothing to install into. A freshly installed Lyrion that has
+        # not run yet is NOT this case; the worker waits for its first run.
+        return _err("msg.skinLmsMissing", 409)
+    _lms_setup_status_set("installing", 5, "msg.lmsSetupInstalling")
+    threading.Thread(target=_lms_setup_apply,
+                     args=(plugins, analytics, language),
+                     daemon=True, name="lms-setup-apply").start()
+    return jsonify({"success": True, "started": True})
+
+
+@app.route("/api/lms_setup_status", methods=["GET"])
+def api_lms_setup_status():
+    return jsonify(_lms_setup_status())
+
+
+# ─────────────────────────── Playlist folder ────────────────────────────────
+# Where Lyrion saves "save queue as playlist". ensure_playlistdir() picks a
+# sane default on its own; this is the user-facing override, so the last thing
+# Lyrion's own setup wizard used to ask has a home in our Sources page.
+
+@app.route("/api/playlistdir", methods=["GET"])
+def api_playlistdir_get():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    path = (_get_lms_pref("playlistdir") or "").strip()
+    return jsonify({
+        "success": True,
+        "path": path,
+        "default": DEFAULT_PLAYLISTDIR,
+        "is_default": bool(path) and os.path.realpath(path) == os.path.realpath(DEFAULT_PLAYLISTDIR),
+        "exists": bool(path) and os.path.isdir(path),
+        "lms_installed": _lyrion_present(),
+    })
+
+
+@app.route("/api/playlistdir", methods=["POST"])
+def api_playlistdir_set():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    data = request.get_json(silent=True) or {}
+    raw = (data.get("path") or "").strip()
+    if not raw:
+        return _err("msg.pathMissing", 400)
+    # Same confinement a media folder gets, plus the appliance's own default —
+    # that one lives under /var/lib and is therefore outside
+    # ALLOWED_LOCAL_ROOTS on purpose (it is ours, not user-picked), but it must
+    # stay reachable so "restore the default" works. Either way what goes on
+    # is our own constant or the confined path, never the request's string.
+    if os.path.realpath(raw) == os.path.realpath(DEFAULT_PLAYLISTDIR):
+        target = DEFAULT_PLAYLISTDIR
+    else:
+        target = _local_path_allowed(raw)
+        if not target:
+            return _err("msg.pathNotAllowed", 400)
+    if not _make_playlist_folder(target):
+        return _err("msg.playlistdirNotWritable", 400, path=target)
+    if not _set_lms_pref("playlistdir", target):
+        return _err("msg.saveFailed", 500)
+    return jsonify({"success": True, "path": target,
+                    "message": _m("msg.playlistdirSaved")})
+
+
+def current_paths(state):
+    """Media directories to hand to Lyrion. Re-validates every path against the
+    same confinement each source type is supposed to already satisfy (MOUNT_ROOT
+    for SMB mountpoints, INTERNAL_MOUNT_ROOT for internal disks,
+    USB_ADOPTED_ROOT for adopted USB disks, ALLOWED_LOCAL_ROOTS for local
+    paths) rather than trusting the stored state verbatim — state can come
+    from a restored /etc/hifi-sources.json (see /api/restore), which is
+    untrusted archive content that never goes through api_add_smb()/
+    api_add_local()'s own validation. Without this, a crafted backup with
+    e.g. {"type":"local", "path":"/"} would get handed straight to Lyrion as
+    a media directory.
+
+    A source flagged pending_activation (api_add_smb()'s defer_activation:
+    mounted, but the user hasn't yet picked "whole share" vs. a subfolder via
+    api_set_subpath()) is skipped entirely -- this is what keeps it out of
+    Lyrion via *every* path, not just the live push api_add_smb() itself
+    skips: the restart-based apply_to_lyrion() safety net (still used by the
+    first-run wizard) rebuilds mediadirs from this function too, and would
+    otherwise hand over the bare mount root before the user ever chose.
+
+    Nothing here waits on a network share whose server is gone: mountpoints
+    come from the mount table (_resolve_mountpoint()) and a path inside a
+    share is resolved through _bounded_probe(), falling back to the path as
+    written when the server does not answer."""
+    smb_root = os.path.realpath(MOUNT_ROOT)
+    internal_root = os.path.realpath(INTERNAL_MOUNT_ROOT)
+    usb_root = os.path.realpath(USB_ADOPTED_ROOT)
+    table = _mount_table()
+    paths = []
+    for src in state.get("sources", []):
+        if src.get("pending_activation"):
+            continue
+        # A source published purely as a network share (the playlist folder —
+        # see api_add_local) is not a music folder; it must never reach
+        # Lyrion's mediadirs, by this path or any other.
+        if src.get("media") is False:
+            continue
+        t = src.get("type")
+        if t == "smb":
+            mp = src.get("mountpoint")
+            if not mp:
+                continue
+            p = _resolve_mountpoint(mp, table)
+            if p != smb_root and not p.startswith(smb_root + os.sep):
+                continue
+        elif t == "internal":
+            mp = src.get("mountpoint")
+            if not mp:
+                continue
+            p = _resolve_mountpoint(mp, table)
+            if p != internal_root and not p.startswith(internal_root + os.sep):
+                continue
+        elif t == "usb":
+            mp = src.get("mountpoint")
+            if not mp:
+                continue
+            p = _resolve_mountpoint(mp, table)
+            if p != usb_root and not p.startswith(usb_root + os.sep):
+                continue
+        else:
+            raw = src.get("path")
+            p = _local_path_quick(raw, table) if raw else None
+        if p and t in ("smb", "internal", "usb"):
+            sub = (src.get("subpath") or "").strip("/")
+            if sub:
+                mount_root = p
+                joined = os.path.normpath(os.path.join(mount_root, sub))
+                cand = _fs_probe(os.path.realpath, joined, None, table, network=(t == "smb")) or joined
+                # Re-confine to this source's own mountpoint (not just the
+                # shared smb_root/internal_root/usb_root) so a subpath can
+                # never wander into a sibling mount, let alone escape it
+                # entirely. An invalid/escaping subpath just falls back to
+                # the mount root rather than being handed to Lyrion.
+                if cand == mount_root or cand.startswith(mount_root + os.sep):
+                    p = cand
+        if p and p not in paths:
+            paths.append(p)
+    return paths
+
+
+def _lyrion_mediadirs():
+    """Lyrion's live list of music folders, or None when it cannot be asked."""
+    try:
+        current = _lyrion_request(["pref", "mediadirs", "?"]).get("_p2")
+    except Exception:
+        return None
+    if not isinstance(current, list):
+        current = [current] if current else []
+    return current
+
+
+def _sync_from_lyrion(state, current=None):
+    """Pull any change made directly in Lyrion's own source list into our
+    state, so the next Apply doesn't blindly clobber it with a mount root.
+    Without this, a subfolder picked in Lyrion's own setup wizard (rather
+    than through our subpath control) gets silently replaced the next time
+    current_paths()/apply_to_lyrion() rebuilds mediadirs purely from our own
+    state -- the two lists otherwise "fight" over whichever applied last.
+
+    Critical: this must NOT treat "our own state has a pending edit we
+    haven't pushed yet" as "Lyrion changed" -- those look identical if you
+    just compare live Lyrion mediadirs against current state (a subpath
+    picked in Music Sources but not yet Applied would get reverted by this
+    function on the very next poll/GET, before the user ever reaches
+    Apply). So a source whose `subpath_pending` flag is set (api_set_subpath
+    sets it; apply_to_lyrion clears it once actually pushed) is left alone
+    here entirely -- its local value wins until the next Apply, at which
+    point it's what actually gets written and the flag clears.
+
+    For each OTHER managed smb/internal/usb source (not pending), an
+    adopted live mediadir that resolves under that source's mountpoint
+    updates its stored subpath. A mediadir that isn't under any managed
+    mount at all is offered as a new `local` source (confined to
+    ALLOWED_LOCAL_ROOTS, same as api_add_local()) instead of silently
+    vanishing on the next Apply -- but only when it's a real directory
+    inside those safe roots; anything else is left alone exactly as before.
+
+    Best-effort: any failure to reach Lyrion (not installed yet, service
+    down) just leaves state untouched. Returns True if state was modified,
+    so the caller knows whether to save_state().
+
+    `current` is Lyrion's list when the caller already fetched it (outside
+    _lock, see api_list()). The callers hold _lock, so nothing below may wait
+    on a network share: mountpoints come from the mount table, folders inside
+    a share are compared as written, and the rest goes through
+    _bounded_probe() (_resolve_quick(), _local_path_quick(), _fs_probe())."""
+    if current is None:
+        current = _lyrion_mediadirs()
+    if not current:
+        return False
+
+    sources = state.get("sources", [])
+    table = _mount_table()
+    managed = [(s, _resolve_mountpoint(s["mountpoint"], table))
+               for s in sources if s.get("type") in ("smb", "internal", "usb") and s.get("mountpoint")]
+    net_roots = [root for s, root in managed if s.get("type") == "smb"]
+    local_paths = {_resolve_quick(s["path"], table, net_roots)
+                   for s in sources if s.get("type") == "local" and s.get("path")}
+
+    changed = False
+    for raw in current:
+        if not raw:
+            continue
+        p = _resolve_quick(raw, table, net_roots)
+        owner = next(((s, root) for s, root in managed
+                      if p == root or p.startswith(root + os.sep)), None)
+        if owner:
+            src, root = owner
+            if src.get("subpath_pending"):
+                # A local edit is staged for this source and hasn't been
+                # pushed yet -- Lyrion still shows the old value, which is
+                # expected, not an external change. Leave it alone; Apply
+                # will reconcile them.
+                continue
+            sub = "" if p == root else os.path.relpath(p, root)
+            if src.get("subpath", "") != sub:
+                src["subpath"] = sub
+                changed = True
+            continue
+
+        # Not under any mount we manage: offer it as a `local` source rather
+        # than let it disappear on the next Apply, but only inside the same
+        # confinement api_add_local() itself enforces.
+        allowed = _local_path_quick(raw, table)
+        if not allowed or allowed in local_paths \
+                or not _fs_probe(os.path.isdir, allowed, False, table):
+            continue
+        # A folder whose name another source already has gets an id of its
+        # own (_free_source_id()). Skipping it, as before, left a second
+        # "Jazz" scanned by Lyrion but missing from the list, for good.
+        sid = _free_source_id(sources, _slug("local", os.path.basename(allowed.rstrip("/"))), allowed)
+        sources.append({"id": sid, "type": "local", "name": allowed, "path": allowed})
+        local_paths.add(allowed)
+        changed = True
+
+    if changed:
+        state["sources"] = sources
+    return changed
+
+
+def _hlang():
+    """Caller's UI language for hifi_i18n-backed messages (X-UI-Lang header,
+    same convention as api_server.py/webui_server.py) — distinct from
+    _req_lang()/_m() below, which serve the self-contained Sources web page via
+    ?lang=/Accept-Language. Wrapped in try/except because apply_to_lyrion() (the
+    only caller today) also runs from the format-watcher background thread,
+    outside any request context. A background job started by a request (the
+    restore worker) carries that request's language in _job_lang instead."""
+    try:
+        v = request.headers.get('X-UI-Lang')
+    except RuntimeError:
+        return getattr(_job_lang, 'lang', 'en')
+    return v if v in ('en', 'it') else 'en'
+
+
+# Language of the request that started the background job running in this
+# thread (see _run_restore_async): its progress and result messages are
+# written long after that request has returned.
+_job_lang = threading.local()
+
+
+def apply_to_lyrion(state):
+    """Write mediadirs into Lyrion prefs and restart + rescan."""
+    try:
+        import yaml
+    except Exception:
+        return False, _ht('lyrion.yamlMissing', _hlang())
+
+    prefs = _ensure_prefs()
+    if not prefs:
+        return False, _ht('lyrion.prefsNotFound', _hlang())
+
+    # Absorb any change made directly in Lyrion's own source list first, so
+    # this Apply (which may be running unattended, e.g. right after USB
+    # auto-adopt) doesn't clobber it with a bare mount root — see
+    # _sync_from_lyrion()'s docstring.
+    with _lock:
+        if _sync_from_lyrion(state):
+            save_state(state)
+
+    paths = current_paths(state)
+
+    # Warn if an adopted internal/USB source is not mounted: applying would
+    # hand an empty mountpoint to Lyrion and clear the library. The user must
+    # re-attach the disk or remove the source.
+    unmounted_disks = _unmounted_adopted_disks(state)
+    if unmounted_disks:
+        return False, _ht('lyrion.diskNotMounted', _hlang(), disks=", ".join(unmounted_disks))
+
+    # Stop Lyrion so it does not overwrite the prefs file under us.
+    _run(["systemctl", "stop", LYRION_SERVICE], timeout=60)
+    try:
+        with open(prefs) as f:
+            data = yaml.safe_load(f) or {}
+        data["mediadirs"] = paths
+        # keep ignoreInAudioScan in sync (empty list is fine)
+        data.setdefault("ignoreInAudioScan", [])
+        # ensure a writable playlist folder so "save as playlist" works
+        data, _ = _provision_playlistdir(data)
+        tmp = prefs + ".tmp"
+        with open(tmp, "w") as f:
+            yaml.safe_dump(data, f, default_flow_style=False, allow_unicode=True)
+        os.replace(tmp, prefs)
+        # prefs belong to the squeezeboxserver user
+        try:
+            import pwd
+            uid = pwd.getpwnam("squeezeboxserver").pw_uid
+            gid = pwd.getpwnam("squeezeboxserver").pw_gid
+            os.chown(prefs, uid, gid)
+        except Exception:
+            pass
+    finally:
+        _systemctl_lyrion("start")
+
+    # The docstring says "restart + rescan", but starting the service back up
+    # does NOT rescan by itself -- Lyrion has no idea mediadirs changed, since
+    # the prefs file was rewritten directly while it was stopped rather than
+    # through a pref it can react to. Without an explicit kick here, whatever
+    # ends up in the library is just whatever was already in the DB before
+    # this ran, which can be an incomplete scan: a source added moments ago
+    # already got a live rescan (_lyrion_push_live()'s force_rescan) queued
+    # in the background, and the stop above cuts it short mid-walk on a slow
+    # network share. Retries because Lyrion's JSON-RPC isn't reachable the
+    # instant systemctl returns -- best-effort, since the prefs write above
+    # already succeeded either way and a manual rescan is always available.
+    _lyrion_wait_and_rescan()
+
+    # Whatever subpaths were staged are now actually live in Lyrion --
+    # clear the pending flag so _sync_from_lyrion() resumes reconciling
+    # these sources normally. Re-read+save rather than reuse the `state`
+    # object passed in, in case something else touched sources while
+    # Lyrion was stopped.
+    with _lock:
+        fresh = load_state()
+        for s in fresh.get("sources", []):
+            s.pop("subpath_pending", None)
+        save_state(fresh)
+
+    return True, _ht('lyrion.applied', _hlang(), count=len(paths))
+
+
+def _unmounted_adopted_disks(state):
+    return [src.get("name") or "disco" for src in state.get("sources", [])
+            if src.get("type") in ("internal", "usb")
+            and not (src.get("mountpoint") and os.path.ismount(src["mountpoint"]))]
+
+
+def apply_to_lyrion_live(state):
+    """apply_to_lyrion() without stopping Lyrion: the list of music folders is
+    rebuilt from state the same way, but set over JSON-RPC, and a rescan is
+    asked for only when that list actually changed.
+
+    The first-run wizard ends its sources step with an apply as a safety net,
+    in case one of the live pushes made while adding sources missed (Lyrion
+    still restarting after its plugins were installed). The restart-based
+    apply made that "Done, continue" button hang for up to two minutes —
+    stop, start, then up to thirty rescan attempts — on a Lyrion that almost
+    always already had every folder. Raises when Lyrion cannot be reached, so
+    the caller can fall back to the restart-based apply."""
+    with _lock:
+        if _sync_from_lyrion(state):
+            save_state(state)
+    unmounted = _unmounted_adopted_disks(state)
+    if unmounted:
+        return False, _ht('lyrion.diskNotMounted', _hlang(), disks=", ".join(unmounted))
+    paths = current_paths(state)
+    live = _lyrion_request(["pref", "mediadirs", "?"]).get("_p2")
+    if not isinstance(live, list):
+        live = [live] if live else []
+    if live != paths:
+        _lyrion_request(["pref", "mediadirs", paths])
+        _lyrion_rescan()
+    with _lock:
+        fresh = load_state()
+        for src in fresh.get("sources", []):
+            src.pop("subpath_pending", None)
+        save_state(fresh)
+    return True, _ht('lyrion.appliedLive', _hlang(), count=len(paths))
+
+
+_APPLY_BG_LOCK = threading.Lock()
+
+
+def _apply_to_lyrion_background():
+    if not _APPLY_BG_LOCK.acquire(blocking=False):
+        return  # one restart-based apply at a time is plenty
+    try:
+        ok, msg = apply_to_lyrion(load_state())
+        print(f"[sources] background apply: ok={ok} {msg}")
+    except Exception as e:
+        print(f"[sources] background apply failed: {e}")
+    finally:
+        _APPLY_BG_LOCK.release()
+
+
+# ─────────────────────────── Backup / restore ────────────────────────
+# HTTP layer only. What may be archived and what may be written back both come
+# from hifi_backup.py — one table, so the two directions can never drift apart.
+# See that module for the reasoning behind the category split, the deny-list,
+# and why this is a profile backup rather than a rootfs image.
+#
+# Building an archive is delegated to /usr/local/sbin/hifi-backup-run.py via
+# systemd-run (same detached-worker + /run status-file shape as the disk format
+# and CD rip jobs), because it walks the whole Lyrion prefs tree and can take
+# long enough to hold an HTTP worker hostage. Restoring used to stay
+# synchronous on the theory that it only ever touches "a handful of small
+# files plus, at worst, a Lyrion stop/start" — wrong in practice: a full
+# profile restore writes back the same thousands-of-tiny-files Lyrion prefs/
+# playlists tree a backup reads, takes its OWN pre-restore safety snapshot
+# inline first (another full archive build), and can restart squeezelite,
+# CamillaDSP, NetworkManager, Samba and hifi-webui along the way. Held in an
+# HTTP request, that ran long enough to look hung, with zero feedback on which
+# of those steps it was actually doing — and if the restored file was
+# webui.db, the last of those restarts kills hifi-webui itself, i.e. the very
+# process proxying the request for the web-admin UI, abruptly dropping the
+# connection the browser was waiting on. So restore now runs in a background
+# thread (in-process — unlike backup it never needs to survive sources_server
+# itself restarting, so systemd-run isn't needed) reporting progress to
+# RESTORE_STATUS_FILE exactly like the backup job does, polled the same way.
+#
+# The archive itself is still an allow-list on BOTH sides — a restore never
+# uses the tar member's own path verbatim, only regular files are ever opened,
+# and every member is checked against the manifest's sha256 before it is
+# written. A malicious or corrupt archive therefore has nowhere to aim.
+# Distinct from the "hifi-backup" name used by the scheduled hifi-backup.service
+# (shipped in includes.chroot/etc/systemd/system, byte-identical to what
+# 0033-backup-scheduler.sh writes): systemd-run refuses to create a transient unit
+# that shares a name with one that already has a fragment file on disk — that
+# collision made every manual backup fail with "already loaded or has a
+# fragment file", unconditionally, the moment the scheduler shipped.
+BACKUP_UNIT = "hifi-backup-manual"
+BACKUP_JOB = "/run/hifi-backup-job.json"
+BACKUP_SCRIPT = "/usr/local/sbin/hifi-backup-run.py"
+# Per-file ceiling for a restore: hb.member_size_limit() — 32MB for config, a
+# FIR filter or the web-admin database, more for the album/artist archive.
+# The backup side leaves out anything above the same limits, so a restore
+# never refuses what a backup was allowed to hold.
+MAX_RESTORE_MEMBER_SIZE = hb.MAX_MEMBER_SIZE
+# Lyrion keeps one .prefs file per plugin and per player, and /var/lib/bluetooth
+# one directory per pairing, so a full profile is thousands of tiny files — not
+# the handful the config-only backup this replaces used to hold.
+MAX_RESTORE_MEMBERS = 20000
+# Upload ceiling, and the most a restore will ever decompress from one archive:
+# every gzip layer is measured against it BEFORE tarfile walks the archive
+# (hb.payload_size — listing a .tar.gz decompresses all of it, before any
+# per-member check can run), so a small, maliciously well-compressed upload
+# cannot keep the CPU busy for hours or fill the disk. It used to be a flat
+# 64MB, which a backup holding the album/artist archive could not fit under.
+# Free disk space is the second, usually tighter, limit, checked at each step.
+MAX_RESTORE_ARCHIVE_SIZE = hb.MAX_RESTORE_PAYLOAD
+
+# _restore_members() writes every member 0600 root:root — the right default
+# for anything sensitive, but wrong for the handful of /etc/hifi-player files
+# the unprivileged "hifi" user's X session reads DIRECTLY off disk, before
+# Electron even starts and before the root API is anywhere in the loop:
+# ~/.xsession itself reads pointer-enabled, and hifi-ui-resolution.sh apply
+# (invoked from there) reads ui-resolution. Normal writes leave both 644
+# (api_server.py's set_pointer() uses a plain open(); hifi-ui-resolution.sh's
+# own `set` subcommand explicitly `chmod 644`s it) — restoring them 0600
+# silently reverts the kiosk session to its defaults (cursor always hidden;
+# no UI downscaling on large panels) regardless of what the backup actually
+# had, with no error anywhere pointing at why. Checked the rest of every
+# restored category for the same class of bug (root:0600 vs. what the actual
+# reader expects) — this is the only other case beyond the Lyrion plugin
+# cache: everything else here is read only by hifi-api/hifi-sources/hifi-webui
+# (root) or NetworkManager/CamillaDSP/squeezelite (also root; NM's connection
+# profiles are the one place 0600 is what's WANTED, and that's already forced
+# explicitly in _restore_apply_side_effects).
+WORLD_READABLE_RESTORES = frozenset((
+    "/etc/hifi-player/pointer-enabled",
+    "/etc/hifi-player/ui-resolution",
+))
+
+# Same shape as hb.STATUS_FILE, own file: a restore and a backup can never run
+# at once (the restore path calls _snapshot_before_restore inline, and the
+# scheduled/manual backup guard would otherwise fight it), but keeping them
+# separate means each polling loop only ever sees its own job's progress.
+RESTORE_STATUS_FILE = "/run/hifi-restore-status.json"
+_RESTORE_LOCK = threading.Lock()
+# First-boot setup in progress (webui_server.py's MARKER; never restored —
+# hb.DENY_FILES). See the reboot in _run_restore_async.
+PROVISIONING_MARKER = "/etc/hifi-player/provisioning-pending"
+RESTORE_REBOOT_DELAY = 8
+
+
+def _reboot_after_restore():
+    body, status = _proxy_to_api_server("/reboot", method="POST", body={}, timeout=15)
+    if status != 200:
+        print(f"[sources] reboot after restore failed: {status} {body}")
+
+
+def _restore_status():
+    try:
+        with open(RESTORE_STATUS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {"state": "idle"}
+
+
+def _write_restore_status(state, progress, message, **extra):
+    payload = {"state": state, "progress": progress, "message": message}
+    payload.update(extra)
+    tmp = RESTORE_STATUS_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, RESTORE_STATUS_FILE)
+    except OSError as e:
+        print(f"[sources] impossibile scrivere lo stato restore: {e}")
+
+
+def _backup_status():
+    try:
+        with open(hb.STATUS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {"state": "idle"}
+
+
+def _backup_error_message(e):
+    """hb.BackupError in the owner's language when it carries an i18n code."""
+    code = getattr(e, "code", None)
+    if code:
+        return _ht(code, _hlang(), **(getattr(e, "fields", None) or {}))
+    return str(e)
+
+
+def _passphrase_ok(value):
+    """A passphrase is handed to openssl through stdin, never a shell, so the
+    only real constraints are that it is printable and bounded."""
+    if not value:
+        return True
+    return len(value) <= 256 and "\n" not in value and "\r" not in value
+
+
+def _stored_passphrase():
+    """The passphrase every backup is encrypted with, as (passphrase, None),
+    or ("", error response) when the owner has not chosen one yet or the
+    stored one cannot be opened any more."""
+    try:
+        passphrase = hb.load_passphrase()
+    except hb.LoginUnreadable as e:
+        print(f"[sources] backup passphrase unreadable: {e}")
+        return "", (jsonify({"success": False, "code": "backup.passphraseUnreadable",
+                             "message": _ht('backup.passphraseUnreadable', _hlang())}), 409)
+    if not passphrase:
+        return "", (jsonify({"success": False, "code": "backup.passphraseMissing",
+                             "message": _ht('backup.passphraseMissing', _hlang())}), 409)
+    return passphrase, None
+
+
+# ── restore ──────────────────────────────────────────────────────────
+def _restore_members(tar, manifest, categories, progress_cb=None):
+    """Write back every member that the selected categories allow.
+
+    Returns (restored_paths, errors). Integrity is checked per member against
+    the manifest before anything touches the filesystem — the failure mode a
+    checksum-free backup tool has (a silently corrupted file restored over a
+    good one) is the whole reason this is here.
+
+    progress_cb, if given, is called as progress_cb(done, total) every 50
+    members — a Lyrion profile is thousands of tiny files, so without this a
+    restore's status just sits on "Ripristino file..." for however long that
+    takes, indistinguishable from actually being stuck.
+    """
+    restored, errors = [], []
+    digests = (manifest or {}).get("members") or {}
+    members = tar.getmembers()
+    if len(members) > MAX_RESTORE_MEMBERS:
+        return [], [_ht('restore.archiveInvalidTooManyFiles', _hlang())]
+    total = len(members)
+
+    current_sources = None
+    if os.path.isfile(STATE_FILE):
+        try:
+            with open(STATE_FILE, "rb") as f:
+                current_sources = f.read()
+        except OSError:
+            pass
+
+    for i, member in enumerate(members):
+        if progress_cb and i % 50 == 0:
+            progress_cb(i, total)
+        if not member.isfile():
+            continue  # dirs, symlinks, devices: never followed, never created
+        dest = hb.restore_dest_for_member(member.name, categories)
+        if not dest:
+            continue  # outside the allow-list, or a category not selected
+        if member.size > hb.member_size_limit(dest):
+            errors.append(_ht('restore.memberTooLarge', _hlang(), name=member.name))
+            continue
+        tmp = dest + ".restore.tmp"
+        try:
+            src = tar.extractfile(member)
+            if src is None:
+                continue
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            if member.size > 1024 * 1024 and not hb.free_space_ok(os.path.dirname(dest), member.size):
+                # Filling the disk to the last byte would take Lyrion, the
+                # logs and every other writer down with this restore.
+                errors.append(_ht('restore.memberNoSpace', _hlang(), name=os.path.basename(dest)))
+                continue
+            # Streamed to a sibling temp file and hashed on the way: the
+            # album/artist archive can be hundreds of MB, which used to be
+            # read whole into memory. Nothing replaces `dest` until the
+            # checksum matches.
+            digest = hashlib.sha256()
+            with open(tmp, "wb") as f:
+                os.chmod(tmp, 0o600)
+                for block in iter(lambda: src.read(1024 * 1024), b""):
+                    digest.update(block)
+                    f.write(block)
+
+            expected = digests.get(member.name)
+            if expected and digest.hexdigest() != expected:
+                os.unlink(tmp)
+                errors.append(_ht('restore.checksumInvalid', _hlang(), name=os.path.basename(dest)))
+                continue
+
+            if dest == STATE_FILE and current_sources:
+                # An unencrypted backup has its SMB passwords blanked; keep the
+                # ones this device already knows so the shares still mount.
+                with open(tmp, "rb") as f:
+                    data = hb.merge_sources_state(f.read(), current_sources)
+                with open(tmp, "wb") as f:
+                    f.write(data)
+
+            os.replace(tmp, dest)
+            restored.append(dest)
+        except Exception as e:
+            print(f"[sources] restore failed for {dest}: {e}")
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            errors.append(_ht('restore.memberFailed', _hlang(), name=os.path.basename(dest)))
+    if progress_cb:
+        progress_cb(total, total)
+    return restored, errors
+
+
+def _lyrion_paths_touched(restored):
+    # Also cache/InstalledPlugins/Plugins/ — that's real plugin CODE (a
+    # downloaded skin like Material, not just a manifest of what's enabled),
+    # and _restore_members() writes every member 0600 owned by whoever this
+    # process runs as (root). Missing it here left restored plugin files
+    # unreadable by the squeezeboxserver/lyrionmusicserver user Lyrion
+    # actually runs as — reproduced live: Material's Plugin.pm/HTML/*.css
+    # sat there as `-rw------- root root`, so Lyrion silently couldn't load
+    # the skin and served /skin.css empty, i.e. Lyrion's page looking totally
+    # unstyled right after a restore.
+    return [p for p in restored
+            if "/prefs/" in p or "/playlists/" in p
+            or "/cache/InstalledPlugins/Plugins/" in p]
+
+
+def _stop_lyrion():
+    """Lyrion caches its prefs in memory and rewrites them on exit, so writing
+    prefs underneath a running server would simply be overwritten. Unlike the
+    backup path — which never stops anything — a restore is an explicit, rare
+    action where a short pause is the right trade."""
+    _run(["systemctl", "stop", "lyrionmusicserver"], timeout=60)
+
+
+def _start_lyrion():
+    _systemctl_lyrion("start")
+
+
+def _lyrion_cache_dir():
+    """The active var-lib base's cache/ dir (squeezeboxserver or
+    lyrionmusicserver layout — same dual-package story as everywhere else in
+    this file), or None if neither is found."""
+    prefs = _find_prefs()
+    if prefs:
+        cache = os.path.join(os.path.dirname(os.path.dirname(prefs)), "cache")
+        if os.path.isdir(cache):
+            return cache
+    for base in ("/var/lib/squeezeboxserver", "/var/lib/lyrionmusicserver"):
+        cache = os.path.join(base, "cache")
+        if os.path.isdir(cache):
+            return cache
+    return None
+
+
+def _invalidate_lyrion_plugin_cache():
+    """Force Lyrion to rebuild its plugin listing from scratch on next start.
+
+    Reproduced live: even after _chown_lyrion() fixes ownership, Lyrion's own
+    cache/plugin-data.yaml (built by scanning cache/InstalledPlugins/Plugins/
+    at startup) stays whatever it last managed to build. If that build ran
+    while a plugin's files were still unreadable — as every restore did before
+    _lyrion_paths_touched() covered this directory — the plugin (e.g. the
+    Material skin) stays "missing" in that cache forever, permission fix or
+    not: /skin.css kept serving empty and /material/ kept 404ing even with
+    every file correctly chowned, until this cache was cleared. Deleting it is
+    safe — Lyrion regenerates it from the Plugins/ directory on every start
+    regardless — and this makes an already-affected device (one that hit the
+    bug on a past restore, before this fix shipped) self-heal on its next one
+    instead of needing a manual cache wipe.
+    """
+    cache_dir = _lyrion_cache_dir()
+    if not cache_dir:
+        return
+    targets = [os.path.join(cache_dir, "plugin-data.yaml")]
+    targets += glob.glob(os.path.join(cache_dir, "stringcache.*.bin"))
+    for path in targets:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _chown_lyrion(paths):
+    uid, gid = _squeezebox_ids()
+    if uid is None:
+        return
+    for path in paths:
+        try:
+            os.chown(path, uid, gid)
+            os.chmod(path, 0o640)
+        except OSError:
+            pass
+
+
+def _chown_lyrion_dirs(paths):
+    """Give Lyrion the folders a restore had to create for its files.
+
+    On a device set up from a backup, prefs/plugin/ and the plugin folders do
+    not exist yet: the restore makes them as root, and Lyrion (which runs as
+    its own user) could then read the restored files but never write a new
+    one there — a streaming service signed in again could not save its login.
+    Only folders still owned by root are taken, so the shared playlists
+    folder (hifimusic:hifishare) keeps its owner."""
+    uid, gid = _squeezebox_ids()
+    if uid is None:
+        return
+    bases = ("/var/lib/squeezeboxserver", "/var/lib/lyrionmusicserver")
+    seen = set()
+    for path in paths:
+        d = os.path.dirname(path)
+        while d not in seen and any(d.startswith(b + "/") for b in bases):
+            seen.add(d)
+            try:
+                if os.stat(d).st_uid == 0:
+                    os.chown(d, uid, gid)
+            except OSError:
+                pass
+            d = os.path.dirname(d)
+
+
+def _drop_stale_sqlite_logs(restored):
+    """A database restored as a snapshot must not meet the write-ahead log of
+    the one it replaced: SQLite would replay that log over it. Lyrion is
+    stopped at this point."""
+    for path in restored:
+        if os.path.basename(path) != "persist.db":
+            continue
+        for side in ("-wal", "-shm"):
+            try:
+                os.unlink(path + side)
+            except OSError:
+                pass
+
+
+def _fix_restored_permissions(restored):
+    """Re-widen the handful of restored files a non-root reader needs — see
+    WORLD_READABLE_RESTORES. Best-effort, same as _chown_lyrion."""
+    for path in restored:
+        if path in WORLD_READABLE_RESTORES:
+            try:
+                os.chmod(path, 0o644)
+            except OSError:
+                pass
+
+
+def _restore_apply_side_effects(restored):
+    """Re-apply the config that was just restored (best-effort, non-fatal)."""
+    notes = []
+    if STATE_FILE in restored:
+        try:
+            remount_all()
+            ok, msg = apply_to_lyrion(load_state())
+            notes.append(msg if ok else _ht('restore.sourcesFailed', _hlang(), msg=msg))
+        except Exception as e:
+            print(f"[sources] restore side-effect (sources) failed: {e}")
+            notes.append(_ht('restore.sourcesNotReapplied', _hlang()))
+    if "/etc/hostname" in restored:
+        # /etc/hostname was restored as a plain file, but the live kernel
+        # hostname (what hostnamectl/socket.gethostname() actually report) is
+        # separate state nothing in a restore re-derives on its own — same
+        # story as /etc/timezone just below. Proxies to api_server.py's
+        # _apply_hostname (via /hostname_apply) instead of duplicating its
+        # hostnamectl/avahi/etc-hosts logic here, and deliberately does NOT go
+        # through /device_name — that would also force the Bluetooth/
+        # squeezelite player name to match, clobbering the player name
+        # /etc/default/squeezelite just restored on its own (see the
+        # squeezelite-restart branch below).
+        try:
+            with open("/etc/hostname") as f:
+                name = f.read().strip()
+            if name:
+                body, status = _proxy_to_api_server(
+                    "/hostname_apply", method="POST", body={"name": name}, timeout=30)
+                if status == 200 and body.get("success"):
+                    notes.append(_ht('restore.hostnameApplied', _hlang(), name=name))
+        except Exception as e:
+            print(f"[sources] restore side-effect (hostname) failed: {e}")
+    if "/etc/timezone" in restored:
+        # /etc/timezone was restored as a plain file, but that's just the IANA
+        # name -- /etc/localtime (the symlink libc/Chromium/timedatectl actually
+        # resolve wall-clock time against) is a separate artifact that nothing
+        # in a restore touches. Left alone, the restored name shows up in
+        # Settings while every clock on the box keeps running on whatever zone
+        # the image shipped with (UTC).
+        #
+        # Handed to api_server.py's /timezone rather than re-implemented here:
+        # applying a zone means validating the name, writing the symlink,
+        # keeping the two files in sync and restarting the kiosk so Chromium
+        # re-reads ICU, and having two copies of that is how the pair drifted
+        # in the first place. Same proxy pattern as the hostname re-apply above.
+        try:
+            with open("/etc/timezone") as f:
+                tz = f.read().strip()
+            if tz:
+                body, status = _proxy_to_api_server(
+                    "/timezone", method="POST", body={"timezone": tz}, timeout=30)
+                if status == 200 and body.get("success"):
+                    notes.append(_ht('restore.timezoneApplied', _hlang(), tz=tz))
+                else:
+                    print(f"[sources] restore side-effect (timezone) rejected: {body}")
+        except Exception as e:
+            print(f"[sources] restore side-effect (timezone) failed: {e}")
+    if "/etc/hifi-player/ui-rotation" in restored:
+        # The kiosk turns its picture by itself when the file changes, but the
+        # boot splash reads the rotation from the kernel command line, which
+        # only api_server's /ui_rotation writes.
+        try:
+            with open("/etc/hifi-player/ui-rotation") as f:
+                deg = int(f.read().strip() or 0)
+            body, status = _proxy_to_api_server(
+                "/ui_rotation", method="POST", body={"rotation": deg}, timeout=90)
+            if not (status == 200 and body.get("success")):
+                print(f"[sources] restore side-effect (rotation) rejected: {body}")
+        except Exception as e:
+            print(f"[sources] restore side-effect (rotation) failed: {e}")
+    if any(p in restored for p in ("/etc/default/squeezelite", "/var/lib/hifi-player/dsp-target")):
+        # /etc/default/squeezelite is rendered from /etc/hifi-player/
+        # squeezelite.json at every start of the service. A backup from
+        # before the JSON existed restores only the file: without this the
+        # restart would render the live JSON over it and the restored DAC,
+        # name and server would be gone. No JSON → the file is imported.
+        if "/etc/default/squeezelite" in restored and "/etc/hifi-player/squeezelite.json" not in restored:
+            try:
+                os.remove("/etc/hifi-player/squeezelite.json")
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                print(f"[sources] restore side-effect (squeezelite model) failed: {e}")
+        _run(["systemctl", "restart", "squeezelite"], timeout=30)
+        notes.append(_ht('restore.squeezeliteRestarted', _hlang()))
+    if any(p in restored for p in ("/etc/camilladsp/config.yml", "/etc/hifi-player/dsp.json")) \
+            or any(p.startswith("/etc/camilladsp/filters/") for p in restored):
+        # Only restart CamillaDSP if it was already running — restoring a
+        # backup must never turn DSP on by itself.
+        try:
+            active = _run(["systemctl", "is-active", "camilladsp.service"], timeout=10)
+            if (active.stdout or "").strip() == "active":
+                _run(["systemctl", "restart", "camilladsp.service"], timeout=30)
+                notes.append(_ht('restore.camillaRestarted', _hlang()))
+        except Exception:
+            pass
+    if any(p.startswith("/etc/NetworkManager/system-connections/") for p in restored):
+        # The profiles are on disk but NetworkManager only reads them on
+        # demand; reload so the restored Wi-Fi networks are actually known.
+        for path in restored:
+            if path.startswith("/etc/NetworkManager/system-connections/"):
+                try:
+                    os.chmod(path, 0o600)
+                except OSError:
+                    pass
+        _run(["nmcli", "connection", "reload"], timeout=30)
+        notes.append(_ht('restore.wifiReloaded', _hlang()))
+    if hb.METADATA_DB in restored:
+        # The archive of album and artist information was written back at its
+        # canonical path. The metadata service is still holding the database
+        # it had open before the restore, and on a device that keeps the
+        # archive on a disk of its owner's that file is somewhere nothing
+        # reads — hifi_metadata does both halves (see adopt_restored_db).
+        try:
+            hmeta.get_service().adopt_restored_db(hb.METADATA_DB)
+            notes.append(_ht('restore.metaArchiveAdopted', _hlang()))
+        except Exception as e:
+            print(f"[sources] restore side-effect (metadata archive) failed: {e}")
+    if "/etc/hifi-player/webui.db" in restored:
+        # The admin account changed underneath the running daemon; restart so
+        # it reopens the database. No note here — restarting hifi-webui.service
+        # is not "the appliance restarted". The restored database also brings
+        # its own sessions, so the web admin that started this is usually
+        # logged out from here on: _run_restore_async reboots the box itself
+        # and the page, which can no longer read the status, says so.
+        _run(["systemctl", "restart", "hifi-webui"], timeout=30)
+    if SAMBA_CRED_FILE in restored:
+        # The restored file's `synced` flag describes whichever machine's
+        # Samba passdb it was written on, not this one's — _create_samba_user
+        # would trust a stale "true" and skip pushing the password into
+        # smbpasswd, leaving smbd still authenticating with its OWN old
+        # password while the UI shows the one that was just restored. Force
+        # the resync so the restored password is what smbd actually accepts.
+        try:
+            with open(SAMBA_CRED_FILE) as f:
+                cred = json.load(f)
+            cred["synced"] = False
+            tmp = SAMBA_CRED_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(cred, f)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, SAMBA_CRED_FILE)
+        except Exception as e:
+            print(f"[sources] samba-cred resync flag reset failed: {e}")
+        _create_samba_user()
+        _run(["systemctl", "try-restart", "smbd"], timeout=30)
+        notes.append(_ht('restore.smbResynced', _hlang()))
+    return notes
+
+
+def _restore_from_path(path, passphrase, requested_categories, report=None):
+    """Open a backup file (either shape), apply it, return (payload, status).
+
+    report, if given, is called as report(state, progress, message) at each
+    stage — see RESTORE_STATUS_FILE / _write_restore_status. Defaults to a
+    no-op so this stays callable on its own (e.g. from a test) without a
+    status file in play.
+    """
+    if report is None:
+        report = lambda *a, **kw: None  # noqa: E731
+    # On disk, not /run: an encrypted backup is copied out of its wrapper and
+    # decrypted here, and /run is RAM.
+    workdir = hb.make_workdir("restore")
+    tar = None
+    try:
+        report("opening", 20, _ht('restore.openingArchive', _hlang()))
+        try:
+            tar, manifest = hb.open_backup(path, workdir, passphrase,
+                                           max_payload=MAX_RESTORE_ARCHIVE_SIZE)
+        except hb.BackupError as e:
+            return {"success": False, "code": e.code, "message": _backup_error_message(e)}, 400
+
+        # A backup written by a newer build may use members or semantics this
+        # code does not understand; refuse rather than half-apply it.
+        if manifest and int(manifest.get("schema") or 1) > hb.SCHEMA:
+            return {"success": False,
+                    "message": _ht('restore.newerVersion', _hlang())}, 409
+
+        available = hb.categories_in_manifest(manifest)
+        wanted = set(requested_categories or available)
+        categories = [c for c in available if c in wanted]
+        if not categories:
+            return {"success": False,
+                    "message": _ht('restore.noCategories', _hlang())}, 400
+
+        lyrion_stopped = False
+        if "lyrion" in categories:
+            report("stopping_lyrion", 25, _ht('restore.stoppingLyrion', _hlang()))
+            _stop_lyrion()
+            lyrion_stopped = True
+        try:
+            def _member_progress(done, total):
+                pct = 30 + int(done / total * 45) if total else 30
+                report("restoring", pct, _ht('restore.restoringFiles', _hlang(), done=done, total=total))
+            restored, errors = _restore_members(tar, manifest, categories, _member_progress)
+            _fix_restored_permissions(restored)
+            _drop_stale_sqlite_logs(restored)
+            if STATE_FILE in restored:
+                # An encrypted backup brings the share logins back opened.
+                try:
+                    _seal_stored_logins()
+                except Exception as e:
+                    print(f"[sources] sealing restored logins failed: {e}")
+        finally:
+            if lyrion_stopped:
+                report("starting_lyrion", 80, _ht('restore.startingLyrion', _hlang()))
+                touched = _lyrion_paths_touched(restored if restored else [])
+                _chown_lyrion(touched)
+                _chown_lyrion_dirs(touched)
+                if any("/cache/InstalledPlugins/Plugins/" in p for p in touched):
+                    _invalidate_lyrion_plugin_cache()
+                _start_lyrion()
+
+        if not restored and errors:
+            return {"success": False, "message": "; ".join(errors)}, 400
+
+        report("applying", 90, _ht('restore.applyingChanges', _hlang()))
+        notes = _restore_apply_side_effects(restored)
+        if lyrion_stopped:
+            # Restoring prefs/playlists makes Lyrion treat them as changed on
+            # its own next start, so it runs its own library rescan — nothing
+            # this code drives or can see the end of, and the LMS web UI's
+            # "please wait" banner during that looks a lot like something
+            # stuck. Say so up front instead of leaving the user to wonder.
+            notes.append(_ht('restore.lyrionScanning', _hlang()))
+        msg = _ht('restore.filesRestored', _hlang(), count=len(restored))
+        if notes:
+            msg += " " + " ".join(notes)
+        if errors:
+            msg += _ht('restore.warningsPrefix', _hlang()) + "; ".join(errors)
+        hb.record_history(hb.STORE_DIR,
+                          f"restore\tcompleted\t{len(restored)} file\t"
+                          f"{','.join(categories)}")
+        return {"success": True, "message": msg, "restored": len(restored),
+                "categories": categories,
+                "login_replaced": "/etc/hifi-player/webui.db" in restored}, 200
+    finally:
+        if tar is not None:
+            try:
+                tar.close()
+            except Exception:
+                pass
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _snapshot_before_restore(protect=()):
+    """Take a restore point first.
+
+    Restoring is the one operation here that overwrites live configuration, and
+    it is exactly when the user is least able to reconstruct what they had. The
+    snapshot is built inline (not via the worker) so it is guaranteed to be on
+    disk before the first file is overwritten — an async job could still be
+    running when the restore starts.
+
+    It is filed as hb.PRE_RESTORE_TRIGGER, which rotation keeps apart from the
+    owner's backups (only the newest one stays, and it costs the owner none of
+    theirs), and `protect` — the generation being restored — is never rotated
+    away: with as many backups as "keep", restoring the oldest one used to
+    delete it here, before it was read. Skipped when the disk cannot hold it,
+    rather than filling the disk to the last byte. Returns the new id or None.
+    """
+    try:
+        os.makedirs(hb.STORE_DIR, exist_ok=True)
+        os.chmod(hb.STORE_DIR, 0o700)
+        hb.prune_incomplete(hb.STORE_DIR)
+        # Encrypted, and so complete, like every backup once the owner has
+        # chosen a passphrase. Before that (a restore during first-boot setup)
+        # there is nothing secret worth keeping: the plain, non-secret half.
+        try:
+            passphrase = hb.load_passphrase()
+        except hb.LoginUnreadable:
+            passphrase = ""
+        cats = list(hb.ALL_CATEGORIES if passphrase else hb.UNATTENDED_CATEGORIES)
+        need = hb.estimate_peak(cats, "/", encrypted=bool(passphrase))
+        if not hb.free_space_ok(hb.STORE_DIR, need):
+            print(f"[sources] pre-restore snapshot skipped: ~{need // (1024 * 1024)} MB "
+                  f"needed, not enough free disk space")
+            hb.record_history(hb.STORE_DIR, "backup\tskipped\tpre-restore\tno space")
+            return None
+        gen_id = hb.new_gen_id()
+        gen_dir = os.path.join(hb.STORE_DIR, gen_id)
+        os.makedirs(gen_dir, exist_ok=True)
+        os.chmod(gen_dir, 0o700)
+        try:
+            plain = os.path.join(gen_dir, hb.ARCHIVE_NAME)
+            manifest = hb.build_archive(plain, cats, "/", encrypted=bool(passphrase),
+                                        extra={"created": gen_id,
+                                               "trigger": hb.PRE_RESTORE_TRIGGER,
+                                               "versions": hb.device_versions()})
+            if passphrase:
+                hb.encrypt_in_place(plain, os.path.join(gen_dir, hb.ENC_NAME),
+                                    passphrase, manifest)
+            tmp = os.path.join(gen_dir, hb.MANIFEST_NAME + ".tmp")
+            with open(tmp, "w") as f:
+                json.dump(manifest, f, indent=2)
+            os.replace(tmp, os.path.join(gen_dir, hb.MANIFEST_NAME))
+        except Exception:
+            # Give the space of a half-built archive back right away instead
+            # of at the next prune: the restore that follows needs it.
+            shutil.rmtree(gen_dir, ignore_errors=True)
+            raise
+        hb.rotate(hb.STORE_DIR, hb.read_settings()["keep"], protect=protect)
+        hb.record_history(hb.STORE_DIR, f"backup\tcompleted\t{gen_id}\tpre-restore")
+        return gen_id
+    except Exception as e:
+        print(f"[sources] pre-restore snapshot failed: {e}")
+        return None
+
+
+def _run_restore_async(path, passphrase, categories, workdir_to_clean=None, gen_id=None,
+                       lang="en"):
+    """Background-thread body for a restore job. Runs in-process (unlike the
+    backup job, restore never needs to survive sources_server itself dying —
+    nothing it does restarts this process — so a plain daemon thread is enough,
+    no systemd-run/status-file-on-tmpfs-for-a-separate-process needed beyond the
+    status file itself, which exists purely so polling requests don't have to
+    share state with this thread directly).
+
+    gen_id is the stored generation being restored, if any: it was pinned by
+    _start_restore (so no rotation can remove it while it is being read) and
+    is unpinned here once the restore is over. `lang` is the language of the
+    request that started it, for every message written from here."""
+    _job_lang.lang = lang
+    try:
+        _write_restore_status("preparing", 5, _ht('restore.preparing', _hlang()))
+        _write_restore_status("snapshotting", 10, _ht('restore.snapshotting', _hlang()))
+        snapshot = _snapshot_before_restore(protect=(gen_id,) if gen_id else ())
+
+        def report(state, progress, message):
+            _write_restore_status(state, progress, message)
+
+        # Nothing typed: the passphrase this device keeps, which opens every
+        # backup it made since the owner chose it.
+        typed, used_stored = passphrase, False
+        if not passphrase:
+            try:
+                passphrase = hb.load_passphrase()
+            except hb.LoginUnreadable:
+                passphrase = ""
+            used_stored = bool(passphrase)
+
+        payload, status = _restore_from_path(path, passphrase, categories, report)
+        if used_stored and payload.get("code") == "restore.wrongPassphrase":
+            payload["message"] = _ht('restore.otherPassphrase', _hlang())
+        if status == 200 and payload.get("success"):
+            if typed and not hb.passphrase_set():
+                # A new device set up from a backup: its passphrase becomes
+                # this device's, so the next backups need no new one.
+                try:
+                    hb.save_passphrase(typed)
+                except (hb.LoginUnreadable, OSError) as e:
+                    print(f"[sources] keeping the restore passphrase failed: {e}")
+            message = payload.get("message", _ht('restore.completed', _hlang()))
+            if snapshot is None:
+                message += " " + _ht('restore.noSnapshot', _hlang())
+            # A restored webui.db replaced the admin login, and with it every
+            # open web-admin session: the page that started this can no longer
+            # read this status nor ask for the reboot a restore ends with, so
+            # the box reboots by itself. Not during first-boot setup, where the
+            # wizard finalizes and reboots on its own (provision_finalize).
+            reboot = bool(payload.get("login_replaced")) and not os.path.exists(PROVISIONING_MARKER)
+            if reboot:
+                message += " " + _ht('restore.rebootingLoginReplaced', _hlang())
+            _write_restore_status("done", 100, message, reboot=reboot,
+                                  restored=payload.get("restored"), categories=payload.get("categories"))
+            if reboot:
+                # A few seconds first, so a page whose session did survive
+                # (a backup taken during that same login) still reads "done".
+                threading.Timer(RESTORE_REBOOT_DELAY, _reboot_after_restore).start()
+        else:
+            _write_restore_status("error", 0, payload.get("message", _ht('restore.failed', _hlang())))
+    except Exception as e:
+        print(f"[sources] restore job failed: {e}")
+        _write_restore_status("error", 0, _ht('restore.failedDetail', _hlang(), err=e))
+    finally:
+        if workdir_to_clean:
+            shutil.rmtree(workdir_to_clean, ignore_errors=True)
+        if gen_id:
+            hb.unpin_generation()
+        _RESTORE_LOCK.release()
+
+
+def _start_restore(path, passphrase, categories, workdir_to_clean=None, gen_id=None):
+    """Start a restore job in the background. Returns None on success, or a
+    (payload, status) error pair if one is already running."""
+    if not _RESTORE_LOCK.acquire(blocking=False):
+        return {"success": False, "code": "restore.alreadyInProgress",
+                "message": _ht('restore.alreadyInProgress', _hlang())}, 409
+    if gen_id:
+        try:
+            hb.pin_generation(gen_id)
+        except OSError as e:
+            # The explicit `protect` of the safety snapshot still covers the
+            # restore's own rotation; only a timer firing mid-restore is not.
+            print(f"[sources] could not pin {gen_id} for the restore: {e}")
+    _write_restore_status("preparing", 0, _ht('common.starting', _hlang()))
+    threading.Thread(target=_run_restore_async,
+                     args=(path, passphrase, categories, workdir_to_clean, gen_id),
+                     kwargs={"lang": _hlang()},
+                     daemon=True, name="restore-worker").start()
+    return None
+
+
+# ── routes ───────────────────────────────────────────────────────────
+@app.route("/api/backup", methods=["GET"])
+def api_backup():
+    """Build and stream a backup immediately.
+
+    Same URL as ever, since it is what the plain download link in the UI
+    points at. An <a href> cannot send a passphrase, and it no longer has to:
+    the archive is encrypted with the one the device keeps, like every other
+    backup, so it is the whole profile.
+    """
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    passphrase, err = _stored_passphrase()
+    if err:
+        return err
+    # Built on disk and streamed from there. It used to be built in /run and
+    # read whole into memory — twice the archive in RAM (tmpfs + the response),
+    # plus the SQLite snapshot of the album/artist archive, also in /run.
+    workdir = None
+    try:
+        workdir = hb.make_workdir("download")
+        cats = list(hb.ALL_CATEGORIES)
+        need = hb.estimate_peak(cats, "/", encrypted=True)
+        if not hb.free_space_ok(workdir, need):
+            return _backup_no_space(need)
+        plain = os.path.join(workdir, hb.ARCHIVE_NAME)
+        enc = os.path.join(workdir, hb.ENC_NAME)
+        stamp = hb.new_gen_id()
+        manifest = hb.build_archive(plain, cats, "/", encrypted=True,
+                                    extra={"created": stamp, "trigger": "download",
+                                           "versions": hb.device_versions()})
+        hb.encrypt_in_place(plain, enc, passphrase, manifest)
+        path = os.path.join(workdir, "wrapper.tar.gz")
+        hb.wrap_encrypted(path, manifest, enc)
+        os.unlink(enc)
+        f = open(path, "rb")
+    except Exception as e:
+        print(f"[sources] backup build failed: {e}")
+        return jsonify({"success": False, "message": _ht('backup.createFailed', _hlang())}), 500
+    finally:
+        # The open file keeps its bytes until the response has sent them.
+        if workdir:
+            shutil.rmtree(workdir, ignore_errors=True)
+    return _send_backup_file(f, f"osmium-backup-{stamp}.tar.gz")
+
+
+def _backup_no_space(need):
+    mb = (need + hb.FREE_SPACE_MARGIN) // (1024 * 1024) + 1
+    return jsonify({"success": False, "code": "backup.noSpace",
+                    "message": _ht('backup.noSpace', _hlang(), mb=mb)}), 507
+
+
+def _send_backup_file(f, name):
+    """Stream an open archive in chunks instead of reading it into memory —
+    with the album/artist archive inside, a backup runs to hundreds of MB.
+    The caller may already have unlinked the file; `f` is closed once sent."""
+    from flask import send_file
+    size = os.fstat(f.fileno()).st_size
+    resp = send_file(f, mimetype="application/gzip", as_attachment=True,
+                     download_name=name, conditional=False, etag=False)
+    resp.content_length = size
+    resp.headers["Content-Disposition"] = f'attachment; filename="{name}"'
+    return resp
+
+
+@app.route("/api/backup/create", methods=["POST"])
+def api_backup_create():
+    """Start a stored-generation build (async, so a big Lyrion prefs tree
+    doesn't hold an HTTP worker)."""
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    if not os.path.exists(BACKUP_SCRIPT):
+        return jsonify({"success": False, "code": "backup.systemUpdateRequired",
+                        "message": _ht('backup.systemUpdateRequired', _hlang())}), 424
+    if _backup_status().get("state") in ("preparing", "checking", "archiving",
+                                         "encrypting", "finishing"):
+        return jsonify({"success": False, "code": "backup.alreadyInProgress",
+                        "message": _ht('backup.alreadyInProgress', _hlang())}), 409
+    if _restore_status().get("state") not in ("idle", "done", "error", None):
+        # A restore takes its own pre-restore snapshot via the same STORE_DIR
+        # (hb.build_archive/rotate) a manual backup would touch — let it finish
+        # rather than racing two writers over the same generations directory.
+        return jsonify({"success": False, "code": "backup.alreadyInProgress",
+                        "message": _ht('backup.alreadyInProgress', _hlang())}), 409
+
+    data = request.get_json(silent=True) or {}
+    passphrase = data.get("passphrase") or ""
+    if not _passphrase_ok(passphrase):
+        return jsonify({"success": False, "message": _ht('backup.invalidPassphrase', _hlang())}), 400
+    if passphrase:
+        # The web admin sends none: the device's own is used. The companion
+        # app still types one each time; the first becomes the device's, so
+        # the weekly backup can be encrypted too.
+        if not hb.passphrase_set():
+            try:
+                hb.save_passphrase(passphrase)
+            except (hb.LoginUnreadable, OSError) as e:
+                print(f"[sources] saving the backup passphrase failed: {e}")
+    else:
+        passphrase, err = _stored_passphrase()
+        if err:
+            return err
+    categories = hb.selected_categories(data.get("categories"), True)
+    if not categories:
+        return jsonify({"success": False,
+                        "message": _ht('backup.noCategoriesSelected', _hlang())}), 400
+
+    job = {"categories": categories, "passphrase": passphrase,
+           "trigger": "manual", "keep": hb.read_settings()["keep"]}
+    # /run is tmpfs and this may carry the passphrase: write it 0600, and the
+    # worker deletes it the moment it has been read.
+    fd = os.open(BACKUP_JOB, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(job, f)
+    with open(hb.STATUS_FILE, "w") as f:
+        json.dump({"state": "preparing", "progress": 0, "message": _ht('common.starting', _hlang())}, f)
+    try:
+        r = _run(["systemd-run", "--no-block", "--collect", "--unit=" + BACKUP_UNIT,
+                  BACKUP_SCRIPT, BACKUP_JOB], timeout=15)
+        launch_err = None if r.returncode == 0 else (r.stderr or r.stdout or "").strip()
+    except subprocess.TimeoutExpired:
+        launch_err = _ht('install.systemdRunNoResponse', _hlang())
+    if launch_err:
+        # Without this, a systemd-run failure (unit already active, dbus, etc.)
+        # leaves the "Starting…"/0% placeholder above in place forever, since
+        # nothing ever starts to overwrite it — the UI just polls a frozen
+        # status and looks hung.
+        with open(hb.STATUS_FILE, "w") as f:
+            json.dump({"state": "error", "progress": 0,
+                       "message": _ht('backup.startFailedDetail', _hlang(), detail=launch_err)[:300]}, f)
+        try:
+            os.unlink(BACKUP_JOB)
+        except OSError:
+            pass
+        return jsonify({"success": False, "message": _ht('backup.startFailed', _hlang())}), 500
+    return jsonify({"success": True, "categories": categories,
+                    "encrypted": bool(passphrase)}), 202
+
+
+@app.route("/api/backup/status", methods=["GET"])
+def api_backup_status():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    status = _backup_status()
+    # The worker (hifi-backup-run.py) writes an i18n code, not text in a
+    # language nobody asked for: translate it for this caller.
+    if status.get("code"):
+        status["message"] = _ht(status["code"], _hlang(), **(status.get("fields") or {}))
+    return jsonify(status)
+
+
+@app.route("/api/backup/list", methods=["GET"])
+def api_backup_list():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    hb.prune_incomplete(hb.STORE_DIR)
+    return jsonify({"generations": hb.list_generations(hb.STORE_DIR),
+                    "categories": list(hb.ALL_CATEGORIES),
+                    "secret": list(hb.SECRET_CATEGORIES),
+                    "settings": hb.read_settings(),
+                    "passphrase_set": hb.passphrase_set(),
+                    "passphrase_min": hb.PASSPHRASE_MIN_LEN,
+                    "scheduled_categories": list(hb.ALL_CATEGORIES)})
+
+
+@app.route("/api/backup/passphrase", methods=["GET", "POST"])
+def api_backup_passphrase():
+    """The passphrase every backup is encrypted with. GET says whether one is
+    set, and with ?reveal=1 hands it back — the owner needs it to open a
+    downloaded backup on another device, and being signed in is enough to see
+    it. POST chooses it, or changes it: backups made before keep the old one."""
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    if request.method == "GET":
+        if request.args.get("reveal") != "1":
+            return jsonify({"set": hb.passphrase_set()})
+        passphrase, err = _stored_passphrase()
+        if err:
+            return err
+        return jsonify({"set": True, "passphrase": passphrase})
+    data = request.get_json(silent=True) or {}
+    passphrase = data.get("passphrase") or ""
+    if not _passphrase_ok(passphrase) or len(passphrase) < hb.PASSPHRASE_MIN_LEN:
+        return jsonify({"success": False, "code": "backup.passphraseTooShort",
+                        "message": _ht('backup.passphraseTooShort', _hlang(),
+                                       n=hb.PASSPHRASE_MIN_LEN)}), 400
+    try:
+        hb.save_passphrase(passphrase)
+    except (hb.LoginUnreadable, OSError) as e:
+        print(f"[sources] saving the backup passphrase failed: {e}")
+        return jsonify({"success": False, "code": "backup.passphraseSaveFailed",
+                        "message": _ht('backup.passphraseSaveFailed', _hlang())}), 500
+    hb.record_history(hb.STORE_DIR, "passphrase\tset")
+    return jsonify({"success": True, "set": True})
+
+
+@app.route("/api/backup/<gen_id>", methods=["GET"])
+def api_backup_download(gen_id):
+    """Download a stored generation as one self-contained file."""
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    if not hb.valid_gen_id(gen_id):
+        return jsonify({"success": False, "message": _ht('backup.notFound', _hlang())}), 404
+    manifest = hb.read_manifest(hb.STORE_DIR, gen_id)
+    if not manifest:
+        return jsonify({"success": False, "message": _ht('backup.notFound', _hlang())}), 404
+
+    src = hb.archive_path(hb.STORE_DIR, gen_id, manifest)
+    workdir = None
+    try:
+        if manifest.get("enc"):
+            # Wrap manifest + ciphertext so the download can be restored
+            # anywhere, not just from the directory it was produced in. On
+            # disk, not /run (RAM): the wrapper is a full copy of the backup.
+            workdir = hb.make_workdir("download")
+            need = os.path.getsize(src) + 1024 * 1024
+            if not hb.free_space_ok(workdir, need):
+                return _backup_no_space(need)
+            wrapper = os.path.join(workdir, "wrapper.tar.gz")
+            hb.wrap_encrypted(wrapper, manifest, src)
+            src = wrapper
+        # Opened now, so a rotation while it is being sent cannot take it away.
+        f = open(src, "rb")
+    except OSError:
+        return jsonify({"success": False, "message": _ht('backup.unreadable', _hlang())}), 500
+    finally:
+        if workdir:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    return _send_backup_file(f, f"osmium-backup-{gen_id}.tar.gz")
+
+
+@app.route("/api/backup/<gen_id>", methods=["DELETE"])
+def api_backup_delete(gen_id):
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    if not hb.valid_gen_id(gen_id):
+        return jsonify({"success": False, "message": _ht('backup.notFound', _hlang())}), 404
+    path = hb.gen_dir(hb.STORE_DIR, gen_id)
+    if not os.path.isdir(path):
+        return jsonify({"success": False, "message": _ht('backup.notFound', _hlang())}), 404
+    shutil.rmtree(path, ignore_errors=True)
+    hb.record_history(hb.STORE_DIR, f"delete\t{gen_id}")
+    return jsonify({"success": True, "message": _ht('backup.deleted', _hlang())})
+
+
+@app.route("/api/backup/<gen_id>/restore", methods=["POST"])
+def api_backup_restore(gen_id):
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    if not hb.valid_gen_id(gen_id):
+        return jsonify({"success": False, "message": _ht('backup.notFound', _hlang())}), 404
+    manifest = hb.read_manifest(hb.STORE_DIR, gen_id)
+    if not manifest:
+        return jsonify({"success": False, "message": _ht('backup.notFound', _hlang())}), 404
+    data = request.get_json(silent=True) or {}
+    passphrase = data.get("passphrase") or ""
+    if not _passphrase_ok(passphrase):
+        return jsonify({"success": False, "message": _ht('backup.invalidPassphrase', _hlang())}), 400
+
+    stored_path = hb.archive_path(hb.STORE_DIR, gen_id, manifest)
+    path, workdir = stored_path, None
+    if manifest.get("enc"):
+        # The stored ciphertext has no wrapper; hand open_backup the manifest
+        # by building one on the fly, so both entry points take the same road.
+        # The wrapper lives in its own workdir (on disk: it is a full copy),
+        # which the restore job cleans up itself once it's actually done
+        # reading from it.
+        try:
+            workdir = hb.make_workdir("restore-src")
+            need = os.path.getsize(stored_path) + 1024 * 1024
+            if not hb.free_space_ok(workdir, need):
+                shutil.rmtree(workdir, ignore_errors=True)
+                return _backup_no_space(need)
+            path = os.path.join(workdir, "wrapper.tar.gz")
+            hb.wrap_encrypted(path, manifest, stored_path)
+        except Exception as e:
+            if workdir:
+                shutil.rmtree(workdir, ignore_errors=True)
+            return jsonify({"success": False,
+                            "message": _ht('restore.prepareFailed', _hlang(), err=e)}), 500
+
+    # gen_id: pinned for the length of the restore, so neither the restore's
+    # own safety snapshot nor the weekly timer can rotate it away — an
+    # unencrypted backup is read in place.
+    err = _start_restore(path, passphrase, data.get("categories"), workdir, gen_id=gen_id)
+    if err:
+        if workdir:
+            shutil.rmtree(workdir, ignore_errors=True)
+        return jsonify(err[0]), err[1]
+    return jsonify({"success": True, "started": True}), 202
+
+
+@app.route("/api/backup/settings", methods=["GET", "POST"])
+def api_backup_settings():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    if request.method == "GET":
+        return jsonify(hb.read_settings())
+    data = request.get_json(silent=True) or {}
+    previous = hb.read_settings()
+    # The web admin and the companion send only {"scheduled": …}: a missing
+    # "keep" is the one already saved, not the default (every toggle of the
+    # schedule used to reset it to 5).
+    try:
+        keep = int(data.get("keep") or previous["keep"])
+    except (TypeError, ValueError):
+        keep = previous["keep"]
+    settings = {"scheduled": bool(data.get("scheduled")),
+                "keep": max(1, min(20, keep))}
+    if settings["scheduled"] and not previous["scheduled"] and not hb.passphrase_set():
+        # It would only fail every week: a backup is never made unencrypted.
+        return jsonify({"success": False, "code": "backup.passphraseMissing",
+                        "message": _ht('backup.passphraseMissing', _hlang()),
+                        "scheduled": False, "keep": previous["keep"]}), 409
+
+    def _save(values):
+        os.makedirs(os.path.dirname(hb.SETTINGS_FILE), exist_ok=True)
+        tmp = hb.SETTINGS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(values, f, indent=2)
+        os.replace(tmp, hb.SETTINGS_FILE)
+
+    try:
+        _save(settings)
+    except OSError as e:
+        return jsonify({"success": False, "message": _ht('backup.saveFailed', _hlang(), err=e)}), 500
+    # The units ship in the image (includes.chroot, timer enabled by the
+    # 0400 hook) and in the system bundle; backup.json is what decides, since
+    # hifi-backup-run.py --scheduled exits at once when it says "off". This
+    # flips the timer to match, and on a legacy install 0033-backup-scheduler.sh
+    # re-applies the same choice on every OS update. On an image the symlink
+    # lands in /etc's overlay upper layer, so it survives image updates too.
+    action = "enable" if settings["scheduled"] else "disable"
+    try:
+        r = _run(["systemctl", action, "--now", "hifi-backup.timer"], timeout=30)
+        detail = ""
+        if r.returncode != 0:
+            detail = ((r.stderr or r.stdout or "").strip()[:300]
+                      or f"systemctl {action}: exit {r.returncode}")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        detail = str(e)[:300] or "systemctl"
+    if detail:
+        print(f"[sources] systemctl {action} hifi-backup.timer failed: {detail}")
+        if settings["scheduled"]:
+            # Saying "saved" here is how the weekly backup stayed silently off
+            # on every image install (the unit did not even exist there). Put
+            # the old choice back so what the UI reloads is the truth.
+            try:
+                _save(dict(previous, keep=settings["keep"]))
+            except OSError:
+                pass
+            return jsonify({"success": False, "code": "backup.scheduleFailed",
+                            "message": _ht('backup.scheduleFailed', _hlang(), detail=detail),
+                            "scheduled": previous["scheduled"], "keep": settings["keep"]}), 500
+        # Turning it off cannot silently fail the owner: the worker itself
+        # exits at once when backup.json says "not scheduled".
+    return jsonify({"success": True, **settings})
+
+
+@app.route("/api/restore/status", methods=["GET"])
+def api_restore_status():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    return jsonify(_restore_status())
+
+
+@app.route("/api/restore", methods=["POST"])
+def api_restore():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    workdir = hb.make_workdir("upload")
+    try:
+        parsed = _receive_restore_upload(workdir)
+    except Exception as e:
+        print(f"[sources] restore upload failed: {e}")
+        parsed = _err("msg.saveFailed", 500)
+    if not isinstance(parsed, dict):
+        shutil.rmtree(workdir, ignore_errors=True)
+        return parsed
+    passphrase = parsed["passphrase"]
+    if not _passphrase_ok(passphrase):
+        shutil.rmtree(workdir, ignore_errors=True)
+        return jsonify({"success": False, "message": _ht('backup.invalidPassphrase', _hlang())}), 400
+    categories = [c for c in parsed["categories"].split(",") if c] or None
+
+    err = _start_restore(parsed["upload"], passphrase, categories, workdir)
+    if err:
+        shutil.rmtree(workdir, ignore_errors=True)
+        return jsonify(err[0]), err[1]
+    return jsonify({"success": True, "started": True}), 202
+
+
+def _receive_restore_upload(workdir):
+    """Take the multipart upload of /api/restore straight to disk.
+
+    request.files would hold it to the app-wide 80MB cap and spool it through
+    /tmp (tmpfs, RAM); the old code then also read it whole into memory and
+    wrote it to /run (RAM again). Here every file part goes to its own file in
+    `workdir`, the body is capped at MAX_RESTORE_ARCHIVE_SIZE (plus room for
+    the multipart framing) and at the free space on disk, and the small text
+    fields are held to 1MB. Returns {"upload", "passphrase",
+    "categories"} or a ready error response."""
+    from werkzeug.exceptions import RequestEntityTooLarge
+    from werkzeug.formparser import parse_form_data
+    import inspect
+
+    limit = MAX_RESTORE_ARCHIVE_SIZE + 1024 * 1024
+    length = request.content_length
+    if length is not None and length > limit:
+        return _err("msg.fileTooLarge", 400)
+    if length and not hb.free_space_ok(workdir, length):
+        return _backup_no_space(length)
+
+    parts = []
+
+    def _to_disk(total_content_length=None, content_type=None, filename=None,
+                 content_length=None):
+        part = tempfile.NamedTemporaryFile(dir=workdir, prefix="part-", delete=False)
+        parts.append(part)
+        return part
+
+    # max_form_memory_size also bounds werkzeug's own read buffer (64KB
+    # chunks), so it has to sit well above that; 1MB still keeps the text
+    # fields (a passphrase, a category list) from ever being a memory sink.
+    kwargs = {"stream_factory": _to_disk, "max_content_length": limit,
+              "max_form_memory_size": 1024 * 1024}
+    if "max_form_parts" in inspect.signature(parse_form_data).parameters:
+        kwargs["max_form_parts"] = 16
+    try:
+        try:
+            _stream, form, files = parse_form_data(request.environ, **kwargs)
+        except RequestEntityTooLarge:
+            return _err("msg.fileTooLarge", 400)
+        f = files.get("file")
+        if not f or not getattr(f.stream, "name", None):
+            return _err("msg.noFile", 400)
+        upload = f.stream.name
+        f.stream.flush()
+        if os.path.getsize(upload) > MAX_RESTORE_ARCHIVE_SIZE:
+            return _err("msg.fileTooLarge", 400)
+        return {"upload": upload,
+                "passphrase": form.get("passphrase") or "",
+                "categories": form.get("categories") or ""}
+    finally:
+        # Only the handles: the files stay in `workdir`, which the caller
+        # (or the restore job) removes.
+        for part in parts:
+            try:
+                part.close()
+            except Exception:
+                pass
+
+
+# ─────────────────────────── Room correction (FIR filter) ────────────
+# Lets the user upload a convolution filter (impulse response) generated on a
+# PC with REW/rePhase, for the optional DSP engine's room-correction toggle
+# (Settings → DSP, api_server.py). Only ONE filter is kept at a time, always
+# under the fixed name "room.<ext>" — never a user-supplied filename — so
+# there is no path-traversal surface. The file is applied identically to both
+# channels; api_server.py's _camilla_config_dict() picks it up if present and
+# room_correction is enabled.
+FIR_DIR = "/etc/camilladsp/filters"
+# Extension -> CamillaDSP Conv "type" (both are officially documented formats,
+# not guessed): a WAV impulse response, or a plain text file with one
+# coefficient per line (CamillaDSP's Raw/TEXT format).
+FIR_KINDS = {".wav": "Wav", ".txt": "Raw"}
+# Fixed ext -> filename lookup (not string-built from the ext at request time)
+# so the stored/opened path is always one of these two literal names, never a
+# concatenation of request-derived data.
+FIR_FILENAMES = {".wav": "room.wav", ".txt": "room.txt"}
+FIR_MAX_SIZE = 20 * 1024 * 1024
+
+
+def _fir_current():
+    """Return (path, ext) of the currently stored filter, or (None, None)."""
+    if os.path.isdir(FIR_DIR):
+        for ext, filename in FIR_FILENAMES.items():
+            p = os.path.join(FIR_DIR, filename)
+            if os.path.isfile(p):
+                return p, ext
+    return None, None
+
+
+@app.route("/api/dsp/fir", methods=["GET"])
+def api_dsp_fir_status():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    path, ext = _fir_current()
+    if not path:
+        return jsonify({"present": False})
+    return jsonify({"present": True, "filename": os.path.basename(path),
+                     "kind": FIR_KINDS[ext], "size": os.path.getsize(path)})
+
+
+@app.route("/api/dsp/fir", methods=["POST"])
+def api_dsp_fir_upload():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return _err("msg.noFile", 400)
+    ext = os.path.splitext(f.filename)[1].lower()
+    if ext not in FIR_KINDS:
+        return _err("msg.badFilterFormat", 400)
+    data = f.read(FIR_MAX_SIZE + 1)
+    if len(data) > FIR_MAX_SIZE:
+        return _err("msg.fileTooLarge20", 400)
+    if not data:
+        return _err("msg.fileEmpty", 400)
+    try:
+        os.makedirs(FIR_DIR, exist_ok=True)
+        # Only one filter at a time: clear any previous room.* before writing.
+        for other_filename in FIR_FILENAMES.values():
+            other = os.path.join(FIR_DIR, other_filename)
+            if os.path.isfile(other):
+                os.remove(other)
+        dest = os.path.join(FIR_DIR, FIR_FILENAMES[ext])
+        tmp = dest + ".tmp"
+        with open(tmp, "wb") as out:
+            out.write(data)
+        os.replace(tmp, dest)
+    except Exception as e:
+        print(f"[sources] FIR filter save failed: {e}")
+        return _err("msg.saveFailed", 500)
+    return jsonify({"success": True, "code": "msg.filterUploaded", "message": _m("msg.filterUploaded")})
+
+
+@app.route("/api/dsp/fir", methods=["DELETE"])
+def api_dsp_fir_delete():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    removed = False
+    for filename in FIR_FILENAMES.values():
+        p = os.path.join(FIR_DIR, filename)
+        if os.path.isfile(p):
+            os.remove(p)
+            removed = True
+    return jsonify({"success": True, "removed": removed})
+
+
+# ─────────────────────────── App pairing token ────────────────────────
+# The companion app's DSP controls are a live "control" surface (unlike the
+# FIR/backup/restore endpoints above, which are also reachable from a plain
+# phone browser via the separate sourcesUrl QR and must stay usable from a
+# bare <a href>). To scope DSP control to phones the user has actually
+# paired, the appliance UI (Settings → Phone control) mints a fresh token
+# each time the pairing QR is (re)generated and embeds it in the QR
+# alongside the LMS/API host:port; the app stores it and sends it back as
+# `Authorization: Bearer <token>` on every DSP call. Tokens are persisted
+# (survive a service restart) and a phone's token does not expire while it
+# is kept — re-scanning the QR after a phone has used its token gives the
+# next phone a token of its own, so multiple paired phones can coexist.
+#
+# The QR (and the web admin's embedded sources page) asked for a new token
+# every time it was opened, though, and the list only ever grew. So:
+#   - a token nobody has used yet is handed out again instead of a new one;
+#   - "last_used" is recorded (at most once an hour) when a token opens a
+#     request here, and the list is capped at PAIR_TOKENS_MAX, the ones idle
+#     the longest going first;
+#   - a token minted with {"purpose": "browser"} (a browser session, not a
+#     phone) is reused for a week and expires PAIR_BROWSER_TTL_S after it
+#     was last used, and goes before any phone's when the cap is reached.
+PAIR_TOKENS_FILE = "/etc/hifi-pairing-tokens.json"
+PAIR_TOKENS_MAX = 20
+PAIR_BROWSER_TTL_S = 30 * 86400
+PAIR_BROWSER_REUSE_S = 7 * 86400
+PAIR_USE_WRITE_EVERY_S = 3600
+_pair_lock = threading.Lock()
+
+
+def _load_pair_tokens():
+    try:
+        with open(PAIR_TOKENS_FILE) as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_pair_tokens(tokens):
+    os.makedirs(os.path.dirname(PAIR_TOKENS_FILE), exist_ok=True)
+    tmp = PAIR_TOKENS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(tokens, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, PAIR_TOKENS_FILE)
+
+
+def _pair_ts(value):
+    """Epoch seconds of an ISO timestamp in the token file; 0 if absent."""
+    try:
+        return datetime.fromisoformat(str(value)).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _pair_last_active(t):
+    return max(_pair_ts(t.get("created")), _pair_ts(t.get("last_used")))
+
+
+def _pair_is_browser(t):
+    return t.get("purpose") == "browser"
+
+
+def _prune_pair_tokens(tokens, now):
+    """`tokens` without the expired browser ones and cut to PAIR_TOKENS_MAX,
+    in their original order. Entries that are not tokens at all go too."""
+    live = [t for t in tokens
+            if isinstance(t, dict) and isinstance(t.get("token"), str) and t["token"]
+            and not (_pair_is_browser(t) and now - _pair_last_active(t) > PAIR_BROWSER_TTL_S)]
+    if len(live) > PAIR_TOKENS_MAX:
+        # Phones before browser sessions, then the most recently active.
+        ranked = sorted(live, key=lambda t: (not _pair_is_browser(t), _pair_last_active(t)),
+                        reverse=True)
+        keep = {id(t) for t in ranked[:PAIR_TOKENS_MAX]}
+        live = [t for t in live if id(t) in keep]
+    return live
+
+
+def _reusable_pair_token(tokens, purpose, now):
+    """The newest token a new mint for `purpose` can hand out again, or None.
+    A phone's token only while nobody has used it yet: once a phone has, the
+    next one gets its own. A browser session's for PAIR_BROWSER_REUSE_S after
+    it was minted, so it still has most of its life ahead of it."""
+    for t in reversed(tokens):
+        if _pair_is_browser(t) != (purpose == "browser"):
+            continue
+        if purpose == "browser":
+            return t if now - _pair_ts(t.get("created")) < PAIR_BROWSER_REUSE_S else None
+        return None if t.get("last_used") else t
+    return None
+
+
+@app.route("/api/pair/token", methods=["POST"])
+def api_pair_token():
+    """Mint a pairing token, shown to the user only via the appliance's
+    own QR code (Settings → Phone control). Restricted to localhost: the
+    Electron kiosk UI is the only caller (it runs on the appliance itself),
+    so a token can only ever be minted by someone with physical access to
+    the appliance's screen. Without this check, any device on the LAN could
+    just POST here directly and self-mint a valid token, defeating the whole
+    point of gating DSP control behind pairing.
+
+    A token still unused (or, for {"purpose": "browser"}, a recent browser
+    one) is returned again rather than a new one — see above."""
+    if request.remote_addr not in ("127.0.0.1", "::1"):
+        return _err("msg.notAllowedRemotely", 403)
+    data = request.get_json(silent=True) or {}
+    purpose = "browser" if isinstance(data, dict) and data.get("purpose") == "browser" else "app"
+    now = time.time()
+    with _pair_lock:
+        tokens = _load_pair_tokens()
+        pruned = _prune_pair_tokens(tokens, now)
+        reuse = _reusable_pair_token(pruned, purpose, now)
+        if reuse is not None:
+            if len(pruned) != len(tokens):
+                _save_pair_tokens(pruned)
+            return jsonify({"token": reuse["token"]})
+        token = secrets.token_urlsafe(24)
+        entry = {"token": token, "created": datetime.now(timezone.utc).isoformat()}
+        if purpose == "browser":
+            entry["purpose"] = "browser"
+        _save_pair_tokens(_prune_pair_tokens(pruned + [entry], now))
+    return jsonify({"token": token})
+
+
+@app.route("/api/pair/tokens/revoke_all", methods=["POST"])
+def api_pair_tokens_revoke_all():
+    """Invalidate every paired phone at once. Restricted to localhost for the
+    same reason as minting above: only someone standing at the appliance can
+    nuke every token, so a leaked/stolen token can always be neutralised by
+    walking up to the device and re-pairing, without needing per-token
+    expiry (which would otherwise log out every legitimately paired phone
+    just to bound a theft that may never have happened)."""
+    if request.remote_addr not in ("127.0.0.1", "::1"):
+        return _err("msg.notAllowedRemotely", 403)
+    with _pair_lock:
+        _save_pair_tokens([])
+    return jsonify({"success": True})
+
+
+# Per-IP failed-auth throttle for _require_pair_token(). In-memory only (the
+# service runs single-process/multi-threaded via `threaded=True`, so a
+# lock-guarded dict is enough — no cross-process state needed, and losing it
+# on restart is fine since it exists purely to slow down online guessing).
+_auth_fail_lock = threading.Lock()
+_auth_fail_log = {}  # ip -> list of failure timestamps (monotonic)
+_AUTH_FAIL_WINDOW = 60.0
+_AUTH_FAIL_MAX = 20
+
+
+def _auth_rate_limited(ip):
+    now = time.monotonic()
+    with _auth_fail_lock:
+        fails = [t for t in _auth_fail_log.get(ip, []) if now - t < _AUTH_FAIL_WINDOW]
+        _auth_fail_log[ip] = fails
+        return len(fails) >= _AUTH_FAIL_MAX
+
+
+def _auth_record_failure(ip):
+    with _auth_fail_lock:
+        _auth_fail_log.setdefault(ip, []).append(time.monotonic())
+
+
+def _require_pair_token():
+    """Returns None if the request is exempt (local kiosk UI) or carries a
+    valid pairing token, otherwise a (jsonify(...), status) tuple to return
+    immediately. The Electron kiosk UI on the appliance itself already calls
+    these endpoints from 127.0.0.1 (same machine, no network hop) — only
+    requests arriving over the LAN (the phone app) need a token."""
+    if request.remote_addr in ("127.0.0.1", "::1"):
+        return None
+    ip = request.remote_addr
+    if _auth_rate_limited(ip):
+        return _err("msg.tooManyAttempts", 429)
+    auth = request.headers.get("Authorization", "")
+    token = auth[len("Bearer "):] if auth.startswith("Bearer ") else None
+    if not token:
+        # Fallback for the embedded SPA's plain browser-navigation flows (the
+        # backup download link, restore file input) which can't attach a
+        # custom Authorization header. The SPA embeds the token minted for it
+        # in the QR-carried URL (?token=...) and forwards it here — same
+        # secret, just a different transport, since a plain <a href> click
+        # can't set headers.
+        token = request.args.get("token") or None
+    if not token or not _pair_token_valid(token, time.time()):
+        _auth_record_failure(ip)
+        return _err("msg.badPairToken", 401)
+    return None
+
+
+def _pair_token_valid(token, now):
+    """Is `token` a live pairing token? Records its use as "last_used" (at
+    most once every PAIR_USE_WRITE_EVERY_S, so a phone polling a page does
+    not rewrite /etc on every request) and drops expired browser tokens
+    from the file as it goes."""
+    want = token.encode("utf-8", "surrogatepass")
+    tokens = _load_pair_tokens()
+    match = next((t for t in tokens if isinstance(t, dict) and secrets.compare_digest(
+        str(t.get("token", "")).encode("utf-8", "surrogatepass"), want)), None)
+    if match is None:
+        return False
+    expired = _pair_is_browser(match) and now - _pair_last_active(match) > PAIR_BROWSER_TTL_S
+    if expired or now - _pair_ts(match.get("last_used")) >= PAIR_USE_WRITE_EVERY_S:
+        with _pair_lock:
+            # Again under the lock: a mint or a revoke may have landed since.
+            tokens = _load_pair_tokens()
+            still = False
+            for t in tokens:
+                if isinstance(t, dict) and t.get("token") == match.get("token"):
+                    still = True
+                    if not expired:
+                        t["last_used"] = datetime.fromtimestamp(now, timezone.utc).isoformat()
+            if not still:
+                return False
+            try:
+                _save_pair_tokens(_prune_pair_tokens(tokens, now))
+            except OSError as e:
+                print(f"[sources] pairing tokens not updated: {e}")
+    return not expired
+
+
+# ─────────────────────────── Album and artist information ────────────
+# /api/meta/* (credits from MusicBrainz, texts from Wikipedia) lives in
+# hifi_metadata.py; mounted here so it shares this service's pairing check.
+hmeta.init_app(app, _require_pair_token)
+# /api/library/* (the Library editor: the tags inside the music files) lives in
+# hifi_tags.py. It writes only below the same roots every other file operation
+# here is confined to.
+htags.init_app(app, _require_pair_token, roots=ALLOWED_LOCAL_ROOTS)
+
+
+# ─────────────────────────── DSP status/control proxy ────────────────
+# api_server.py:8000 (root, unauthenticated, exposes reboot/shutdown/network
+# reconfig) is deliberately loopback-only — see the bind comment at the
+# bottom of that file. dsp_status/dsp_set are the one piece of that API the
+# phone companion app needs, so we relay just those two calls through this
+# already-LAN-exposed, already-root service instead of widening api_server's
+# bind address. Unlike the FIR/backup endpoints above, these two require a
+# valid pairing token (see above) since they're control, not just data.
+_API_SERVER_BASE = "http://127.0.0.1:8000"
+
+
+def _proxy_to_api_server(path, method="GET", body=None, timeout=10):
+    # Callers that trigger a full DSP apply pass a longer timeout: applying
+    # now pauses playback, restarts squeezelite/CamillaDSP, waits for the
+    # player to re-register with Lyrion (up to ~10s) and seeks back — easily
+    # past the default 10s, and timing out here made the phone report
+    # "Servizio DSP non raggiungibile" while the apply was in fact succeeding.
+    req = urllib.request.Request(f"{_API_SERVER_BASE}{path}", method=method)
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, data=data, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8")), resp.status
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read().decode("utf-8")), e.code
+        except Exception:
+            # api_server.py didn't return JSON for this error — don't forward
+            # the raw exception text (may contain internal paths/details) to
+            # the caller; log it server-side instead.
+            print(f"[sources] proxy to {path} failed: {e}")
+            return {"success": False, "code": "msg.dspUnavailable", "message": _m("msg.dspUnavailable")}, e.code
+    except Exception as e:
+        print(f"[sources] proxy to {path} unreachable: {e}")
+        return {"success": False, "code": "msg.dspUnreachable", "message": _m("msg.dspUnreachable")}, 502
+
+
+@app.route("/api/dsp/status", methods=["GET"])
+def api_dsp_status_proxy():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    body, status = _proxy_to_api_server("/dsp_status")
+    return jsonify(body), status
+
+
+@app.route("/api/dsp/set", methods=["POST"])
+def api_dsp_set_proxy():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    data = request.get_json(silent=True) or {}
+    body, status = _proxy_to_api_server("/dsp_set", method="POST", body=data, timeout=60)
+    return jsonify(body), status
+
+
+@app.route("/api/dsp/presets", methods=["GET"])
+def api_dsp_presets_proxy():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    body, status = _proxy_to_api_server("/dsp_presets")
+    return jsonify(body), status
+
+
+@app.route("/api/dsp/preset/save", methods=["POST"])
+def api_dsp_preset_save_proxy():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    data = request.get_json(silent=True) or {}
+    body, status = _proxy_to_api_server("/dsp_preset_save", method="POST", body=data)
+    return jsonify(body), status
+
+
+@app.route("/api/dsp/preset/load", methods=["POST"])
+def api_dsp_preset_load_proxy():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    data = request.get_json(silent=True) or {}
+    # Preset load runs a full set_dsp() apply on the appliance — long timeout,
+    # same reasoning as /api/dsp/set above.
+    body, status = _proxy_to_api_server("/dsp_preset_load", method="POST", body=data, timeout=60)
+    return jsonify(body), status
+
+
+@app.route("/api/dsp/preset/rename", methods=["POST"])
+def api_dsp_preset_rename_proxy():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    data = request.get_json(silent=True) or {}
+    body, status = _proxy_to_api_server("/dsp_preset_rename", method="POST", body=data)
+    return jsonify(body), status
+
+
+@app.route("/api/dsp/preset/delete", methods=["POST"])
+def api_dsp_preset_delete_proxy():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    data = request.get_json(silent=True) or {}
+    body, status = _proxy_to_api_server("/dsp_preset_delete", method="POST", body=data)
+    return jsonify(body), status
+
+
+# ─────────────────────────── System / admin proxy ─────────────────────
+# Same rationale as the DSP proxy above: these all live on api_server.py's
+# loopback-only port (system info, SSH toggle, OTA channel + update
+# check/apply/status for each of the 4 update kinds, reboot/shutdown, audio
+# device selection). All require a pairing token except from localhost (the
+# kiosk UI) — see _require_pair_token(). Table-driven to avoid 20 near-
+# identical view functions; each entry is (our path, method, api_server.py
+# path).
+_SYSTEM_PROXY_ROUTES = [
+    ("/api/system/info", "GET", "/system_info"),
+    ("/api/system/ssh", "GET", "/ssh_status"),
+    ("/api/system/ssh", "POST", "/ssh_set"),
+    ("/api/system/ota_channel", "GET", "/ota_channel"),
+    ("/api/system/ota_channel", "POST", "/ota_channel"),
+    ("/api/system/audio_devices", "GET", "/audio_devices"),
+    ("/api/system/audio_device", "POST", "/set_audio_device"),
+    # Display mode (GUI kiosk <-> headless). Lets a paired companion bring a
+    # headless unit back to the on-screen GUI remotely — the only way back when
+    # there is no screen. Non-destructive, so the pairing token alone is enough
+    # (factory reset, which IS destructive, is deliberately NOT proxied here).
+    ("/api/system/display_mode", "GET", "/display_mode"),
+    ("/api/system/display_mode", "POST", "/display_mode"),
+    # UI render resolution (framebuffer downscale + GPU upscale). Same
+    # rationale as above: non-destructive, and worth reaching remotely because
+    # the unit it helps most is the one driving a big TV.
+    ("/api/system/ui_resolution", "GET", "/ui_resolution"),
+    ("/api/system/ui_resolution", "POST", "/ui_resolution"),
+    # Animated VU meter toggle. Same rationale as ui_resolution: no OS action,
+    # but worth reaching remotely because a headless unit can never open the
+    # on-screen Settings to flip it locally.
+    ("/api/system/vu_meter", "GET", "/vu_meter"),
+    ("/api/system/vu_meter", "POST", "/vu_meter"),
+    # Panel refresh rate (native <-> low-power). Same rationale as
+    # ui_resolution: applies live with no OS action, and worth reaching
+    # remotely because the unit it helps most (big TV, weak iGPU) may well be
+    # headless or across the room. Mirrors admin-webui's forwarder.
+    ("/api/system/ui_refresh", "GET", "/ui_refresh"),
+    ("/api/system/ui_refresh", "POST", "/ui_refresh"),
+    # The rest of the web admin's Settings the companion shows too: which
+    # interface runs on the screen, the pointer, whether this device plays at
+    # all, the timezone, the VU meter style and store, and the now-playing
+    # auto-open delay. Same rationale as the display
+    # settings above — none of them can cut the box off the network, lock
+    # anyone out or hand out a login, so the pairing token is enough. Network
+    # addressing, Tailscale, the SSH login, the admin account, factory reset
+    # and the boot-debug flags stay web-admin/on-screen only.
+    ("/api/system/ui_engine", "GET", "/ui_engine"),
+    ("/api/system/ui_engine", "POST", "/ui_engine"),
+    ("/api/system/pointer_status", "GET", "/pointer_status"),
+    ("/api/system/pointer_set", "POST", "/pointer_set"),
+    ("/api/system/player_enabled", "GET", "/player_enabled"),
+    ("/api/system/player_enabled", "POST", "/player_enabled"),
+    ("/api/system/timezone", "GET", "/timezone"),
+    ("/api/system/timezone", "POST", "/timezone"),
+    ("/api/system/timezones", "GET", "/timezones"),
+    ("/api/system/vu_style", "GET", "/vu_style"),
+    ("/api/system/vu_style", "POST", "/vu_style"),
+    ("/api/system/vu_store", "GET", "/vu_store"),
+    ("/api/system/vu_store/check", "POST", "/vu_store/check"),
+    ("/api/system/vu_store/install", "POST", "/vu_store/install"),
+    ("/api/system/vu_store/remove", "POST", "/vu_store/remove"),
+    ("/api/system/vu_store/seen", "POST", "/vu_store/seen"),
+    ("/api/system/nowplaying_autoexpand", "GET", "/nowplaying_autoexpand"),
+    ("/api/system/nowplaying_autoexpand", "POST", "/nowplaying_autoexpand"),
+    ("/api/system/player_name", "GET", "/player_name"),
+    ("/api/system/player_name", "POST", "/player_name"),
+    # Renames BOTH the hostname and the squeezelite/Bluetooth player name
+    # together (api_server.py's set_device_name) — the companion app's
+    # rename field uses this instead of player_name above, so a rename from
+    # the phone stays in sync with the kiosk/web-admin ones.
+    ("/api/system/device_name", "GET", "/device_name"),
+    ("/api/system/device_name", "POST", "/device_name"),
+    ("/api/system/lms_role", "GET", "/lms_role"),
+    ("/api/system/lms_role", "POST", "/lms_role"),
+    ("/api/system/discover_lms", "GET", "/discover_lms"),
+    ("/api/system/updates/app/check", "GET", "/app_update/check"),
+    ("/api/system/updates/app/apply", "POST", "/app_update/apply"),
+    ("/api/system/updates/app/status", "GET", "/app_update/status"),
+    ("/api/system/updates/system/check", "GET", "/system_update/check"),
+    ("/api/system/updates/system/apply", "POST", "/system_update/apply"),
+    ("/api/system/updates/system/status", "GET", "/system_update/status"),
+    ("/api/system/updates/os/check", "GET", "/os_update/check"),
+    ("/api/system/updates/os/apply", "POST", "/os_update/apply"),
+    ("/api/system/updates/os/status", "GET", "/os_update/status"),
+    # Sequenced multi-component update (server-side plan). The companion used to
+    # chain the three components itself over the network, which made it the most
+    # fragile of the three clients — every restart the update performs dropped
+    # its connection mid-sequence.
+    ("/api/system/updates/apply_all", "POST", "/update/apply_all"),
+    ("/api/system/updates/status", "GET", "/update/status"),
+    ("/api/system/updates/dismiss", "POST", "/update/dismiss"),
+    ("/api/system/updates/lyrion/check", "GET", "/lyrion_update/check"),
+    ("/api/system/updates/lyrion/apply", "POST", "/lyrion_update/apply"),
+    ("/api/system/updates/lyrion/status", "GET", "/lyrion_update/status"),
+    ("/api/system/lyrion_channel", "GET", "/lyrion_channel"),
+    ("/api/system/lyrion_channel", "POST", "/lyrion_channel"),
+    # Deliberately NOT exposed here: /shell_account. It mints a Linux user with
+    # full sudo, and the only thing authenticating a companion request is the
+    # pairing token — a stolen one must not be able to create a root-capable
+    # login. The companion reads the SSH login name from /ssh_status (which
+    # carries `account`) and sends the user to the touchscreen or web admin to
+    # create or change it.
+    ("/api/system/reboot", "POST", "/reboot"),
+    ("/api/system/shutdown", "POST", "/shutdown"),
+]
+
+_SLOW_SYSTEM_PROXY_POSTS = {"/ui_engine", "/player_enabled", "/timezone"}
+
+
+def _make_system_proxy_view(remote_path, method):
+    # Starting an update is slower than the default budget: api_server resolves
+    # the release and downloads a checksum sidecar per component before it can
+    # write the plan. Timing out here would tell the phone the update failed
+    # while the appliance was in fact about to start it — and the phone would
+    # then fall back to driving the sequence itself, on top of a running plan.
+    # Switching the screen's interface or turning the player on/off each wait
+    # on a systemctl call of up to 30s over there.
+    if "apply" in remote_path:
+        timeout = 90
+    elif method == "POST" and remote_path in _SLOW_SYSTEM_PROXY_POSTS:
+        timeout = 45
+    else:
+        timeout = 10
+    def view():
+        denied = _require_pair_token()
+        if denied:
+            return denied
+        data = request.get_json(silent=True) if method == "POST" else None
+        body, status = _proxy_to_api_server(remote_path, method=method, body=data,
+                                            timeout=timeout)
+        return jsonify(body), status
+    return view
+
+
+for _local_path, _method, _remote_path in _SYSTEM_PROXY_ROUTES:
+    app.add_url_rule(
+        _local_path,
+        endpoint=f"system_proxy_{_method}_{_local_path}",
+        view_func=_make_system_proxy_view(_remote_path, _method),
+        methods=[_method],
+    )
+
+
+def _fs_usage(path):
+    """Total/free bytes of the filesystem holding `path`, or None when it
+    can't be stat'd (not mounted, gone). Reported per source by /api/sources
+    so "Active sources" can show how much room a disk still has without the
+    UI needing a second endpoint per row."""
+    if not path:
+        return None
+    try:
+        st = os.statvfs(path)
+    except (OSError, ValueError):
+        return None
+    total = st.f_blocks * st.f_frsize
+    if total <= 0:
+        return None
+    return {"total": total, "free": st.f_bavail * st.f_frsize}
+
+
+# ───────────────────── SMB: plain-language failures ──────────────────
+# "Add a network folder" used to hand the owner mount.cifs' own stderr:
+# NT_STATUS_LOGON_FAILURE as the whole error message tells a normal person
+# nothing, and it is the single most common thing to get wrong (a typo in the
+# password). Everything below maps the raw text onto a sentence that says
+# what to fix; the raw text still travels as `detail`, which the UI keeps
+# behind a "technical details" line for us.
+def _smb_reason(text):
+    """i18n key for a mount.cifs/smbclient failure, or None when unrecognised."""
+    t = (text or "").upper()
+    pairs = (
+        ("msg.smbBadCredentials", ("LOGON_FAILURE", "ACCESS_DENIED", "WRONG_PASSWORD",
+                                   "NO_SUCH_USER", "PERMISSION DENIED", "MOUNT ERROR(13)")),
+        ("msg.smbPasswordExpired", ("PASSWORD_EXPIRED", "PASSWORD_MUST_CHANGE")),
+        ("msg.smbAccountLocked", ("ACCOUNT_LOCKED_OUT", "ACCOUNT_DISABLED")),
+        ("msg.smbNoSuchShare", ("BAD_NETWORK_NAME", "OBJECT_NAME_NOT_FOUND",
+                                "OBJECT_PATH_NOT_FOUND", "MOUNT ERROR(2)")),
+        ("msg.smbUnreachable", ("HOST_UNREACHABLE", "NETWORK_UNREACHABLE", "CONNECTION_REFUSED",
+                                "CONNECTION_RESET", "IO_TIMEOUT", "TIMED OUT", "HOST_DOWN",
+                                "NO ROUTE TO HOST", "HOST IS DOWN", "UNABLE TO CONNECT",
+                                "COULD NOT RESOLVE", "NAME_NOT_FOUND", "MOUNT ERROR(112)")),
+        ("msg.smbProtocol", ("PROTOCOL NEGOTIATION", "NT_STATUS_INVALID_NETWORK_RESPONSE",
+                             "NOT_SUPPORTED")),
+    )
+    for code, needles in pairs:
+        if any(n in t for n in needles):
+            return code
+    return None
+
+
+def _err_detail(key, status, detail="", message="", **fields):
+    """_err() plus the raw tool output. Same shape as every other failure here
+    (stable `code` + already-translated `message`), with `detail` as an extra
+    the UI may show or hide -- it must never be the only thing on screen."""
+    body = {"success": False, "code": key,
+            "message": message or _m(key, detail=detail, **fields)}
+    if detail:
+        body["detail"] = detail[:800]
+    return jsonify(body), status
+
+
+def _smb_reachable(server, timeout=5):
+    """Fast TCP probe on 445. mount.cifs against a host that silently drops
+    packets can wedge the mount() syscall in uninterruptible sleep for
+    minutes -- see mount_smb() -- and smbclient is no better, so every path
+    that talks to a server checks here first."""
+    try:
+        with socket.create_connection((server, 445), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+# ───────────────────── SMB discovery (network scan) ──────────────────
+# Four empty boxes (server, share, user, password) are unusable by someone who
+# does not already know what an SMB share is. These helpers find the file
+# servers on the LAN the way every other music player does, so the wizard can
+# offer a list to tap and keep typing as the fallback.
+#
+# Three independent probes merged by IP, because no single one sees every kind
+# of server:
+#   * mDNS/Bonjour (avahi-browse)  — NAS boxes, macOS, Linux
+#   * NetBIOS broadcast (nmblookup) — Windows and Samba
+#   * a TCP-445 sweep of our own /24 — everything else, including hosts with
+#     NetBIOS off and mDNS filtered, which is most modern NAS boxes
+_SMB_SCAN_MAX_HOSTS = 512    # ceiling on the sweep; a /24 is 254
+_smb_scan = {"state": "idle", "progress": 0, "hosts": [], "finished": 0.0, "tools": {}}
+_smb_scan_lock = threading.Lock()
+
+
+def _have(cmd):
+    return shutil.which(cmd) is not None
+
+
+def _smb_scan_set(**fields):
+    with _smb_scan_lock:
+        _smb_scan.update(fields)
+
+
+def _smb_scan_add(ip, name="", source=""):
+    """Merge one finding into the live list. Every probe calls this as it goes,
+    so the wizard's poll sees hosts appear one by one instead of waiting for
+    the slowest probe to finish."""
+    if not ip:
+        return
+    with _smb_scan_lock:
+        for h in _smb_scan["hosts"]:
+            if h["ip"] == ip:
+                if name and not h.get("name"):
+                    h["name"] = name
+                if source and source not in h["sources"]:
+                    h["sources"].append(source)
+                return
+        _smb_scan["hosts"].append({"ip": ip, "name": name or "",
+                                   "sources": [source] if source else []})
+
+
+def _unescape_avahi(name):
+    """avahi-browse -p escapes its fields: "\\032" for a space, "\\." for a dot."""
+    out = re.sub(r"\\(\d{3})", lambda m: chr(int(m.group(1))), name or "")
+    return out.replace("\\.", ".").strip()
+
+
+def _smb_probe_mdns():
+    """=;eth0;IPv4;NAS;_smb._tcp;local;nas.local;192.168.0.10;445;"..." """
+    if not _have("avahi-browse"):
+        return
+    try:
+        r = _run(["avahi-browse", "-rpt", "_smb._tcp"], timeout=12)
+    except Exception:
+        return
+    for line in (r.stdout or "").splitlines():
+        if not line.startswith("="):
+            continue
+        f = line.split(";")
+        if len(f) < 8 or f[2] != "IPv4":
+            continue
+        _smb_scan_add(f[7].strip(), _unescape_avahi(f[3]), "mdns")
+
+
+def _smb_probe_netbios():
+    """What Windows itself uses to fill its "Network" folder. nmblookup comes
+    with the samba package, already installed for our own shares."""
+    if not _have("nmblookup"):
+        return
+    try:
+        r = _run(["nmblookup", "-S", "--", "*"], timeout=12)
+    except Exception:
+        return
+    ip = ""
+    for line in (r.stdout or "").splitlines():
+        m = re.match(r"^(\d+\.\d+\.\d+\.\d+)\s+\*<00>", line)
+        if m:
+            ip = m.group(1)
+            _smb_scan_add(ip, "", "netbios")
+            continue
+        m = re.match(r"^\s+(\S+)\s+<20>", line)   # <20> = the file-server service
+        if m and ip:
+            _smb_scan_add(ip, m.group(1), "netbios")
+
+
+def _scan_targets():
+    """(our own addresses, addresses to sweep).
+
+    Anything wider than a /24 is narrowed to the /24 around our own address: a
+    /16 is 65k probes, which is a port scanner, not a setup wizard."""
+    selves, targets = set(), []
+    for link in _run_json(["ip", "-j", "-4", "addr", "show"], timeout=5) or []:
+        if link.get("link_type") == "loopback":
+            continue
+        for a in link.get("addr_info") or []:
+            addr = a.get("local") or ""
+            if not addr or addr.startswith("127.") or addr.startswith("169.254."):
+                continue
+            selves.add(addr)
+            try:
+                net = ipaddress.ip_network(
+                    "%s/%d" % (addr, max(int(a.get("prefixlen") or 24), 24)), strict=False)
+            except ValueError:
+                continue
+            for host in net.hosts():
+                if len(targets) >= _SMB_SCAN_MAX_HOSTS:
+                    break
+                targets.append(str(host))
+    return selves, [t for t in dict.fromkeys(targets) if t not in selves]
+
+
+def _smb_probe_ports(targets):
+    """A plain TCP connect on 445 -- the only probe that finds a server with
+    NetBIOS off and mDNS filtered."""
+    done = [0]
+    total = max(1, len(targets))
+
+    def probe(ip):
+        try:
+            with socket.create_connection((ip, 445), timeout=0.6):
+                _smb_scan_add(ip, "", "port")
+        except OSError:
+            pass
+        # Racy on purpose: the only consumer is the progress bar, and a lock
+        # per probe would cost more than the number it produces is worth.
+        done[0] += 1
+        if done[0] % 8 == 0:
+            _smb_scan_set(progress=min(90, 20 + int(70 * done[0] / total)))
+
+    with ThreadPoolExecutor(max_workers=64) as pool:
+        list(pool.map(probe, targets))
+
+
+def _smb_resolve_names():
+    """Put a name on the hosts only the port sweep found: NetBIOS first (it is
+    the name the owner sees on their own PC), then reverse DNS, else nothing
+    and the UI shows the address."""
+    with _smb_scan_lock:
+        unnamed = [h["ip"] for h in _smb_scan["hosts"] if not h.get("name")]
+    if not unnamed:
+        return
+
+    def name_of(ip):
+        if _have("nmblookup"):
+            try:
+                r = _run(["nmblookup", "-A", ip], timeout=4)
+                for line in (r.stdout or "").splitlines():
+                    m = re.match(r"^\s+(\S+)\s+<20>", line)
+                    if m:
+                        return m.group(1)
+            except Exception:
+                pass
+        try:
+            return socket.gethostbyaddr(ip)[0].split(".")[0]
+        except OSError:
+            return ""
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        for ip, name in zip(unnamed, pool.map(name_of, unnamed)):
+            if name:
+                _smb_scan_add(ip, name, "")
+
+
+def _smb_scan_worker():
+    try:
+        _smb_scan_set(state="running", progress=5)
+        selves, targets = _scan_targets()
+        _smb_probe_mdns()
+        _smb_scan_set(progress=15)
+        _smb_probe_netbios()
+        _smb_scan_set(progress=20)
+        _smb_probe_ports(targets)
+        _smb_scan_set(progress=92)
+        # This appliance shares its own music over SMB, so it answers all three
+        # probes. Offering someone their own player as the NAS they are looking
+        # for is the fastest way to lose them.
+        with _smb_scan_lock:
+            _smb_scan["hosts"] = [h for h in _smb_scan["hosts"] if h["ip"] not in selves]
+        _smb_resolve_names()
+    except Exception as e:
+        print(f"[sources] smb scan failed: {e}")
+    finally:
+        _smb_scan_set(state="done", progress=100, finished=time.time())
+
+
+def _smb_cred_file(username, password):
+    """Credentials in a 0600 temp file. NEVER on the command line: argv is
+    readable through /proc, so -U user%pass would put the NAS password in
+    `ps aux` for every account on the box. Same reason mount_smb() writes a
+    credentials= file instead of using -o.
+
+    In /run, which is RAM: /tmp is on the disk here, and a deleted file's
+    blocks still hold the password until something overwrites them."""
+    run_dir = "/run" if os.access("/run", os.W_OK) else None
+    fd, path = tempfile.mkstemp(prefix="hifi-smb-cred-", dir=run_dir)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(f"username={username}\npassword={password}\n")
+    return path
+
+
+def _smb_login(src):
+    """(username, password) of a stored SMB source. Sealed on disk (see
+    hifi_backup.seal_login); a clear pair is only still there when it could
+    not be sealed yet, and is used as it is rather than failing the mount.
+    Raises hb.LoginUnreadable when the sealed login cannot be opened."""
+    if src.get("login"):
+        return hb.open_login(src["login"])
+    return src.get("username") or "", src.get("password") or ""
+
+
+def _seal_stored_logins():
+    """Seal any clear login in the state file: the ones written before this
+    existed, and the ones an encrypted backup brings back."""
+    with _lock:
+        state = load_state()
+        if any(isinstance(s, dict) and ("username" in s or "password" in s)
+               for s in state.get("sources", [])):
+            save_state(state)
+
+
+def _smbclient(args, username, password, timeout=25):
+    cred = None
+    try:
+        cmd = ["smbclient"]
+        if username:
+            cred = _smb_cred_file(username, password)
+            cmd += ["-A", cred]
+        else:
+            cmd += ["-N"]
+        return _run(cmd + args, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 1, "", "connection timed out")
+    finally:
+        if cred:
+            try:
+                os.remove(cred)
+            except OSError:
+                pass
+
+
+# Shares nobody browsing for music ever wants, plus the "$" convention for
+# hidden/administrative ones.
+_SMB_HIDDEN_SHARES = {"ipc$", "print$", "admin$", "netlogon", "sysvol"}
+
+
+def _smb_list_shares(server, username, password):
+    """(shares, code, detail) -- `code` is None on success, otherwise an i18n
+    key. msg.smbNeedsAuth is the interesting one: it means the server refused
+    an anonymous listing, which is what tells the wizard to ask for a
+    password instead of declaring failure."""
+    if not _have("smbclient"):
+        return [], "msg.smbNoClient", ""
+    # -g is the machine-readable listing ("Disk|Music|comment"), far steadier
+    # than parsing the column layout. The NT1 retry is for old NAS boxes and
+    # Windows shares still on SMB1, the same ladder mount_smb() walks down.
+    last = ""
+    for extra in ([], ["-m", "NT1"]):
+        r = _smbclient(["-L", server, "-g"] + extra, username, password)
+        out = r.stdout or ""
+        if r.returncode == 0 and "|" in out:
+            shares = []
+            for line in out.splitlines():
+                parts = line.split("|")
+                if len(parts) < 2 or parts[0].strip() != "Disk":
+                    continue
+                name = parts[1].strip()
+                if not name or name.endswith("$") or name.lower() in _SMB_HIDDEN_SHARES:
+                    continue
+                shares.append({"name": name,
+                               "comment": parts[2].strip() if len(parts) > 2 else ""})
+            return shares, None, ""
+        last = ((r.stderr or "") + out).strip()
+        code = _smb_reason(last)
+        if code == "msg.smbBadCredentials":
+            # Anonymous refused is not a failure: it is the server asking who
+            # we are, and the wizard has a step for exactly that.
+            return [], ("msg.smbNeedsAuth" if not username else code), last
+        if code and code != "msg.smbProtocol":
+            return [], code, last
+    return [], "msg.smbListFailed", last
+
+
+# ───────────────────── File manager (web admin) ──────────────────────
+# The sources page can add a folder, but there was no way to tidy what is
+# inside one without mounting the share from a PC. These helpers are the small
+# file manager behind the web admin's Files view -- list, new folder, rename,
+# copy, move, delete -- confined to the very same roots the folder pickers
+# already offer, and never on top of a source's own mountpoint.
+_FILE_JOBS = {}
+_file_jobs_lock = threading.Lock()
+_FILE_JOB_TTL = 600          # a finished job stays readable this long
+_FILE_MAX_ITEMS = 500        # per request; the UI selects, it does not script
+
+
+def _fs_readonly(path):
+    """True when the filesystem holding `path` is mounted read-only -- a NAS
+    added as a read-only source, or the image's own squashfs. os.access() is
+    not enough on its own: root passes the permission check and then the write
+    fails at the syscall."""
+    try:
+        return bool(os.statvfs(path).f_flag & os.ST_RDONLY)
+    except OSError:
+        return False
+
+
+def _writable(path):
+    return not _fs_readonly(path) and os.access(path, os.W_OK)
+
+
+def _protected_paths():
+    """Paths the file manager must never rename, move or delete: the allowed
+    roots themselves, every source's own mountpoint/path, and the playlist
+    folder. Deleting one of these does not remove a source, it only breaks
+    it -- and an empty mountpoint left behind looks exactly like a NAS that
+    lost its music."""
+    out = {os.path.realpath(r) for r in _BROWSE_ROOTS}
+    out.add(os.path.realpath(DEFAULT_PLAYLISTDIR))
+    try:
+        for s in load_state().get("sources") or []:
+            for p in (s.get("mountpoint"), s.get("path")):
+                if p:
+                    out.add(os.path.realpath(p))
+    except Exception:
+        pass
+    return out
+
+
+# Entries owned by one of these are this server's own doing (it runs as root,
+# and so does the rip worker): they are handed to the share account. Anybody
+# else's (Lyrion's, a user's over SSH) keep their owner and take the group.
+_ROOT_UIDS = (0,)
+# Where ownership is ours to fix: the local disks and the playlist folder. A
+# network share carries no ownership of ours; a FAT-like disk gets uid and
+# gid from its mount options (and refuses chown, which hand_over ignores).
+_OWNED_ROOTS = (DATA_MUSIC_ROOT, INTERNAL_MOUNT_ROOT, USB_ADOPTED_ROOT, DEFAULT_PLAYLISTDIR)
+
+
+def _claim_for_share(path):
+    """Hand a file or folder the file manager just made to the share account
+    and group -- hifimusic:hifishare, folders 2775, files 0664, the shape of
+    a published folder (hifi_cdrip.hand_over). This server runs as root, and
+    what root leaves behind plays fine but cannot be renamed or deleted from
+    a PC over the network: with the forced Samba user neither the owner nor
+    the group bits let it in. Somebody else's entry keeps its owner and takes
+    the group, so the two never fight over it (see SHARE_GROUP)."""
+    uid, gid = _ensure_samba_uid_gid()
+    if not uid or not gid:
+        return
+    hcd.hand_over(path, (uid, gid), from_uids=_ROOT_UIDS)
+
+
+def _ownership_ours(path):
+    """Whether `path` lies where ownership is ours to put right: a local disk,
+    the playlist folder or a folder published over the network -- not a
+    network share."""
+    roots = list(_OWNED_ROOTS)
+    try:
+        roots += [s["path"] for s in load_state().get("sources", [])
+                  if s.get("type") == "local" and s.get("samba") and s.get("path")]
+    except Exception:
+        pass
+    return _under_roots(path, roots) is not None
+
+
+# The top level of the file manager is the allowed roots themselves. Showing
+# them as raw paths ("/mnt/hifi-sources") is the sort of thing this whole
+# redesign is against, so the ones we own get a name in the owner's language.
+# The `kind` is what tells the two look-alikes apart on screen: "System disk"
+# is the appliance's OWN storage (a folder on the data partition, a
+# few gigabytes, the one shared over SMB), while "Second disk" is only the
+# place extra disks get mounted -- so the first is answered with how much room
+# is left and the second with how many disks are actually there. Named
+# side by side with nothing else, they read as the same thing.
+_ROOT_LABELS = (
+    (DATA_MUSIC_ROOT, "files.rootMusic", "music"),
+    (MOUNT_ROOT, "files.rootNetwork", "network"),
+    (INTERNAL_MOUNT_ROOT, "files.rootInternal", "internal"),
+    (USB_ADOPTED_ROOT, "files.rootUsb", "usb"),
+    (DEFAULT_PLAYLISTDIR, "files.rootPlaylists", "playlists"),
+    ("/home", "files.rootHome", "home"),
+)
+
+
+def _root_kind(path):
+    real = os.path.realpath(path)
+    for root, _key, kind in _ROOT_LABELS:
+        if os.path.realpath(root) == real:
+            return kind
+    return "other"
+
+
+def _root_entry(path):
+    """One card of the file manager's first screen.
+
+    Free space only for the appliance's own music folder: the playlist folder
+    lives on that same partition, so reporting it there would print the very
+    same number twice and put the two back to being indistinguishable. The
+    mount roots get a count instead -- their filesystem is a tmpfs whose size
+    says nothing about the disks mounted under it."""
+    kind = _root_kind(path)
+    entry = {"name": _root_label(path), "path": path, "dir": True,
+             "size": 0, "mtime": 0, "kind": kind}
+    if kind == "music":
+        entry["usage"] = _fs_usage(path)
+    else:
+        try:
+            entry["count"] = sum(1 for e in os.scandir(path) if not e.name.startswith("."))
+        except OSError:
+            entry["count"] = 0
+    return entry
+
+
+def _root_label(path):
+    real = os.path.realpath(path)
+    for root, key, _kind in _ROOT_LABELS:
+        if os.path.realpath(root) == real:
+            return _m(key)
+    return os.path.basename(real) or real
+
+
+def _safe_name(name):
+    """A single path component the user typed. Rejects separators, the dot
+    entries and leading dots (which would make the result invisible in every
+    listing, including this one), and control characters: a line break in a
+    folder name ended up in smb.conf once the folder was published."""
+    n = (name or "").strip()
+    if not n or len(n) > 255 or "/" in n or _CONTROL_CHARS.search(n) or n.startswith("."):
+        return None
+    return n
+
+
+def _unique_name(path):
+    """"Album (2)" rather than a silent overwrite: there is no undo here, and
+    losing a folder of FLACs to a name clash is not a recoverable mistake."""
+    if os.path.isdir(path):
+        base, ext = path, ""
+    else:
+        base, ext = os.path.splitext(path)
+    for n in range(2, 1000):
+        cand = f"{base} ({n}){ext}"
+        if not os.path.lexists(cand):
+            return cand
+    return f"{base} ({secrets.token_hex(4)}){ext}"
+
+
+def _tree_size(path):
+    try:
+        if os.path.islink(path):
+            return os.lstat(path).st_size
+        if not os.path.isdir(path):
+            return os.path.getsize(path)
+    except OSError:
+        return 0
+    total = 0
+    for dirpath, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, f))
+            except OSError:
+                pass
+    return total
+
+
+def _file_job_new(op):
+    jid = secrets.token_hex(8)
+    now = time.time()
+    with _file_jobs_lock:
+        for k in [k for k, v in _FILE_JOBS.items()
+                  if v.get("finished") and now - v["finished"] > _FILE_JOB_TTL]:
+            _FILE_JOBS.pop(k, None)
+        _FILE_JOBS[jid] = {"id": jid, "op": op, "state": "running", "progress": 0,
+                           "current": "", "total": 0, "done": 0, "code": "",
+                           "detail": "", "finished": 0.0, "skipped": 0}
+    return jid
+
+
+def _file_job_set(jid, **fields):
+    with _file_jobs_lock:
+        job = _FILE_JOBS.get(jid)
+        if job:
+            job.update(fields)
+
+
+def _copy_file_budgeted(src, dst, budget):
+    """shutil.copy2() in 1 MiB steps, each one counted against the system
+    disk's reserve (hifi_diskguard): one big file must not be the one that
+    fills the disk either. A file stopped half way is removed."""
+    try:
+        with open(src, "rb") as fi, open(dst, "wb") as fo:
+            while True:
+                chunk = fi.read(1024 * 1024)
+                if not chunk:
+                    break
+                fo.write(chunk)
+                budget.add(len(chunk))
+    except BaseException:
+        try:
+            os.remove(dst)
+        except OSError:
+            pass
+        raise
+    shutil.copystat(src, dst)
+
+
+def _copy_tree(src, dst, bump, budget=None, exists="keep", skipped=None):
+    """Recursive copy that reports as it goes. shutil.copytree() would be
+    shorter but gives no progress, and copying a 200 GB library with a frozen
+    bar looks exactly like a hang.
+
+    Folders that are already there are merged into. A file that is already
+    there is left alone with exists="skip" ("only what is missing": counted in
+    `skipped`, a list of one int) and overwritten otherwise."""
+    if os.path.isdir(src) and not os.path.islink(src):
+        os.makedirs(dst, exist_ok=True)
+        _claim_for_share(dst)
+        for name in sorted(os.listdir(src)):
+            _copy_tree(os.path.join(src, name), os.path.join(dst, name), bump, budget, exists, skipped)
+        return
+    if exists == "skip" and os.path.lexists(dst):
+        if skipped is not None:
+            skipped[0] += 1
+        try:
+            bump(os.path.getsize(src), os.path.basename(dst))
+        except OSError:
+            bump(0, os.path.basename(dst))
+        return
+    if budget is not None and budget.active and os.path.isfile(src) and not os.path.islink(src):
+        _copy_file_budgeted(src, dst, budget)
+    else:
+        shutil.copy2(src, dst, follow_symlinks=False)
+    _claim_for_share(dst)
+    try:
+        bump(os.path.getsize(dst), os.path.basename(dst))
+    except OSError:
+        bump(0, os.path.basename(dst))
+
+
+def _merge_move(src, dst, bump, budget, exists, skipped):
+    """Move `src` into an existing `dst`, file by file: what is not there yet
+    is moved, what is there already is left where it was (exists="skip") or
+    replaced; folders emptied on the way are removed."""
+    if os.path.isdir(src) and not os.path.islink(src):
+        os.makedirs(dst, exist_ok=True)
+        _claim_for_share(dst)
+        for name in sorted(os.listdir(src)):
+            _merge_move(os.path.join(src, name), os.path.join(dst, name), bump, budget, exists, skipped)
+        try:
+            os.rmdir(src)
+        except OSError:
+            pass                  # something was skipped and stays behind
+        return
+    if os.path.lexists(dst) and exists == "skip":
+        skipped[0] += 1
+        try:
+            bump(os.path.getsize(src), os.path.basename(dst))
+        except OSError:
+            bump(0, os.path.basename(dst))
+        return
+    try:
+        os.replace(src, dst)
+        _claim_for_share(dst)
+        bump(os.path.getsize(dst), os.path.basename(dst))
+    except OSError:
+        _copy_tree(src, dst, bump, budget, "replace")
+        os.remove(src)
+
+
+def _file_worker(jid, op, paths, dest, exists="keep"):
+    """One copy/move/delete job. Runs in a thread because a move across
+    filesystems (NAS -> internal disk) is a full copy, and the request would
+    otherwise time out long before it finished.
+
+    `exists` says what happens when the destination already has an entry with
+    the same name: "keep" both (the new one gets a free name), "skip" what is
+    already there (folders are merged, existing files left alone) or
+    "replace" it (folders merged, existing files overwritten)."""
+    counted = op in ("copy", "move")
+    sizes = {p: _tree_size(p) for p in paths} if counted else {}
+    total = sum(sizes.values()) if counted else len(paths)
+    _file_job_set(jid, total=total)
+    state = {"done": 0}
+    budget = hdg.Budget(dest) if counted and dest else None
+    if counted and dest:
+        # Make sure it fits before copying a byte. On the system disk this keeps
+        # the reserve free; on any other disk (the second disk, a USB stick) it
+        # is a plain free-space check -- without one, a copy too big for the
+        # second disk started and gave no warning at all (issue #118).
+        # What actually grows the destination disk: everything a copy writes,
+        # and what a move brings from another disk (a move within it only
+        # renames).
+        try:
+            dest_dev = os.stat(dest).st_dev
+        except OSError:
+            dest_dev = None
+        def grows(p):
+            if op == "copy":
+                return True
+            try:
+                return os.stat(p).st_dev != dest_dev
+            except OSError:
+                return True
+        try:
+            hdg.check_any(dest, sum(n for p, n in sizes.items() if grows(p)))
+        except hdg.NoRoom as e:
+            _file_job_set(jid, state="error", code="disk.noRoom", need=e.need, room=e.room,
+                          reserve=e.reserve, finished=time.time())
+            return
+
+    skipped = [0]
+
+    def bump(n, name):
+        state["done"] += n
+        _file_job_set(jid, done=state["done"], current=name, skipped=skipped[0],
+                      progress=min(99, int(100 * state["done"] / total)) if total else 99)
+
+    try:
+        for p in paths:
+            name = os.path.basename(p.rstrip("/"))
+            target = os.path.join(dest, name) if dest else ""
+            merge = bool(target) and exists != "keep" and os.path.lexists(target)
+            if target and os.path.lexists(target) and not merge:
+                target = _unique_name(target)
+            if op == "copy":
+                _copy_tree(p, target, bump, budget, exists, skipped)
+            elif op == "move" and merge:
+                _merge_move(p, target, bump, budget, exists, skipped)
+            elif op == "move":
+                try:
+                    os.rename(p, target)      # same filesystem: instant
+                    _claim_for_share(target)
+                    bump(_tree_size(target), name)
+                except OSError:
+                    # Crossing filesystems (EXDEV) or a busy mount: copy, then
+                    # remove the original only once the copy is complete.
+                    _copy_tree(p, target, bump, budget)
+                    if os.path.isdir(p) and not os.path.islink(p):
+                        shutil.rmtree(p, ignore_errors=True)
+                    else:
+                        os.remove(p)
+            else:
+                if os.path.isdir(p) and not os.path.islink(p):
+                    shutil.rmtree(p)
+                else:
+                    os.remove(p)
+                bump(1, name)
+        _file_job_set(jid, state="done", progress=100, current="", skipped=skipped[0])
+    except hdg.NoRoom as e:
+        # stopped at the reserve: the file half way is gone, the originals
+        # of a move are still where they were
+        _file_job_set(jid, state="error", code="disk.noRoomStopped", need=e.need, room=e.room,
+                      reserve=e.reserve)
+    except OSError as e:
+        _file_job_set(jid, state="error", code="msg.fileOpFailed",
+                      detail=_oserror_detail(e))
+    except Exception as e:
+        _file_job_set(jid, state="error", code="msg.fileOpFailed", detail=str(e)[:200])
+    finally:
+        _file_job_set(jid, finished=time.time())
+        # Anything the owner just moved around may be inside a media folder,
+        # and Lyrion has no idea files changed under it -- see
+        # _lyrion_wait_and_rescan()'s docstring for why nothing rescans by
+        # itself here.
+        try:
+            _lyrion_rescan()
+        except Exception:
+            pass
+
+
+# ─────────────────────────── HTTP API ───────────────────────────────
+@app.route("/api/sources", methods=["GET"])
+def api_list():
+    # Previously exempt ("read-only, no secrets") — but source names/paths/SMB
+    # server+username are still information disclosure to any device that can
+    # merely reach port 8080 on the LAN, so this now requires the same pairing
+    # token as everything else. Loopback (Electron kiosk, and the webui:443
+    # proxy's own forwarded requests — see webui_server.py's SECURITY comment
+    # on _forward_to()) and a valid ?token=/companion app remain exempt/allowed
+    # via _require_pair_token() itself.
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    # Lyrion is asked before taking _lock, and under it only state is
+    # touched: the kiosk polls this every few seconds, and with a NAS switched
+    # off the stat() calls below used to keep _lock for minutes. Mounted or
+    # not comes from the mount table; usage and "does the folder exist" on a
+    # network share are bounded probes (see _bounded_probe()).
+    current = _lyrion_mediadirs()
+    with _lock:
+        state = load_state()
+        if current and _sync_from_lyrion(state, current):
+            save_state(state)
+    table = _mount_table()
+    out = []
+    for s in state.get("sources", []):
+        item = dict(s)
+        item.pop("password", None)
+        item.pop("smbpassword", None)
+        item.pop("username", None)
+        item.pop("login", None)
+        t = s.get("type")
+        if t == "smb":
+            item["mounted"] = _mount_depth(s.get("mountpoint", ""), table) > 0
+            refused = None if item["mounted"] else _smb_auth_blocked(s)
+            if refused:
+                # The boot-time remount stopped at the first refused login;
+                # this says why the share is not there.
+                item["mount_error"] = {"code": refused[0], "message": _m(refused[0])}
+        elif t in ("internal", "usb"):
+            item["mounted"] = _mount_depth(s.get("mountpoint", ""), table) > 0
+            item["share"] = s.get("share")
+        else:
+            item["exists"] = bool(_fs_probe(os.path.isdir, s.get("path", ""), False, table))
+        if item.get("mounted") or item.get("exists"):
+            item["usage"] = _fs_probe(_fs_usage, s.get("mountpoint") or s.get("path"), None,
+                                      table, network=(t == "smb"))
+        out.append(item)
+    return jsonify({"sources": out, "paths": current_paths(state)})
+
+
+def _format_watcher():
+    """Background thread: when the format job finishes, adopt the new partition."""
+    deadline = time.monotonic() + 15 * 60
+    while time.monotonic() < deadline:
+        try:
+            if not os.path.exists(FORMAT_STATUS):
+                time.sleep(2)
+                continue
+            with open(FORMAT_STATUS) as f:
+                st = json.load(f)
+            state = st.get("state")
+            if state in ("done", "error", "idle"):
+                if state == "done":
+                    _auto_adopt_formatted(st)
+                break
+        except Exception as e:
+            print(f"[sources] format watcher error: {e}")
+        time.sleep(2)
+
+
+def _auto_adopt_formatted(st):
+    device = st.get("partition")
+    partuuid = st.get("partuuid")
+    fstype = (st.get("fstype") or "").lower()
+    label = st.get("label") or "Musica"
+    if not device or not partuuid or fstype not in ("ext4", "exfat"):
+        return
+    # Re-read lsblk to get the fresh partition details.
+    data = _lsblk_full() or {}
+    part = None
+    for dev in data.get("blockdevices", []):
+        for p in dev.get("children") or []:
+            if p.get("partuuid") == partuuid or p.get("path") == device:
+                part = p
+                break
+        if part:
+            break
+    if not part:
+        return
+
+    share = _share_name(label)
+    mountpoint = os.path.join(INTERNAL_MOUNT_ROOT,
+                              _slug(label) + "-" + partuuid[:8])
+    src = {
+        "id": _slug("internal", share),
+        "type": "internal",
+        "name": f"{label} (interno)",
+        "partuuid": partuuid,
+        "fsuuid": part.get("uuid"),
+        "fstype": fstype,
+        "label": label,
+        "model": (part.get("model") or "").strip(),
+        "mountpoint": mountpoint,
+        "share": share,
+    }
+    ok, msg = mount_internal(src)
+    if not ok:
+        print(f"[sources] auto-adopt mount failed: {msg}")
+        return
+    with _lock:
+        state = load_state()
+        state["sources"] = [s for s in state["sources"] if s.get("id") != src["id"]]
+        state["sources"].append(src)
+        save_state(state)
+        regen_samba_shares()
+    # Mark status as adopted so the UI can show success.
+    try:
+        with open(FORMAT_STATUS) as f:
+            st = json.load(f)
+        st["adopted"] = True
+        st["source_id"] = src["id"]
+        st["share"] = share
+        with open(FORMAT_STATUS, "w") as f:
+            json.dump(st, f)
+    except Exception:
+        pass
+    _lyrion_push_live(add_paths=[src["mountpoint"]])
+
+
+def _under_roots(path, roots):
+    """Resolve `path` and confine it to one of `roots`. Returns the resolved
+    realpath if it is one of the roots or sits below one, otherwise None.
+    The root itself is handed back as the root (our own constant), a deeper
+    path only once the prefix check has passed -- so what comes out of here
+    is never the caller's string, which is what makes it safe to use on disk."""
+    path = os.path.realpath(path)
+    for root in roots:
+        root = os.path.realpath(root)
+        if path == root:
+            return root
+        if path.startswith(root + os.sep):
+            return path
+    return None
+
+
+def _local_path_allowed(path):
+    """Resolve `path` and confine it to an allow-listed media root. Returns the
+    resolved realpath if allowed, otherwise None. Shared by api_add_local
+    (fresh user input) and the restore-time re-validation of a restored
+    hifi-sources.json (untrusted archive content) — both must apply the exact
+    same confinement before the path is ever touched on disk or handed to
+    Lyrion as a media directory."""
+    return _under_roots(path, ALLOWED_LOCAL_ROOTS)
+
+
+_UNANSWERED = object()
+
+
+def _local_path_quick(path, table=None):
+    """_local_path_allowed() that never waits on a network share whose server
+    is gone: on a network filesystem the resolution runs through
+    _bounded_probe(), and when that does not answer the path as written is
+    confined instead (lexically, against the same roots)."""
+    if not _on_network_fs(path, table):
+        return _local_path_allowed(path)
+    got = _bounded_probe(_local_path_allowed, path, _UNANSWERED)
+    if got is not _UNANSWERED:
+        return got
+    p = os.path.normpath(os.path.abspath(path))
+    for root in ALLOWED_LOCAL_ROOTS:
+        r = os.path.normpath(root)
+        if p == r or p.startswith(r.rstrip("/") + "/"):
+            return p
+    return None
+
+
+@app.route("/api/sources/local", methods=["POST"])
+def api_add_local():
+    """Add a rootfs folder as a `local` source. With `samba: true`, also
+    turn it into a network-writable Samba share (same ownership/mode
+    treatment ext4 internal disks get -- see _mount_adopted_disk()) so
+    music can be copied onto the appliance over the network instead of
+    needing SSH/a USB stick -- the folder is created if it doesn't exist
+    yet, since the whole point is often to make a fresh empty share to
+    upload into."""
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    data = request.get_json(silent=True) or {}
+    path = (data.get("path") or "").strip()
+    samba = bool(data.get("samba"))
+    if not path:
+        return _err("msg.pathMissing", 400)
+    # The appliance's own playlist folder is the one exception to the
+    # confinement, exactly as in api_playlistdir_set(): it lives under /var/lib
+    # (ours, not user-picked) so it is outside ALLOWED_LOCAL_ROOTS on purpose,
+    # but the folder picker offers it — _BROWSE_ROOTS includes it — and an
+    # owner who wants to copy playlists onto the box from a PC has to be able
+    # to publish it. Refusing it here is what produced "it pops up as a
+    # possible location but selecting it says the folder is not available".
+    # Either way what goes on is our own constant or the confined path, never
+    # the request's string.
+    is_playlistdir = os.path.realpath(path) == os.path.realpath(DEFAULT_PLAYLISTDIR)
+    if is_playlistdir:
+        path = DEFAULT_PLAYLISTDIR
+    else:
+        path = _local_path_allowed(path)
+        if not path:
+            return _err("msg.pathNotAllowed", 400)
+        # Entries already saved this way are left as they are; only adding a
+        # new one is refused.
+        if _on_ram_fs(path):
+            return _err("msg.folderInRam", 400)
+    # A folder name with a line break in it (made over SSH or from a PC) is
+    # refused outright; to be shared, the path must also be one smb.conf
+    # cannot misread (_smb_conf_problem(); regen_samba_shares() checks again).
+    if _CONTROL_CHARS.search(path) or (samba and _smb_conf_problem("x", path)):
+        return _err("msg.unsafeFolderName", 400)
+    if not os.path.isdir(path):
+        if not samba:
+            return _err("msg.folderMissing", 400, path=path)
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError as e:
+            return _err("msg.mountFailed", 400, detail=_oserror_detail(e))
+
+    with _lock:
+        state = load_state()
+        # The same folder again replaces its own entry (and keeps its id);
+        # another folder with the same name gets an id of its own.
+        same = next((s for s in state["sources"] if _same_local_path(s, path)), None)
+        sid = same["id"] if same else _free_source_id(
+            state["sources"], _slug("local", os.path.basename(path.rstrip("/"))), path)
+        src = {"id": sid, "type": "local", "name": path, "path": path}
+        if is_playlistdir:
+            # Publishing the playlist folder is not the same as adding a music
+            # folder: Lyrion already reads playlists from it through the
+            # `playlistdir` pref, and handing it over as a media directory too
+            # would have it scan the same files a second time. current_paths()
+            # honours this flag, so the entry stays out of mediadirs for good
+            # (including the restart-based apply path) instead of being pushed
+            # once and silently dropped on the next Apply.
+            src["media"] = False
+        if samba:
+            uid, gid = _ensure_samba_uid_gid()
+            try:
+                os.chown(path, uid, gid)
+                os.chmod(path, 0o2775)
+            except Exception as e:
+                print(f"[sources] chown/chmod for shared local folder {path} failed: {e}")
+            existing = next((s for s in state["sources"] if s.get("id") == sid), None)
+            src["samba"] = True
+            src["share"] = (existing or {}).get("share") or _share_name(os.path.basename(path.rstrip("/")))
+        state["sources"] = [s for s in state["sources"] if s.get("id") != sid]
+        # Publishing is the only thing the playlist folder can be added FOR
+        # (it is never a music folder), so picking it with sharing off means
+        # "stop sharing it", not "keep a row that does nothing".
+        if not (is_playlistdir and not samba):
+            state["sources"].append(src)
+        save_state(state)
+        # Always regenerate, not just when samba=True now: re-adding the
+        # same path with the box unchecked must also drop a share it had
+        # from a previous add.
+        regen_samba_shares()
+    if not is_playlistdir:
+        _lyrion_push_live(add_paths=[path])
+    return jsonify({"success": True})
+
+
+# What the folder picker may browse: the roots a picked folder can actually
+# end up under (see _local_path_allowed()) plus the appliance's own default
+# playlist folder, which api_playlistdir_set() accepts on its own.
+_BROWSE_ROOTS = ALLOWED_LOCAL_ROOTS + (DEFAULT_PLAYLISTDIR,)
+# What the file manager shows and may touch. Deliberately shorter than
+# _BROWSE_ROOTS: /home holds the appliance's own accounts (hifi, and whatever
+# the wizard made for SSH), nobody keeps their music there, and offering it
+# beside "Music on this player" only made the owner wonder which of the two
+# was theirs. The folder pickers keep the full list, so a library that really
+# does live under a home can still be ADDED as a source -- it just isn't one
+# of the places this file manager opens on.
+_FILE_ROOTS = tuple(r for r in _BROWSE_ROOTS if r != "/home")
+
+
+def _file_path_allowed(path):
+    """Confine a file-manager path to _FILE_ROOTS. Separate from
+    _local_path_allowed() on purpose: what the manager will not show, it must
+    not touch either -- a path it hides but still deletes is worse than one it
+    simply does not offer."""
+    if not path or not isinstance(path, str):
+        return None
+    return _under_roots(path, _FILE_ROOTS)
+
+
+def _file_entry_allowed(path):
+    """_file_path_allowed() for an entry the manager is about to act ON --
+    delete, rename, move, copy -- rather than look inside. The folder holding
+    it is resolved and confined; the last component is kept as it is. Resolving
+    that too would hand the operation to whatever a symlink points at: deleting
+    a link to an album deleted the album and left the link behind."""
+    if not path or not isinstance(path, str):
+        return None
+    path = path.rstrip("/")
+    name = os.path.basename(path)
+    parent = _file_path_allowed(os.path.dirname(path)) if name not in ("", ".", "..") else None
+    if not parent:
+        # A root itself (its parent is outside every root) is still named the
+        # way it always was, so the protected-path refusal stays the one the
+        # owner sees; a link standing in for a root gets nothing.
+        full = _file_path_allowed(path)
+        return full if full and not os.path.islink(path) else None
+    return os.path.join(parent, name)
+
+
+@app.route("/api/local/browse", methods=["GET"])
+def api_browse_local():
+    """List immediate subdirectories under a path -- powers the "Add local
+    folder" picker's file-browser UI, a folder picker rather than a
+    free-text path box. Confined to _BROWSE_ROOTS: anything outside them
+    would be refused by api_add_local()/api_mkdir_local()/
+    api_playlistdir_set() anyway, so the picker only shows what can be
+    picked. With no ?path= (or one outside the roots) the listing is the
+    roots themselves, as a virtual top level. Distinct from
+    api_browse_subpath(): that one browses under an existing source's own
+    mountpoint; this one has no source yet."""
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    rel = (request.args.get("path") or "").strip()
+    cand = _under_roots(rel, _BROWSE_ROOTS) if rel else None
+    if cand is None:
+        roots = sorted({r for r in _BROWSE_ROOTS if os.path.isdir(r)})
+        return jsonify({"path": "/", "parent": None, "dirs": roots})
+    if not os.path.isdir(cand):
+        return _err("msg.folderMissing", 400, path=rel)
+    try:
+        dirs = sorted(
+            e.path for e in os.scandir(cand)
+            if e.is_dir(follow_symlinks=False) and not e.name.startswith(".")
+        )
+    except OSError:
+        dirs = []
+    parent = os.path.dirname(cand.rstrip("/")) or "/"
+    if parent == cand:
+        parent = None  # already at /, nowhere further up
+    return jsonify({"path": cand, "parent": parent, "dirs": dirs})
+
+
+@app.route("/api/local/mkdir", methods=["POST"])
+def api_mkdir_local():
+    """Create a new subfolder inside an ALLOWED_LOCAL_ROOTS-confined path --
+    the picker's "new folder" action, for making a fresh empty folder to
+    share/upload into rather than only picking among what already exists."""
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    data = request.get_json(silent=True) or {}
+    parent = (data.get("path") or "").strip()
+    name = (data.get("name") or "").strip()
+    if not parent or not name or "/" in name or name in (".", ".."):
+        return _err("msg.pathNotAllowed", 400)
+    if _CONTROL_CHARS.search(name):
+        # A line break in a folder name ended up in smb.conf once the folder
+        # was published, and the rest of the name became configuration.
+        return _err("msg.badName", 400)
+    parent_ok = _local_path_allowed(parent)
+    if not parent_ok or not os.path.isdir(parent_ok):
+        return _err("msg.folderMissing", 400, path=parent)
+    target = _local_path_allowed(os.path.join(parent_ok, name))
+    if not target:
+        return _err("msg.pathNotAllowed", 400)
+    if _on_ram_fs(target):
+        return _err("msg.folderInRam", 400)
+    try:
+        os.makedirs(target, exist_ok=True)
+    except OSError as e:
+        return _err("msg.mountFailed", 400, detail=_oserror_detail(e))
+    # Made by root: hand it over, or nothing can be put into it from a PC.
+    _claim_for_share(target)
+    return jsonify({"success": True, "path": target})
+
+
+@app.route("/api/sources/smb", methods=["POST"])
+def api_add_smb():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    data = request.get_json(silent=True) or {}
+    server = (data.get("server") or "").strip().strip("/")
+    share = (data.get("share") or "").strip().strip("/")
+    if not server or not share:
+        return _err("msg.smbFieldsRequired", 400)
+    name = data.get("name") or f"{server}/{share}"
+    sid, mountpoint = _smb_slot(load_state().get("sources", []), server, share)
+    # Opt-in, backward-compatible: callers that don't ask to defer (the kiosk's
+    # SourcesManager.jsx today) keep the old behaviour of handing the whole
+    # mount straight to Lyrion. The wizard and webui's Settings -> Sources
+    # pass this so they can let the user pick "whole share" vs. a subfolder
+    # (via the existing api_browse_subpath()/api_set_subpath() picker) between
+    # the mount succeeding and anything reaching Lyrion.
+    defer = bool(data.get("defer_activation"))
+    src = {
+        "id": sid,
+        "type": "smb",
+        "name": name,
+        "server": server,
+        "share": share,
+        "mountpoint": mountpoint,
+        # On by default — see mount_smb()'s docstring. A caller that asks
+        # for read-only still gets it, and so does a share the server only
+        # lets us read (mount_smb() flips this back itself).
+        "rw": bool(data.get("rw", True)),
+    }
+    if defer:
+        # current_paths() (and so both _lyrion_push_live() and the restart-
+        # based apply_to_lyrion() safety net) skips any source flagged like
+        # this, so it can't reach Lyrion by any path until api_set_subpath()
+        # clears the flag -- see current_paths()'s docstring.
+        src["pending_activation"] = True
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    if username or password:
+        # Sealed before anything else: a login that cannot be stored safely
+        # is refused, never kept in the clear. Adding a share again is also
+        # how an owner puts back a login that no longer opens (same id, so
+        # the entry below replaces the old one).
+        try:
+            src["login"] = hb.seal_login(username, password)
+        except hb.LoginUnreadable as e:
+            print(f"[sources] cannot seal the login of {server}/{share}: {e}")
+            return _err("msg.smbLoginNotStored", 500)
+    ok, msg, detail = mount_smb(src)
+    if not ok:
+        return _err_detail(_smb_reason(detail) or "msg.mountFailed", 400,
+                           detail=detail, message=msg)
+    # The login works now: whatever the boot-time remount recorded against
+    # this source no longer applies.
+    _smb_auth_failed.pop(sid, None)
+    with _lock:
+        state = load_state()
+        state["sources"] = [s for s in state["sources"] if s.get("id") != sid]
+        state["sources"].append(src)
+        save_state(state)
+    if not defer:
+        _lyrion_push_live(add_paths=[src["mountpoint"]])
+    return jsonify({"success": True, "message": msg, "id": sid,
+                    "mountpoint": src["mountpoint"], "pending_activation": defer})
+
+
+def _smb_slot(sources, server, share):
+    """(id, mountpoint) for //server/share. The share already in the list
+    keeps its own (adding it again is how a new password is put in). A new
+    one gets the id and mountpoint of the old format unless another share
+    already has them: "Musica" and "Musica è", "Rock Pop" and "Rock_Pop"
+    make the same slug, and the second add then found the first share's
+    mountpoint "already mounted" and showed its music under the new name.
+    Two different shares never share a mountpoint."""
+    same = next((s for s in sources if _same_smb_share(s, server, share)
+                 and s.get("id") and s.get("mountpoint")), None)
+    if same:
+        return same["id"], same["mountpoint"]
+    base = _slug("smb", server, share)
+    sid = _free_source_id(sources, base, f"//{server}/{share}")
+    folder = _slug(server, share) + sid[len(base):]
+    taken = {_mp_key(s["mountpoint"]) for s in sources if s.get("mountpoint")}
+    mountpoint = os.path.join(MOUNT_ROOT, folder)
+    n = 2
+    while _mp_key(mountpoint) in taken:
+        mountpoint = os.path.join(MOUNT_ROOT, f"{folder}-{n}")
+        n += 1
+    return sid, mountpoint
+
+
+def _host_ok(value):
+    """A host name or IP literal and nothing else: this string becomes both an
+    argv element and half of a UNC path, so it is stricter than _field_ok()."""
+    v = (value or "").strip()
+    return bool(re.fullmatch(r"[A-Za-z0-9._:-]{1,255}", v)) and not v.startswith("-")
+
+
+@app.route("/api/sources/smb/discover", methods=["POST"])
+def api_smb_discover_start():
+    """Start the LAN scan. Returns immediately: the sweep takes seconds, and
+    the wizard shows its results filling in live via the GET below."""
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    with _smb_scan_lock:
+        if _smb_scan["state"] == "running":
+            return jsonify({"success": True, "state": "running"})
+        _smb_scan.update({"state": "running", "progress": 0, "hosts": [], "finished": 0.0,
+                          # What the UI may offer: without smbclient it must
+                          # ask the owner to type the folder name instead of
+                          # listing what the server has. Both tools arrive with
+                          # the image, so a device that has not been updated
+                          # yet still gets the host list, just not the shares.
+                          "tools": {"shares": _have("smbclient"),
+                                    "mdns": _have("avahi-browse")}})
+    threading.Thread(target=_smb_scan_worker, daemon=True).start()
+    return jsonify({"success": True, "state": "running"}), 202
+
+
+@app.route("/api/sources/smb/discover", methods=["GET"])
+def api_smb_discover_status():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    with _smb_scan_lock:
+        hosts = [dict(h) for h in _smb_scan["hosts"]]
+        state, progress = _smb_scan["state"], _smb_scan["progress"]
+        tools = dict(_smb_scan.get("tools") or {})
+    # Named hosts first: an owner looking for "SYNOLOGY" should not have to
+    # read past four bare addresses to find it.
+    hosts.sort(key=lambda h: (not h.get("name"), (h.get("name") or "").lower(),
+                              [int(p) for p in h["ip"].split(".")]))
+    return jsonify({"success": True, "state": state, "progress": progress,
+                    "hosts": hosts, "tools": tools})
+
+
+@app.route("/api/sources/smb/shares", methods=["POST"])
+def api_smb_shares():
+    """The shared folders one server offers. `needs_auth` in the reply is the
+    wizard's cue to ask for a username and password rather than to give up."""
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    data = request.get_json(silent=True) or {}
+    server = (data.get("server") or "").strip().strip("/")
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    if not _host_ok(server):
+        return _err("msg.smbFieldsRequired", 400)
+    if not _field_ok(username) or not _password_ok(password):
+        return _err("msg.smbFieldsRequired", 400)
+    if not _smb_reachable(server):
+        return _err("msg.smbUnreachable", 400, server=server)
+    shares, code, detail = _smb_list_shares(server, username, password)
+    if code == "msg.smbNeedsAuth":
+        return jsonify({"success": True, "needs_auth": True, "shares": []})
+    if code:
+        return _err_detail(code, 400, detail=detail)
+    return jsonify({"success": True, "needs_auth": False, "shares": shares})
+
+
+@app.route("/api/sources/smb/test", methods=["POST"])
+def api_smb_test():
+    """Try one share without mounting it, so the wizard can fail on the step
+    that caused the problem (wrong password on the password step) instead of
+    on a final "mount failed" the owner cannot place."""
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    data = request.get_json(silent=True) or {}
+    server = (data.get("server") or "").strip().strip("/")
+    share = (data.get("share") or "").strip().strip("/")
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    if not _host_ok(server) or not share:
+        return _err("msg.smbFieldsRequired", 400)
+    for value in (share, username):
+        if not _field_ok(value):
+            return _err("msg.smbFieldsRequired", 400)
+    if not _password_ok(password):
+        return _err("msg.smbFieldsRequired", 400)
+    if not _smb_reachable(server):
+        return _err("msg.smbUnreachable", 400, server=server)
+    if not _have("smbclient"):
+        # No client to probe with: let the caller go straight to the mount,
+        # which is the check of last resort anyway.
+        return jsonify({"success": True, "checked": False})
+    r = _smbclient(["//%s/%s" % (server, share), "-c", "ls"], username, password)
+    if r.returncode == 0:
+        return jsonify({"success": True, "checked": True})
+    raw = ((r.stderr or "") + (r.stdout or "")).strip()
+    return _err_detail(_smb_reason(raw) or "msg.smbTestFailed", 400, detail=raw)
+
+
+# ── File manager ────────────────────────────────────────────────────
+# Deliberately under /api/local/, next to the folder picker's own browse and
+# mkdir: webui_server.py already forwards that whole prefix for the web admin
+# (/api/system/local/<path:rest>) and for the paired phone
+# (_SOURCES_FWD_PREFIXES), so none of this needs a new door opening in the
+# proxy. The same reason the ops below are all POST: that forward carries
+# GET and POST only.
+@app.route("/api/local/list", methods=["GET"])
+def api_files_list():
+    """Files *and* folders under one path, with sizes -- api_browse_local()
+    lists directories only, because a folder picker has no use for the rest."""
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    rel = (request.args.get("path") or "").strip()
+    cand = _under_roots(rel, _FILE_ROOTS) if rel else None
+    if cand is None:
+        roots = [_root_entry(r)
+                 for r in sorted({os.path.realpath(x) for x in _FILE_ROOTS
+                                  if os.path.isdir(x)})]
+        return jsonify({"success": True, "path": "", "parent": "", "writable": False,
+                        "protected": True, "entries": roots})
+    if not os.path.isdir(cand):
+        return _err("msg.folderMissing", 400, path=rel)
+    # What an earlier version of this server (new folders, copies, moves) or
+    # of the rip worker left root-owned becomes the share account's as the
+    # owner browses past it -- the rest of the backlog is for
+    # _repair_shared_ownership() at start. Local disks only.
+    fix_owner = _ownership_ours(cand)
+    entries = []
+    try:
+        for e in os.scandir(cand):
+            if e.name.startswith("."):
+                continue        # dotfiles are never the music someone came for
+            try:
+                st = e.stat(follow_symlinks=False)
+                is_dir = e.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            if fix_owner and st.st_uid in _ROOT_UIDS:
+                _claim_for_share(os.path.join(cand, e.name))
+            entries.append({"name": e.name, "path": os.path.join(cand, e.name),
+                            "dir": is_dir, "size": 0 if is_dir else st.st_size,
+                            "mtime": int(st.st_mtime)})
+    except OSError as e:
+        return _err_detail("msg.fileOpFailed", 400, detail=_oserror_detail(e))
+    entries.sort(key=lambda x: (not x["dir"], x["name"].lower()))
+    parent = os.path.dirname(cand.rstrip("/")) or "/"
+    if parent == cand or _under_roots(parent, _FILE_ROOTS) is None:
+        parent = ""             # at a root: one step up is the virtual top level
+    return jsonify({"success": True, "path": cand, "parent": parent,
+                    "writable": _writable(cand),
+                    # In memory: nothing new goes in, and the folder pickers
+                    # will not take it.
+                    "ram": _on_ram_fs(cand),
+                    "protected": os.path.realpath(cand) in _protected_paths(),
+                    "entries": entries})
+
+
+def _file_op_targets(data, need_dest):
+    """Validate one copy/move/delete request. Returns (paths, dest, error) --
+    every path resolved and confined by _local_path_allowed(), nothing that is
+    a source's own mountpoint, and a destination that can really be written."""
+    raw = data.get("paths")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list) or not raw or len(raw) > _FILE_MAX_ITEMS:
+        return None, None, _err("msg.pathMissing", 400)
+    protected = _protected_paths()
+    paths = []
+    for item in raw:
+        p = _file_entry_allowed(item)
+        if not p or not os.path.lexists(p):
+            return None, None, _err("msg.pathNotAllowed", 400)
+        # A link is only ever the link: removing one that points at a
+        # mountpoint takes nothing away from the mountpoint.
+        if not os.path.islink(p) and os.path.realpath(p) in protected:
+            return None, None, _err("msg.fileProtected", 400)
+        paths.append(p)
+    dest = None
+    if need_dest:
+        dest = _file_path_allowed(data.get("dest") or "")
+        if not dest or not os.path.isdir(dest):
+            return None, None, _err("msg.folderMissing", 400,
+                                    path=str(data.get("dest") or ""))
+        if not _writable(dest):
+            return None, None, _err("msg.fileReadOnly", 400)
+        # What is already in a folder in memory can still be deleted or moved
+        # out of it; nothing new goes in.
+        if _on_ram_fs(dest):
+            return None, None, _err("msg.folderInRam", 400)
+        for p in paths:
+            # Copying a folder into itself never terminates.
+            if dest == p or dest.startswith(p + os.sep):
+                return None, None, _err("msg.fileIntoItself", 400)
+    else:
+        for p in paths:
+            if not _writable(os.path.dirname(p)):
+                return None, None, _err("msg.fileReadOnly", 400)
+    return paths, dest, None
+
+
+def _files_start(op):
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    data = request.get_json(silent=True) or {}
+    paths, dest, err = _file_op_targets(data, need_dest=op in ("copy", "move"))
+    if err:
+        return err
+    if op == "move":
+        for p in paths:
+            if not _writable(os.path.dirname(p)):
+                return _err("msg.fileReadOnly", 400)   # the original has to go too
+    exists = data.get("exists") if data.get("exists") in ("keep", "skip", "replace") else "keep"
+    jid = _file_job_new(op)
+    threading.Thread(target=_file_worker, args=(jid, op, paths, dest, exists), daemon=True).start()
+    return jsonify({"success": True, "job": jid}), 202
+
+
+@app.route("/api/local/copy", methods=["POST"])
+def api_files_copy():
+    return _files_start("copy")
+
+
+@app.route("/api/local/move", methods=["POST"])
+def api_files_move():
+    return _files_start("move")
+
+
+@app.route("/api/local/delete", methods=["POST"])
+def api_files_delete():
+    # POST, not DELETE: the web admin's forwarder carries GET and POST only.
+    return _files_start("delete")
+
+
+@app.route("/api/local/rename", methods=["POST"])
+def api_files_rename():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    data = request.get_json(silent=True) or {}
+    src = _file_entry_allowed((data.get("path") or "").strip())
+    name = _safe_name(data.get("name"))
+    if not src or not os.path.lexists(src):
+        return _err("msg.pathNotAllowed", 400)
+    if not name:
+        return _err("msg.badName", 400)
+    if not os.path.islink(src) and os.path.realpath(src) in _protected_paths():
+        return _err("msg.fileProtected", 400)
+    parent = os.path.dirname(src)
+    if not _writable(parent):
+        return _err("msg.fileReadOnly", 400)
+    target = _file_path_allowed(os.path.join(parent, name))
+    if not target:
+        return _err("msg.pathNotAllowed", 400)
+    if os.path.lexists(target):
+        return _err("msg.fileExists", 400, name=name)
+    try:
+        os.rename(src, target)
+    except OSError as e:
+        return _err_detail("msg.fileOpFailed", 400, detail=_oserror_detail(e))
+    _claim_for_share(target)
+    _lyrion_rescan()
+    return jsonify({"success": True, "path": target})
+
+
+@app.route("/api/local/job", methods=["GET"])
+def api_files_job():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    with _file_jobs_lock:
+        job = dict(_FILE_JOBS.get(request.args.get("id") or "") or {})
+    if not job:
+        return _err("msg.jobNotFound", 404)
+    job["success"] = True
+    if job.get("code", "").startswith("disk."):
+        e = hdg.NoRoom(job.get("current") or "", job.get("need", 0), job.get("room", 0), job.get("reserve", 0))
+        job["message"] = hdg.message(e, _req_lang(), stopped=job["code"] == "disk.noRoomStopped")
+    elif job.get("code"):
+        job["message"] = _m(job["code"])
+    return jsonify(job)
+
+
+@app.route("/api/sources/<sid>/rw", methods=["POST"])
+def api_set_smb_rw(sid):
+    """Flip an SMB source's stored read-only/read-write flag. Takes effect on
+    the next reboot rather than live: CIFS doesn't support changing
+    uid=/gid=/file_mode=/dir_mode= with an `-o remount`, so making this live
+    would mean unmount+remount while Lyrion (or an in-progress CD rip) may
+    still have the old mount open. A lazy `umount -l` doesn't break already-
+    open reads, but anything that opens a *new* file during the swap window
+    hits a dead mountpoint, an in-flight rip's write handles stay bound to
+    the old (soon fully torn down) CIFS session instead of the new one — a
+    real risk of silently losing ripped tracks — and a library scan that
+    catches the transient failure can misread it as "file gone" and prune
+    the track from the database. None of that is worth risking for a
+    rarely-toggled setting, so this just persists the new flag; boot's
+    remount_all_retry() re-mounts every SMB source from state fresh, picking
+    it up with mount_smb()'s current option set."""
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    data = request.get_json(silent=True) or {}
+    rw = bool(data.get("rw"))
+    with _lock:
+        state = load_state()
+        src = next((s for s in state["sources"] if s.get("id") == sid and s.get("type") == "smb"), None)
+        if not src:
+            return _err("msg.sourceNotFound", 404)
+        if _smb_wants_rw(src) == rw:
+            return jsonify({"success": True, "message": _m("msg.noChange")})
+        src["rw"] = rw
+        save_state(state)
+    return jsonify({"success": True, "message": _m("msg.rebootRequired")})
+
+
+@app.route("/api/sources/<sid>/subpath", methods=["POST"])
+def api_set_subpath(sid):
+    """Set (or clear, with an empty subpath) the subfolder under a
+    smb/internal/usb source's mount that Lyrion should actually scan, instead
+    of always the whole mount. This is what lets Music Sources fully replace
+    Lyrion's own "pick a folder" step in its setup wizard: the subfolder
+    choice now lives in state we control (current_paths() applies it) and
+    survives the next Apply instead of being silently reset to the mount
+    root.
+
+    Also doubles as the confirm step for a deferred add (api_add_smb()'s
+    defer_activation): a source still flagged pending_activation has never
+    reached Lyrion at all, so an empty subpath here means "the whole share,
+    thanks" rather than "no change" -- either way, this is what first clears
+    the flag and lets current_paths() see it."""
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    data = request.get_json(silent=True) or {}
+    subpath = (data.get("subpath") or "").strip("/")
+    # The folder is checked before taking _lock, from a snapshot of the
+    # state: on a share whose server is gone every stat() waits for minutes,
+    # and it must not hold up every other route meanwhile.
+    snap = next((s for s in load_state().get("sources", []) if s.get("id") == sid), None)
+    if not snap:
+        return _err("msg.sourceNotFound", 404)
+    if snap.get("type") not in ("smb", "internal", "usb"):
+        return _err("msg.subpathNotSupported", 400)
+    mountpoint = snap.get("mountpoint")
+    if subpath and mountpoint:
+        table = _mount_table()
+        network = snap.get("type") == "smb"
+        root = _resolve_mountpoint(mountpoint, table)
+        joined = os.path.join(root, subpath)
+
+        def confine(p, _root=root):
+            return _under_roots(p, (_root,))
+        cand = _fs_probe(confine, joined, _UNANSWERED, table, network)
+        if cand is _UNANSWERED:
+            # No answer from the server: the path as written, confined.
+            cand = os.path.normpath(joined)
+            if cand != root and not cand.startswith(root + os.sep):
+                cand = None
+        if cand is None:
+            return _err("msg.pathNotAllowed", 400)
+        if cand == root:
+            subpath = ""  # "." and friends: the mount itself, i.e. no subpath
+        elif _mount_depth(mountpoint, table) and not _fs_probe(os.path.isdir, cand, False, table, network):
+            return _err("msg.folderMissing", 400, path=cand)
+    with _lock:
+        state = load_state()
+        src = next((s for s in state["sources"] if s.get("id") == sid), None)
+        if not src:
+            return _err("msg.sourceNotFound", 404)
+        was_pending = bool(src.get("pending_activation"))
+        mountpoint = src.get("mountpoint")
+        src["subpath"] = subpath
+        # Staged until the live push below lands -- tell _sync_from_lyrion()
+        # to leave this source alone in the meantime, otherwise a GET
+        # /api/sources poll landing in that window sees Lyrion still showing
+        # the old mediadir and "reconciles" this pick right back out.
+        src["subpath_pending"] = True
+        src.pop("pending_activation", None)
+        save_state(state)
+        src = dict(src)
+    target = current_paths({"sources": [src]})
+    # Swap the old mediadir for the newly picked subfolder right away: there
+    # is no Apply button to reach any more.
+    if _lyrion_push_live(drop_roots=[mountpoint] if mountpoint else (),
+                         add_paths=target):
+        with _lock:
+            fresh = load_state()
+            for s in fresh.get("sources", []):
+                if s.get("id") == sid:
+                    s.pop("subpath_pending", None)
+            save_state(fresh)
+    return jsonify({"success": True,
+                    "message": _m("msg.sourceActivated" if was_pending else "msg.subpathSaved")})
+
+
+@app.route("/api/sources/<sid>/browse", methods=["GET"])
+def api_browse_subpath(sid):
+    """List immediate subdirectories under a source's mount (optionally under
+    a further relative ?path=), so the subpath control above can offer a
+    folder picker instead of free-text entry -- no such browse endpoint
+    existed before this."""
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    state = load_state()
+    src = next((s for s in state["sources"] if s.get("id") == sid), None)
+    if not src:
+        return _err("msg.sourceNotFound", 404)
+    if src.get("type") not in ("smb", "internal", "usb"):
+        return _err("msg.subpathNotSupported", 400)
+    mountpoint = src.get("mountpoint")
+    if not mountpoint or not os.path.ismount(mountpoint):
+        return _err("msg.folderMissing", 400, path=mountpoint or "")
+    root = os.path.realpath(mountpoint)
+    rel = (request.args.get("path") or "").strip("/")
+    cand = _under_roots(os.path.join(root, rel), (root,))  # root itself when no path
+    if cand is None:
+        return _err("msg.pathNotAllowed", 400)
+    if not os.path.isdir(cand):
+        return _err("msg.folderMissing", 400, path=cand)
+    try:
+        dirs = sorted(
+            e.name for e in os.scandir(cand)
+            if e.is_dir(follow_symlinks=False) and not e.name.startswith(".")
+        )
+    except OSError:
+        dirs = []
+    parent = None
+    if cand != root:
+        parent = os.path.relpath(os.path.dirname(cand), root)
+        if parent == ".":
+            parent = ""
+    return jsonify({"path": rel, "parent": parent, "dirs": dirs})
+
+
+@app.route("/api/sources/<sid>", methods=["DELETE"])
+def api_remove(sid):
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    with _lock:
+        state = load_state()
+        removed = [s for s in state.get("sources", []) if s.get("id") == sid]
+        for src in removed:
+            # remember_ignored: the user asked for this one, and the device
+            # may well still be plugged in — see _detach_source().
+            _detach_source(state, src, remember_ignored=True)
+        save_state(state)
+        regen_samba_shares()
+        # Lyrion, still inside the lock: a GET /api/sources landing between
+        # the save above and this call would see a mediadir belonging to no
+        # source and re-import it through _sync_from_lyrion(), undoing the
+        # removal the user just asked for.
+        roots = [r for src in removed for r in _source_lyrion_roots(src)]
+        if roots:
+            try:
+                _lyrion_remove_mediadir_live(roots)
+            except Exception as e:
+                # Not fatal: the source is gone from our state either way and
+                # the next apply rewrites mediadirs from it.
+                print(f"[sources] could not drop {roots} from Lyrion mediadirs: {e}")
+    return jsonify({"success": True})
+
+
+@app.route("/api/apply", methods=["POST"])
+def api_apply():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    data = request.get_json(silent=True) or {}
+    state = load_state()
+    if data.get("live"):
+        # Answer in seconds: set the folders over JSON-RPC, and only when
+        # Lyrion does not answer at all fall back to the restart-based apply,
+        # in the background, so nobody waits on it.
+        try:
+            ok, msg = apply_to_lyrion_live(state)
+        except Exception as e:
+            print(f"[sources] live apply failed, restarting Lyrion in the background: {e}")
+            threading.Thread(target=_apply_to_lyrion_background, daemon=True).start()
+            return jsonify({"success": True, "background": True,
+                            "message": _ht('lyrion.applyBackground', _hlang())}), 202
+        return jsonify({"success": ok, "message": msg}), (200 if ok else 500)
+    ok, msg = apply_to_lyrion(state)
+    return jsonify({"success": ok, "message": msg}), (200 if ok else 500)
+
+
+@app.route("/api/internal/disks", methods=["GET"])
+def api_internal_disks():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    return jsonify({"disks": _internal_disks()})
+
+
+@app.route("/api/internal/adopt", methods=["POST"])
+def api_internal_adopt():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    data = request.get_json(silent=True) or {}
+    device = (data.get("device") or "").strip()
+    if not _path_ok(device):
+        return _err("msg.badDevice", 400)
+
+    disks = _internal_disks()
+    disk = None
+    part = None
+    for d in disks:
+        if d["path"] == device:
+            disk = d
+            break
+        for p in d.get("partitions") or []:
+            if p["path"] == device:
+                disk = d
+                part = p
+                break
+    if not disk:
+        return _err("msg.diskNotFound", 400)
+    if not part:
+        # Whole disk with no partitions: reject.
+        return _err("msg.pickPartition", 400)
+    if not part.get("fstype"):
+        return _err("msg.partitionNoFs", 400)
+
+    partuuid = part.get("partuuid")
+    fsuuid = part.get("uuid")
+    fstype = (part.get("fstype") or "").lower()
+    label = part.get("label") or disk.get("label") or "Musica"
+    model = disk.get("model") or ""
+    existing = _existing_adopted_source("internal", partuuid, fsuuid)
+    if existing:
+        share = existing["share"]
+        mountpoint = existing["mountpoint"]
+        sid = existing["id"]
+    else:
+        share = _share_name(label)
+        mountpoint = os.path.join(INTERNAL_MOUNT_ROOT,
+                                  _slug(label) + "-" + (partuuid or fsuuid or "adopt")[:8])
+        sid = _slug("internal", share)
+
+    src = {
+        "id": sid,
+        "type": "internal",
+        "name": f"{label or 'Musica'} (interno)",
+        "partuuid": partuuid,
+        "fsuuid": fsuuid,
+        "fstype": fstype,
+        "label": label,
+        "model": model,
+        "mountpoint": mountpoint,
+        "share": share,
+    }
+    ok, msg = mount_internal(src)
+    if not ok:
+        return _err("msg.mountFailed", 400, detail=msg)
+
+    with _lock:
+        state = load_state()
+        state["sources"] = [s for s in state["sources"] if s.get("id") != src["id"]]
+        state["sources"].append(src)
+        save_state(state)
+        regen_samba_shares()
+    # Live add rather than apply_to_lyrion(): that stops/starts
+    # lyrionmusicserver, which would cut off whatever is playing — exactly
+    # what adopting a second disk should not do.
+    _lyrion_push_live(add_paths=[src["mountpoint"]])
+    return jsonify({"success": True, "source_id": src["id"], "share": share})
+
+
+def _adopt_usb_partition(part):
+    """Mount `part` (one of _usb_partitions()'s dicts) read-write under
+    USB_ADOPTED_ROOT and register it as a persistent, Samba-shared "usb"
+    source. Pure — no Flask request/response — so it's safe to call both from
+    an HTTP request (api_usb_adopt(), the manual retry path) and from the
+    usb_monitor background thread (the automatic path every healthy device
+    takes, see usb_sync()). Returns (ok, message, src_dict_or_None)."""
+    partuuid = part.get("partuuid")
+    fsuuid = part.get("uuid")
+    fstype = (part.get("fstype") or "").lower()
+    label = part.get("label") or part.get("name") or "USB"
+    existing = _existing_adopted_source("usb", partuuid, fsuuid)
+    if existing:
+        share = existing["share"]
+        mountpoint = existing["mountpoint"]
+        sid = existing["id"]
+    else:
+        share = _share_name(label)
+        mountpoint = os.path.join(USB_ADOPTED_ROOT,
+                                  _slug(label) + "-" + (partuuid or fsuuid or "adopt")[:8])
+        sid = _slug("usb", share)
+
+    src = {
+        "id": sid,
+        "type": "usb",
+        "name": f"{label or 'USB'} (USB)",
+        "partuuid": partuuid,
+        "fsuuid": fsuuid,
+        "fstype": fstype,
+        "label": label,
+        "model": "",
+        "mountpoint": mountpoint,
+        "share": share,
+    }
+    ok, msg = mount_usb_adopted(src)
+    if not ok:
+        return False, msg, None
+
+    with _lock:
+        state = load_state()
+        state["sources"] = [s for s in state["sources"] if s.get("id") != src["id"]]
+        state["sources"].append(src)
+        save_state(state)
+        regen_samba_shares()
+    # Deliberately does NOT call apply_to_lyrion() — that does a full
+    # systemctl stop/start of lyrionmusicserver, which drops the squeezelite
+    # connection and kills any music currently playing. The Samba share is
+    # already live at this point (regen_samba_shares() above) without it.
+    # Instead, add the folder to Lyrion's live mediadirs and trigger a scan
+    # over JSON-RPC (_lyrion_add_mediadir_live) — same non-disruptive
+    # approach _rip_watcher() already uses after a CD rip — so the music
+    # shows up in the library without a restart. Best-effort: if Lyrion isn't
+    # reachable this silently does nothing, and the folder still gets picked
+    # up whenever the user next presses "Apply & rescan library" (which
+    # recomputes mediadirs from state regardless, so there's nothing to
+    # reconcile either way).
+    try:
+        _lyrion_add_mediadir_live(mountpoint)
+    except Exception as e:
+        print(f"[sources] live mediadir add/rescan failed for {mountpoint}: {e}")
+    return True, "", src
+
+
+@app.route("/api/usb/adopt", methods=["POST"])
+def api_usb_adopt():
+    """Manual retry for a USB partition that usb_sync()'s automatic adoption
+    couldn't mount (recognized filesystem, transient mount error) — every
+    healthy device is adopted automatically as soon as it's plugged in, no
+    user action needed."""
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    data = request.get_json(silent=True) or {}
+    device = (data.get("device") or "").strip()
+    if not _path_ok(device):
+        return _err("msg.badDevice", 400)
+
+    part = next((p for p in _usb_partitions() if p.get("path") == device), None)
+    if not part:
+        return _err("msg.diskNotFound", 400)
+    if not part.get("fstype"):
+        return _err("msg.partitionNoFs", 400)
+
+    ok, msg, src = _adopt_usb_partition(part)
+    if not ok:
+        return _err("msg.mountFailed", 400, detail=msg)
+    return jsonify({"success": True, "source_id": src["id"], "share": src["share"]})
+
+
+@app.route("/api/internal/format", methods=["POST"])
+def api_internal_format():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    data = request.get_json(silent=True) or {}
+    device = (data.get("device") or "").strip()
+    fs = (data.get("fs") or "").strip().lower()
+    label = (data.get("label") or "").strip()
+    confirm = (data.get("confirm") or "").strip()
+
+    if not _path_ok(device):
+        return _err("msg.badDevice", 400)
+    if fs not in ("ext4", "exfat"):
+        return _err("msg.unsupportedFs", 400)
+    if not _label_ok(label):
+        return _err("msg.badLabel", 400)
+    if fs == "exfat" and len(label) > 11:
+        return _err("msg.labelTooLongExfat", 400)
+
+    disks = _internal_disks()
+    disk = next((d for d in disks if d["path"] == device), None)
+    if not disk:
+        return _err("msg.diskNotFound", 400)
+    if disk.get("confirm") != confirm:
+        return _err("msg.confirmMismatch", 400)
+    if disk.get("adopted"):
+        return _err("msg.alreadyAdopted", 400)
+
+    # Check no partitions are mounted.
+    for p in disk.get("partitions") or []:
+        if p.get("mountpoint"):
+            return _err("msg.unmountFirst", 400)
+
+    # Check mkfs.exfat is available when requested.
+    if fs == "exfat":
+        if _run(["which", "mkfs.exfat"], timeout=5).returncode != 0:
+            return _err("msg.osUpdateForExfat", 424)
+
+    # Interlock: no concurrent format job.
+    if os.path.exists(FORMAT_STATUS):
+        try:
+            with open(FORMAT_STATUS) as f:
+                st = json.load(f)
+            if st.get("state") not in ("done", "error", "idle"):
+                return _err("msg.formatInProgress", 409)
+        except Exception:
+            pass
+
+    # Reset status file.
+    with open(FORMAT_STATUS, "w") as f:
+        json.dump({"state": "idle", "progress": 0, "message": _ht('common.starting', _hlang())}, f)
+
+    _run(["systemd-run", "--no-block", "--collect", "--unit=" + FORMAT_UNIT,
+          FORMAT_SCRIPT, device, fs, label], timeout=10)
+    return jsonify({"success": True}), 202
+
+
+@app.route("/api/internal/format/status", methods=["GET"])
+def api_internal_format_status():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    status = {"state": "idle"}
+    if os.path.exists(FORMAT_STATUS):
+        try:
+            with open(FORMAT_STATUS) as f:
+                status = json.load(f)
+        except Exception:
+            pass
+    # Enrich with adoption info if done.
+    if status.get("state") == "done":
+        partuuid = status.get("partuuid")
+        if partuuid:
+            for s in _adopted_disk_sources():
+                if s.get("partuuid") == partuuid:
+                    status["adopted"] = True
+                    status["source_id"] = s.get("id")
+                    status["share"] = s.get("share")
+                    break
+    return jsonify(status)
+
+
+# ─────────────────────────── CD ripping ─────────────────────────────
+# Same async-job shape as the disk format above: kick off a detached worker
+# via systemd-run, poll a status file on /run, then a watcher thread finishes
+# the job (ownership fix + Lyrion rescan). The Lyrion CD Player plugin only
+# *plays* discs; this archives them into the library as tagged FLAC.
+
+_cd_info_cache = {}  # freedb discid -> MusicBrainz lookup (see _cd_lookup), or a miss marker
+_cd_leadouts = {}    # freedb discid -> exact lead-out in frames (0: not available)
+_cd_data_tracks = {}  # freedb discid -> numbers of its data tracks
+# How long a disc that MusicBrainz does not know, or a lookup that failed, is
+# left alone. CdRip polls /api/cd/info every few seconds: without these, an
+# unknown disc or a device without internet would query MusicBrainz on every
+# single poll.
+_CD_UNKNOWN_HOLD = 600
+_CD_OFFLINE_HOLD = 120
+_CD_BUSY_HOLD = 15
+
+
+def _cd_toc():
+    """Read the audio-CD TOC via cd-discid. Returns None when there is no
+    readable audio disc. Output format: `discid ntracks off1 ... offN seconds`
+    (offsets in CD frames, 75/s, lead-in included). The exact lead-out, which
+    the MusicBrainz disc id needs, comes from a second `--musicbrainz` read
+    done once per disc."""
+    try:
+        r = _run(["cd-discid", CD_DEVICE], timeout=20)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    parts = (r.stdout or "").split()
+    if len(parts) < 4:
+        return None
+    try:
+        ntracks = int(parts[1])
+        offsets = [int(x) for x in parts[2:2 + ntracks]]
+        total_sec = int(parts[2 + ntracks])
+    except (ValueError, IndexError):
+        return None
+    if ntracks < 1 or len(offsets) != ntracks:
+        return None
+    discid = parts[0]
+    leadout = _cd_leadouts.get(discid)
+    if leadout is None:
+        if len(_cd_leadouts) > 32:
+            _cd_leadouts.clear()
+        leadout = _cd_leadouts[discid] = _cd_exact_leadout(ntracks, offsets, total_sec)
+    if not leadout:
+        # `seconds` is the lead-out divided by 75, so this is at most 74
+        # frames short: close enough for the fuzzy TOC search.
+        leadout = total_sec * 75
+    # Enhanced CD: the data track after the music is neither ripped nor part
+    # of the MusicBrainz disc id (hcd.audio_toc()). Read once per disc, like
+    # the lead-out; a drive that cannot say is treated as all audio, and the
+    # worker still skips a track cdparanoia calls "non audio".
+    data_tracks = _cd_data_tracks.get(discid)
+    if data_tracks is None:
+        if len(_cd_data_tracks) > 32:
+            _cd_data_tracks.clear()
+        data_tracks = _cd_data_tracks[discid] = tuple(hcd.read_data_tracks(CD_DEVICE) or ())
+    audio = hcd.audio_toc(offsets, leadout, data_tracks)
+    if not audio["tracks"]:
+        return None
+    offsets, leadout = audio["offsets"], audio["leadout"]
+    ntracks = len(offsets)
+    lengths = []
+    for i in range(ntracks):
+        end = offsets[i + 1] if i + 1 < ntracks else leadout
+        lengths.append(max(0, (end - offsets[i]) // 75))
+    return {"discid": discid, "ntracks": ntracks, "offsets": offsets,
+            "total_sec": total_sec, "lengths": lengths, "leadout": leadout,
+            # the audio track numbers, the only ones a rip may read
+            "audio_tracks": audio["tracks"]}
+
+
+def _cd_exact_leadout(ntracks, offsets, total_sec):
+    """`cd-discid --musicbrainz` prints `ntracks off1 ... offN leadout`. Only
+    trusted when it agrees with the plain read; 0 otherwise."""
+    try:
+        r = _run(["cd-discid", "--musicbrainz", CD_DEVICE], timeout=20)
+        values = [int(x) for x in (r.stdout or "").split()] if r.returncode == 0 else []
+    except Exception:
+        return 0
+    if len(values) != ntracks + 2 or values[0] != ntracks or values[1:-1] != offsets:
+        return 0
+    leadout = values[-1]
+    return leadout if leadout // 75 == total_sec and leadout > offsets[-1] else 0
+
+
+def _mb_lookup(toc):
+    """Look the disc up on MusicBrainz: by disc id, falling back to the fuzzy
+    TOC search when the id is not known. Returns (lookup, None) or (None,
+    miss) with miss "unknown", "offline" or "busy". The lookup keeps every
+    plausible release (best first), each with the medium that matches the disc
+    — a box set that contains the same CD is a choice, not the answer."""
+    disc_id = hmeta.mb_disc_id(toc["offsets"], toc["leadout"])
+    try:
+        data = hmeta.mb_get(f"discid/{disc_id}", toc=hmeta.cd_toc_string(toc["offsets"], toc["leadout"]),
+                            inc=hmeta.DISCID_INC, timeout=10, retries=1, max_wait=5)
+    except hmeta.NotFoundError:
+        return None, "unknown"
+    except hmeta.OfflineError as e:
+        print(f"[sources] musicbrainz lookup: offline ({e})")
+        return None, "offline"
+    except Exception as e:
+        print(f"[sources] musicbrainz lookup failed: {e}")
+        return None, "busy"
+    choices = hmeta.cd_choices(data, disc_id, hmeta.cd_toc_lengths_ms(toc["offsets"], toc["leadout"]))
+    seen, kept = set(), []
+    for c in choices:
+        mbid = c["release"].get("id")
+        if not mbid or mbid in seen:
+            continue
+        seen.add(mbid)
+        kept.append({"mbid": mbid, "rel": c["release"], "medium": int(c["medium"].get("position") or 1),
+                     "exact": c["exact"], "entry": hmeta.cd_release_entry(c)})
+        if len(kept) >= 15:
+            break
+    if not kept:
+        return None, "unknown"
+    return {"disc_id": disc_id, "choices": kept}, None
+
+
+_cd_lookup_lock = threading.Lock()
+
+
+def _cd_lookup(toc):
+    """The cached MusicBrainz lookup of the disc in the drive, or None while
+    it is unknown/unreachable (without asking again before the hold ends).
+    One lookup at a time: a poll that arrives while MusicBrainz is still
+    answering the previous one waits for that answer instead of sending the
+    same request again."""
+    def cached():
+        entry = _cd_info_cache.get(toc["discid"])
+        if entry is not None and ("miss" not in entry or time.monotonic() < entry["until"]):
+            return True, (None if "miss" in entry else entry)
+        return False, None
+
+    hit, value = cached()
+    if hit:
+        return value
+    with _cd_lookup_lock:
+        hit, value = cached()
+        if hit:
+            return value
+        return _cd_lookup_locked(toc)
+
+
+def _cd_lookup_locked(toc):
+    now = time.monotonic()
+    look, miss = _mb_lookup(toc)
+    if len(_cd_info_cache) > 32:
+        _cd_info_cache.clear()
+    if look is None:
+        hold = {"unknown": _CD_UNKNOWN_HOLD, "offline": _CD_OFFLINE_HOLD}.get(miss, _CD_BUSY_HOLD)
+        _cd_info_cache[toc["discid"]] = {"miss": miss, "until": now + hold}
+        return None
+    _cd_info_cache[toc["discid"]] = look
+    # Fetch the full lookup of the likeliest release now, while the user is
+    # still reading the form, so the rip itself does not wait for it.
+    threading.Thread(target=_cd_fetch_full, args=(look, look["choices"][0]["mbid"]),
+                     daemon=True, name="cd-full-lookup").start()
+    return look
+
+
+def _cd_fetch_full(look, mbid, timeout=15, retries=2, max_wait=30):
+    """The RELEASE_INC lookup of `mbid` (composer, lyricist and the rest),
+    kept in the disc's lookup and in the metadata cache. None on failure."""
+    full = look.setdefault("full", {})
+    if mbid in full:
+        return full[mbid]
+    try:
+        rel = hmeta.mb_get(f"release/{mbid}", inc=hmeta.RELEASE_INC,
+                           timeout=timeout, retries=retries, max_wait=max_wait)
+    except Exception as e:
+        print(f"[sources] full release lookup for tags skipped: {e}")
+        return None
+    full[mbid] = rel
+    try:
+        hmeta.get_service().remember_release(rel)
+    except Exception as e:
+        print(f"[sources] metadata cache unavailable: {e}")
+    return rel
+
+
+def _cd_metadata(toc, release=None):
+    """Metadata for `toc` from the cached lookup — the release `release`
+    (an MBID among the plausible ones) or the best one — padded with offline
+    fallbacks so callers always get artist/album and one title per track."""
+    look = _cd_lookup(toc)
+    choices = (look or {}).get("choices") or []
+    choice = None
+    if release:
+        choice = next((c for c in choices if c["mbid"] == str(release).strip().lower()), None)
+    if choice is None and choices:
+        choice = choices[0]
+    titles, artists = [], []
+    artist = album = year = ""
+    if choice:
+        rel = choice["rel"]
+        artist = hmeta.artist_credit_text(rel.get("artist-credit"))
+        album = rel.get("title") or ""
+        year = (rel.get("date") or "")[:4]
+        medium = next((m for m in rel.get("media") or []
+                       if int(m.get("position") or 0) == choice["medium"]), {})
+        for tr in medium.get("tracks") or []:
+            titles.append(tr.get("title") or (tr.get("recording") or {}).get("title") or "")
+            artists.append(hmeta.artist_credit_text(tr.get("artist-credit")) or artist)
+    tracks = []
+    for i in range(toc["ntracks"]):
+        title = titles[i] if i < len(titles) and titles[i] else f"Track {i + 1:02d}"
+        tracks.append({"num": i + 1, "title": title, "length": toc["lengths"][i]})
+    audio = toc.get("audio_tracks")
+    if audio is not None:
+        # A data track (mixed-mode disc) keeps its place in the numbering
+        # and in MusicBrainz's track list, but is never offered for ripping.
+        tracks = [t for t in tracks if t["num"] in audio]
+    return {
+        "mbid": choice["mbid"] if choice else None,
+        "artist": artist or "Unknown Artist",
+        "album": album or "Unknown Album",
+        "year": year,
+        "tracks": tracks,
+        "track_artists": artists,
+        "releases": [c["entry"] for c in choices],
+        "choice": choice,
+        "lookup": look,
+    }
+
+
+def _cd_tag_plan(meta, artist):
+    """Album-wide and per-track tags for the rip (see hifi-rip-cd.py). Uses a
+    full release lookup when MusicBrainz answers in time — it carries the works
+    behind the recordings, hence composer and lyricist — and the discid
+    lookup already in hand otherwise. A track artist that differs from the
+    release artist (a compilation) is kept; the rest follow the artist the
+    user may have corrected in the form."""
+    choice = meta.get("choice")
+    if not choice:
+        return [], [None] * len(meta["tracks"]), [artist] * len(meta["tracks"])
+    rel = choice["rel"]
+    # Bounded: this runs inside the POST that starts the rip.
+    full = _cd_fetch_full(meta["lookup"], choice["mbid"], timeout=8, retries=0, max_wait=3)
+    if full and any(int(m.get("position") or 0) == choice["medium"] for m in full.get("media") or []):
+        rel = full
+    album_tags, track_tags, track_artists = hmeta.cd_tags(rel, choice["medium"])
+    if choice.get("exact") and (meta.get("lookup") or {}).get("disc_id"):
+        album_tags.append(("MUSICBRAINZ_DISCID", meta["lookup"]["disc_id"]))
+    mb_artist = hmeta.artist_credit_text(rel.get("artist-credit"))
+    if artist and artist != mb_artist:
+        album_tags = [(k, artist if k == "ALBUMARTIST" else v) for k, v in album_tags]
+    # By the track's place on the disc: a data track left out of the rip
+    # (mixed-mode disc) must not shift every tag onto the next track.
+    positions = [int(t.get("num") or (i + 1)) - 1 for i, t in enumerate(meta["tracks"])]
+    artists, tags = [], []
+    for pos in positions:
+        ta = track_artists[pos] if 0 <= pos < len(track_artists) else ""
+        artists.append(ta if ta and ta != mb_artist else artist)
+        tags.append(track_tags[pos] if 0 <= pos < len(track_tags) else [])
+    return album_tags, tags, artists
+
+
+def _rip_state():
+    if os.path.exists(RIP_STATUS):
+        try:
+            with open(RIP_STATUS) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"state": "idle"}
+
+
+def _rip_running():
+    return _rip_state().get("state") not in ("idle", "done", "error", "cancelled")
+
+
+def _lyrion_request(params, timeout=10):
+    """POST one slim.request command to Lyrion's JSON-RPC endpoint and return
+    its `result` dict. Raises on any transport/JSON error — callers decide
+    whether that's fatal for them."""
+    payload = {"id": 1, "method": "slim.request", "params": ["", params]}
+    req = urllib.request.Request(
+        LYRION_RPC, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8")).get("result") or {}
+
+
+def _lyrion_rescan():
+    _lyrion_request(["rescan"])
+
+
+def _lyrion_wait_and_rescan(attempts=30, delay=2):
+    """Wait for Lyrion's JSON-RPC to come back up after a `systemctl start`
+    (it isn't reachable the instant the unit is reported started -- Perl
+    startup + plugin init takes a few seconds), then trigger a rescan. Used
+    by apply_to_lyrion() right after its restart, since that path rewrites
+    mediadirs straight into the prefs file while the service is stopped --
+    Lyrion has no pref-change hook to react to and never rescans on its own
+    just because the file changed underneath it. Best-effort: apply_to_lyrion()
+    has already written the prefs successfully either way by the time this
+    runs, and a rescan is always reachable by hand (Settings, or Lyrion's own
+    web UI) if every attempt here fails. Returns True once the rescan request
+    itself was accepted."""
+    for _ in range(attempts):
+        try:
+            _lyrion_rescan()
+            return True
+        except Exception:
+            time.sleep(delay)
+    print("[sources] apply: gave up waiting for Lyrion to rescan")
+    return False
+
+
+def _lyrion_edit_mediadirs_live(drop_roots=(), add_paths=(), force_rescan=False):
+    """Drop every live mediadir at or under `drop_roots`, append everything in
+    `add_paths`, then rescan — in one read-modify-write round-trip and,
+    crucially, without stopping/starting lyrionmusicserver the way
+    apply_to_lyrion() does, so whatever is playing keeps going. mediadirs is
+    an array pref and Lyrion's CLI can't set array values (JSON-RPC only —
+    confirmed against the Lyrion forum's own guidance for this exact pref),
+    hence reading the live list first rather than trusting our own state.
+
+    This is what makes every edit in Music Sources take effect by itself:
+    there is no "Apply & rescan" button in the kiosk/web-admin UIs any more,
+    so adding, removing and re-pointing a source each push themselves through
+    here. Deliberately targeted rather than rewriting the whole list from
+    current_paths(): an unrelated source whose disk happens to be unplugged
+    keeps its folder in Lyrion instead of being scanned away to nothing.
+
+    Raises on failure (e.g. Lyrion not reachable) — callers treat that as
+    non-fatal, since /api/apply still recomputes mediadirs from state.
+    Returns True if the list actually changed."""
+    current = _lyrion_request(["pref", "mediadirs", "?"]).get("_p2")
+    if not isinstance(current, list):
+        current = [current] if current else []
+    # Removing a source runs this under _lock: a folder on a share whose
+    # server is gone must be compared as written, never stat-ed.
+    table = _mount_table()
+    net_roots = (os.path.realpath(MOUNT_ROOT),)
+    victims = [_resolve_quick(r, table, net_roots) for r in drop_roots if r]
+    wanted = []
+    for d in current:
+        if not d:
+            continue
+        p = _resolve_quick(d, table, net_roots)
+        if any(p == v or p.startswith(v + os.sep) for v in victims):
+            continue
+        wanted.append(d)
+    for path in add_paths:
+        if path and path not in wanted:
+            wanted.append(path)
+    changed = wanted != current
+    if changed:
+        _lyrion_request(["pref", "mediadirs", wanted])
+    if changed or force_rescan:
+        _lyrion_rescan()
+    return changed
+
+
+def _lyrion_push_live(drop_roots=(), add_paths=()):
+    """Best-effort _lyrion_edit_mediadirs_live() for the HTTP handlers. Music
+    Sources has no "Apply & rescan" button any more, so every mutation calls
+    this — and a Lyrion that is still starting (or not installed yet on a
+    fresh unit) must not turn an otherwise successful edit into an HTTP
+    error. /api/apply, still used by the first-run setup pages, rebuilds
+    mediadirs from state regardless, so nothing is lost when this misses."""
+    try:
+        _lyrion_edit_mediadirs_live(drop_roots=drop_roots, add_paths=add_paths,
+                                    force_rescan=bool(add_paths))
+        return True
+    except Exception as e:
+        print(f"[sources] live mediadirs update failed "
+              f"(drop={list(drop_roots)}, add={list(add_paths)}): {e}")
+        return False
+
+
+def _lyrion_add_mediadir_live(path):
+    """Have Lyrion scan `path`: a rescan when a live mediadir already holds
+    it, else add it first. Always rescans — the caller is the CD ripper,
+    where it is the new files inside the folder that need picking up.
+
+    🚨 Not added when already held: a ripped album folder listed beside the
+    disk it sits on was scanned twice, and _sync_from_lyrion() then took it
+    for the source's own subfolder, or for a new `local` source of its own."""
+    current = _lyrion_request(["pref", "mediadirs", "?"]).get("_p2")
+    if not isinstance(current, list):
+        current = [current] if current else []
+    # as written, not resolved: a mediadir on a share that went away must
+    # not hang the check
+    real = os.path.normpath(path)
+    for d in current:
+        p = os.path.normpath(d) if d else ""
+        if p and (real == p or real.startswith(p.rstrip(os.sep) + os.sep)):
+            _lyrion_rescan()
+            return
+    _lyrion_edit_mediadirs_live(add_paths=[path], force_rescan=True)
+
+
+def _source_lyrion_roots(src):
+    """Every path in Lyrion's mediadirs that belongs to `src`: its mount root
+    for an adopted/SMB source, its folder for a `local` one. The subpath is
+    deliberately not applied — what Lyrion holds may be the root, a subpath,
+    or (after an edit that was never applied) both, and all of it goes when
+    the source goes."""
+    if src.get("type") in ("smb", "internal", "usb"):
+        mp = src.get("mountpoint")
+        return [_resolve_mountpoint(mp)] if mp else []
+    raw = src.get("path")
+    return [_resolve_quick(raw, None, (os.path.realpath(MOUNT_ROOT),))] if raw else []
+
+
+def _lyrion_remove_mediadir_live(roots):
+    """The counterpart of _lyrion_add_mediadir_live(): drop every live
+    mediadir at or under `roots`, then rescan — again without restarting
+    lyrionmusicserver, so removing a source doesn't cut the music off.
+
+    Without this, removing a source only ever took it out of our own state:
+    Lyrion kept the folder, and the very next GET /api/sources handed it
+    back through _sync_from_lyrion(), which re-imports any mediadir it does
+    not recognise as a `local` source. The user's deletion undid itself
+    within the second, forever — and neither the kiosk nor the web UI could
+    do anything about it, since both go through this same endpoint.
+
+    Raises on failure (Lyrion unreachable): the caller decides, and the next
+    "Apply & rescan" recomputes mediadirs from state regardless."""
+    return _lyrion_edit_mediadirs_live(drop_roots=roots)
+
+
+def _rip_watcher():
+    """Background thread (spawned per rip): when the worker reports done,
+    make sure the rip belongs to the share account (the worker hands its
+    files over itself — hifi_cdrip.hand_over_tree — this is the safety net
+    behind it, for a worker that died between the move and the hand-over)
+    and add the destination to Lyrion's library live — not apply_to_lyrion(),
+    so LMS is not restarted mid-listen. Filesystems without POSIX ownership
+    (FAT, exFAT, NTFS, SMB) ignore the chown; their mount options already
+    fix uid and gid."""
+    deadline = time.monotonic() + 3 * 60 * 60
+    while time.monotonic() < deadline:
+        time.sleep(3)
+        try:
+            st = _rip_state()
+            state = st.get("state")
+            if state in ("done", "error", "idle", "cancelled"):
+                if state == "done":
+                    dest = st.get("dest") or ""
+                    try:
+                        owner = _ensure_samba_uid_gid()
+                        if dest and owner[0]:
+                            # the root the rip started from: in the status, or
+                            # in the plan for a worker that does not report it
+                            hcd.hand_over_tree(st.get("root") or _rip_plan_root(dest), dest, owner)
+                    except Exception as e:
+                        print(f"[sources] rip ownership fix failed: {e}")
+                    try:
+                        _lyrion_add_mediadir_live(dest)
+                    except Exception as e:
+                        print(f"[sources] rip library add/rescan failed: {e}")
+                return
+        except Exception as e:
+            print(f"[sources] rip watcher error: {e}")
+
+
+def _rip_plan_root(dest):
+    """The destination root of the rip that is running or just finished
+    (from the plan the worker was given), else the parent of `dest` so the
+    album folder itself is still covered."""
+    try:
+        with open(RIP_PLAN) as f:
+            root = (json.load(f) or {}).get("root") or ""
+    except Exception:
+        root = ""
+    return root if root and dest.startswith(root.rstrip("/") + "/") else os.path.dirname(dest)
+
+
+def _shared_local_roots():
+    """Folders whose contents must be the share account's, on filesystems
+    that carry ownership at all: the appliance's own music folder, every
+    folder published over the network, and every adopted internal or USB
+    disk that is mounted and not FAT-like (those get uid and gid from their
+    mount options). The rip folder always sits inside one of these. One
+    inside another is dropped."""
+    roots = []
+    if os.path.isdir(DATA_MUSIC_ROOT):
+        roots.append(os.path.realpath(DATA_MUSIC_ROOT))
+    for s in load_state().get("sources", []):
+        t = s.get("type")
+        if t == "local" and s.get("samba") and s.get("path") and os.path.isdir(s["path"]):
+            roots.append(os.path.realpath(s["path"]))
+        mp = s.get("mountpoint") or ""
+        if t in ("internal", "usb") and mp and os.path.ismount(mp) \
+                and (s.get("fstype") or "").lower() not in _FAT_LIKE:
+            roots.append(os.path.realpath(mp))
+    out = []
+    for r in sorted(set(roots), key=len):
+        if not any(r == o or r.startswith(o + os.sep) for o in out):
+            out.append(r)
+    return out
+
+
+def _repair_shared_ownership(roots=None, limit=250000):
+    """What an earlier version of this server (the file manager's new
+    folders, copies and moves) or of the rip worker left root-owned under
+    the shared folders: playable, but not renameable or deletable from a PC
+    on the network. Hand every such entry to the share account; the roots
+    themselves are left as they are. Bounded per root, so a whole library
+    cannot turn this into a long walk. Returns how many entries changed."""
+    owner = _ensure_samba_uid_gid()
+    if not owner[0] or not owner[1]:
+        return 0
+    n = 0
+    for root in (_shared_local_roots() if roots is None else roots):
+        k = hcd.hand_over_tree(root, root, owner, from_uids=_ROOT_UIDS, limit=limit,
+                               skip_names=("lost+found",))
+        if k:
+            print(f"[sources] {root}: {k} entries handed to {SAMBA_USER}:{SHARE_GROUP}")
+        n += k
+    return n
+
+
+def _repair_shared_ownership_loop(delays=(20, 60, 180, 600)):
+    """_repair_shared_ownership() a few times after start, each pass on the
+    folders not seen yet: at boot the adopted disks come up in their own
+    time."""
+    done = set()
+    for d in delays:
+        time.sleep(d)
+        try:
+            roots = [r for r in _shared_local_roots() if r not in done]
+            if roots:
+                _repair_shared_ownership(roots)
+                done.update(roots)
+        except Exception as e:
+            print(f"[sources] _repair_shared_ownership error: {e}")
+
+
+RIP_SYSTEM_ID = "__system__"
+
+
+def _rip_writable_sources():
+    """Sources the rip can write into: adopted (rw, hifimusic-owned) internal
+    or USB disks, any SMB share mounted read-write — which is the default,
+    but not one the server always allows (see mount_smb()) — and the music
+    on the system disk itself: every `local` music folder, plus the
+    player's own /data/music even before anything was added from there.
+
+    🚨 Without the last two a player with no second disk could not rip at
+    all ("no writable destination") though its system disk has room. A
+    `local` entry comes back with `mountpoint` = its folder, so every caller
+    treats them all alike."""
+    out = []
+    local_paths = set()
+    table = _mount_table()
+    for s in load_state().get("sources", []):
+        t = s.get("type")
+        if t == "local":
+            # a folder under /mnt may be on a share: asked nothing, skipped
+            raw = s.get("path") or ""
+            if s.get("media") is False or not raw or _on_network_fs(raw, table):
+                continue
+            path = _local_path_allowed(raw)
+            # One saved before folders in RAM were refused stays a source,
+            # but a rip written there would be gone at the next boot.
+            if path and os.path.isdir(path) and os.access(path, os.W_OK) \
+                    and not _on_ram_fs(path, table):
+                local_paths.add(path)
+                out.append(dict(s, mountpoint=path))
+            continue
+        if t not in ("internal", "usb") and not (t == "smb" and _smb_wants_rw(s)):
+            continue
+        mp = s.get("mountpoint") or ""
+        entry = _mount_entry(mp, table) if table is not None else None
+        if table is None:
+            mounted = bool(mp) and os.path.ismount(mp)
+        else:
+            mounted = entry is not None
+        if not mounted:
+            continue
+        if t == "smb" and entry is not None:
+            # A share's mount options say whether it is writable; access()
+            # on it would ask a server that may have gone away.
+            if "rw" in entry[1].split(","):
+                out.append(s)
+        elif os.access(mp, os.W_OK):
+            out.append(s)
+    music = os.path.realpath(DATA_MUSIC_ROOT)
+    if music not in local_paths and os.path.ismount(DATA_MNT) \
+            and os.path.isdir(music) and os.access(music, os.W_OK):
+        out.append({"id": RIP_SYSTEM_ID, "type": "local", "name": _m("files.rootMusic"),
+                    "path": music, "mountpoint": music})
+    return out
+
+
+def _rip_into_library(root):
+    """Make sure the folder a rip goes into is in the library before the rip
+    starts. Disks and shares are there already; a folder on the system disk
+    may not be — /data/music is offered as a destination before anyone
+    added it — and a rip Lyrion never scans looks like a rip that got lost.
+    Adds the folder as a `local` source, as Music Sources would, when no
+    `local` source holds it yet."""
+    real = _local_path_allowed(root)
+    if not real:
+        return
+    with _lock:
+        state = load_state()
+        for s in state.get("sources", []):
+            if s.get("type") != "local" or s.get("media") is False or not s.get("path"):
+                continue
+            p = os.path.realpath(s["path"])
+            if real == p or real.startswith(p + os.sep):
+                return
+        sources = state.setdefault("sources", [])
+        sid = _free_source_id(sources, _slug("local", os.path.basename(real.rstrip("/"))), real)
+        sources.append({"id": sid, "type": "local", "name": real, "path": real})
+        save_state(state)
+    _lyrion_push_live(add_paths=[real])
+
+
+@app.route("/api/cd/info", methods=["GET"])
+def api_cd_info():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    toc = _cd_toc()
+    if not toc:
+        return jsonify({"no_disc": True, "releases": []})
+    meta = _cd_metadata(toc, request.args.get("release"))
+    settings = _cd_settings()
+    return jsonify({
+        "no_disc": False,
+        "enabled": settings["enabled"],
+        # the folder set in Settings → CD ripping, when it is usable right now
+        "default_target": _cd_default_target(settings),
+        "eject_after": settings["eject"],
+        "auto_start": settings["auto_start"],
+        "discid": toc["discid"],
+        "mbid": meta["mbid"],
+        "artist": meta["artist"],
+        "album": meta["album"],
+        "year": meta["year"],
+        "tracks": meta["tracks"],
+        # Every release this disc may belong to (best first), for the edition
+        # choice: pass one back as `release` here or to /api/cd/rip.
+        "releases": meta["releases"],
+        "destinations": [
+            {"source_id": s.get("id"), "name": s.get("name") or s.get("label"), "path": s.get("mountpoint")}
+            for s in _rip_writable_sources()
+        ],
+        "ripping": _rip_running(),
+    })
+
+
+def _cd_settings():
+    return hcd.load(CDRIP_CONF)
+
+
+def _cd_target_root(path):
+    """(mountpoint, source, real path) of the writable source `path` sits in,
+    or (None, None, None): a destination is only ever a folder inside an
+    adopted internal or USB disk, a network share mounted read-write or the
+    music on the system disk (see _rip_writable_sources()). The
+    real path handed back is the one to use from here on: it is the resolved
+    one, checked to be under the mountpoint."""
+    if not path:
+        return None, None, None
+    real = os.path.realpath(path)
+    # the innermost first: a `local` folder inside /data/music is its own source
+    for src in sorted(_rip_writable_sources(), key=lambda s: -len(s.get("mountpoint") or "")):
+        mp = _resolve_mountpoint(src["mountpoint"]) if src.get("mountpoint") else ""
+        if not mp:
+            continue
+        if real == mp:
+            return mp, src, mp
+        if real.startswith(mp + os.sep):
+            return mp, src, real
+    return None, None, None
+
+
+def _cd_default_target(settings=None):
+    """The configured destination when it is usable right now: {path, name,
+    source_id}; None when unset, unmounted or not writable."""
+    s = settings or _cd_settings()
+    path = s.get("target") or ""
+    mp, src, _real = _cd_target_root(path)
+    if not mp or not os.path.isdir(path) or not os.access(path, os.W_OK):
+        return None
+    return {"path": path, "name": path, "source_id": src.get("id")}
+
+
+def _cd_start_rip(data, toc, auto=False):
+    """Start the worker for the disc `toc`. `data` may carry source_id (a
+    writable source, or "__default__" for the folder from Settings), release,
+    artist, album, year and track titles; without a source the default folder
+    is used, or the only writable source. `selected` lists the disc's
+    track numbers to rip (every track when absent). Returns (body, status)."""
+    settings = _cd_settings()
+    sources = _rip_writable_sources()
+    picked = data.get("selected")
+    if picked is not None:
+        try:
+            picked = {int(n) for n in picked}
+        except (TypeError, ValueError):
+            return _err("msg.cdNoTracksSelected", 400)
+        if not picked:
+            return _err("msg.cdNoTracksSelected", 400)
+    source_id = (data.get("source_id") or "").strip()
+    target = str(data.get("target") or "").strip()
+    default = _cd_default_target(settings)
+    if target:
+        # a folder picked in the rip page's browser: inside a writable source
+        mp, _src, real = _cd_target_root(target)
+        if not mp or not os.path.isdir(real) or not os.access(real, os.W_OK):
+            return _err("msg.cdTargetOutside", 400)
+        root = real
+    elif source_id in ("", "__default__") and default:
+        root = default["path"]
+    else:
+        src = next((s for s in sources if s.get("id") == source_id), None)
+        if src is None and len(sources) == 1 and not source_id:
+            src = sources[0]
+        if src is None:
+            return _err("msg.noWritableTarget", 400)
+        root = src["mountpoint"]
+    try:
+        _rip_into_library(root)
+    except Exception as e:
+        print(f"[sources] rip destination {root} not added to the library: {e}")
+
+    meta = _cd_metadata(toc, data.get("release"))
+    artist = str(data.get("artist") or meta["artist"]).strip() or "Unknown Artist"
+    album = str(data.get("album") or meta["album"]).strip() or "Unknown Album"
+    year = str(data.get("year") or meta["year"]).strip()[:4]
+    tracks = meta["tracks"]
+    override = data.get("tracks")
+    if isinstance(override, list) and len(override) == len(tracks):
+        for i, t in enumerate(override):
+            title = str(t or "").strip()
+            if title:
+                tracks[i]["title"] = title
+
+    # Cover art (best effort, embedded by the worker if present).
+    try:
+        os.remove(RIP_COVER)
+    except OSError:
+        pass
+    if meta.get("mbid"):
+        try:
+            req = urllib.request.Request(
+                f"https://coverartarchive.org/release/{meta['mbid']}/front-500",
+                headers={"User-Agent": hmeta.user_agent()})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                cover = resp.read(5 * 1024 * 1024)
+            with open(RIP_COVER, "wb") as f:
+                f.write(cover)
+        except Exception:
+            pass
+
+    # MusicBrainz identifiers and the rest of the Picard-style tags; the
+    # titles, artist, album and year above stay whatever the user confirmed.
+    album_tags, track_tags, track_artists = _cd_tag_plan(meta, artist)
+    for i, tr in enumerate(tracks):
+        tr["artist"] = track_artists[i] if i < len(track_artists) else artist
+        tr["tags"] = [list(t) for t in (track_tags[i] or [])] if i < len(track_tags) else []
+    # Only now, with every track's tags in place by its position on the disc:
+    # the ones left out are dropped, and TRACKTOTAL stays the disc's.
+    disc_tracks = len(tracks)
+    if picked is not None:
+        tracks = [t for t in tracks if int(t.get("num") or 0) in picked]
+        if not tracks:
+            return _err("msg.cdNoTracksSelected", 400)
+    plan = {
+        "device": CD_DEVICE,
+        "root": root,
+        "artist": artist,
+        "album": album,
+        "year": year,
+        "discid": toc["discid"],
+        "cover": RIP_COVER if os.path.exists(RIP_COVER) else "",
+        "tracks": tracks,
+        # how many audio tracks the disc has, for TRACKTOTAL when only some are ripped
+        "disc_tracks": disc_tracks,
+        "album_tags": [list(t) for t in album_tags],
+        # Settings → CD ripping, frozen for this rip (hifi-rip-cd.py reads them)
+        "options": settings,
+        "auto": bool(auto),
+        # The worker runs as root; the rip is handed to the share account
+        # (hifi_cdrip.hand_over_tree) so a PC on the network can rename or
+        # delete it.
+        "owner": list(_ensure_samba_uid_gid()),
+    }
+    with open(RIP_PLAN, "w") as f:
+        json.dump(plan, f)
+    os.chmod(RIP_PLAN, 0o600)
+    with open(RIP_STATUS, "w") as f:
+        json.dump({"state": "starting", "track": 0, "total": len(tracks), "progress": 0,
+                   "message": _ht('common.starting', 'en'), "code": "common.starting"}, f)
+
+    _run(["systemd-run", "--no-block", "--collect", "--unit=" + RIP_UNIT,
+          RIP_SCRIPT, RIP_PLAN], timeout=10)
+    threading.Thread(target=_rip_watcher, daemon=True, name="rip-watcher").start()
+    return jsonify({"success": True, "total": len(tracks)}), 202
+
+
+@app.route("/api/cd/rip", methods=["POST"])
+def api_cd_rip():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    data = request.get_json(silent=True) or {}
+    if not _cd_settings().get("enabled", True):
+        return _err("msg.cdDisabled", 403)
+    toc = _cd_toc()
+    if not toc:
+        return _err("msg.noAudioCd", 400)
+    if _rip_running():
+        return _err("msg.ripInProgress", 409)
+    return _cd_start_rip(data, toc)
+
+
+@app.route("/api/cd/cancel", methods=["POST"])
+def api_cd_cancel():
+    """Stop a running rip: the worker catches the SIGTERM, removes its work
+    folder and reports "cancelled"; the disc can then be ejected."""
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    if not _rip_running():
+        return _err("msg.ripNotRunning", 409)
+    _run(["systemctl", "stop", RIP_UNIT + ".service"], timeout=60)
+    if _rip_running():
+        with open(RIP_STATUS, "w") as f:
+            json.dump({"state": "cancelled", "track": 0, "total": 0, "progress": 0,
+                       "message": _ht('common.cancelled', 'en'), "code": "common.cancelled"}, f)
+    return jsonify({"success": True})
+
+
+@app.route("/api/cd/settings", methods=["GET", "POST"])
+def api_cd_settings():
+    """Settings → CD ripping: Daphile's page, field by field (hifi_cdrip.py).
+    A POST is a partial update; the destination folder must be inside a
+    writable source and exist."""
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    settings = _cd_settings()
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        try:
+            settings = hcd.set_fields(settings, data if isinstance(data, dict) else {})
+        except hcd.InvalidField as e:
+            return _err("msg.cdInvalidValue", 400, field=e.field)
+        if settings["target"]:
+            mp, _src, real = _cd_target_root(settings["target"])
+            if not mp:
+                return _err("msg.cdTargetOutside", 400)
+            if not os.path.isdir(real):
+                return _err("msg.folderMissing", 400, path=settings["target"])
+        try:
+            settings = hcd.save(settings, CDRIP_CONF)
+        except OSError as e:
+            return jsonify({"success": False, "message": _oserror_detail(e)}), 500
+    return jsonify({
+        "success": True,
+        "settings": settings,
+        "drive": hcd.drive_info(CD_DEVICE),
+        "target_ok": _cd_default_target(settings) is not None,
+        "targets": [{"source_id": s.get("id"), "name": s.get("name") or s.get("label"), "path": s.get("mountpoint")}
+                    for s in _rip_writable_sources()],
+        "ripping": _rip_running(),
+        "choices": {"auto_start": list(hcd.AUTO_START), "retries": list(hcd.RETRIES),
+                    "pre_emphasis": list(hcd.PRE_EMPHASIS), "speed": list(hcd.SPEEDS)},
+    })
+
+
+@app.route("/api/cd/settings/offset_lookup", methods=["POST"])
+def api_cd_offset_lookup():
+    """Daphile's "Calibrate": the drive's read offset from AccurateRip's
+    public list (accuraterip.com/driveoffsets.htm), matched on vendor and
+    model and saved into the settings."""
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    drive = hcd.drive_info(CD_DEVICE)
+    if not (drive.get("vendor") or drive.get("model")):
+        return _err("msg.cdNoDrive", 400)
+    try:
+        found = hcd.lookup_offset(drive.get("vendor"), drive.get("model"))
+    except Exception as e:
+        return _err("msg.cdOffsetLookupFailed", 502, err=_exc_detail(e))
+    if not found.get("found"):
+        return _err("msg.cdOffsetNotFound", 404, drive=drive.get("label") or drive.get("node"))
+    settings = hcd.save(hcd.set_fields(_cd_settings(), {"offset": int(found["offset"])}), CDRIP_CONF)
+    return jsonify({"success": True, "offset": found["offset"], "drive": found["drive"],
+                    "submitted": found["submitted"], "agree": found["agree"], "settings": settings,
+                    "message": _m("msg.cdOffsetFound", offset=f"{found['offset']:+d}", drive=found["drive"])})
+
+
+_cd_auto_seen = {}   # discid -> True once auto-start has decided about that disc
+
+
+def cd_monitor(interval=5):
+    """Automatic start: when a disc appears and Settings → CD ripping says so,
+    rip it into the default folder without anyone touching a screen. One
+    decision per disc — a failed or cancelled rip is not retried until the
+    disc comes out and back in."""
+    while True:
+        time.sleep(interval)
+        try:
+            s = _cd_settings()
+            if not s.get("enabled") or s.get("auto_start") == "off":
+                continue
+            toc = _cd_toc()
+            if not toc:
+                _cd_auto_seen.clear()
+                continue
+            if toc["discid"] in _cd_auto_seen or _rip_running():
+                continue
+            _cd_auto_seen[toc["discid"]] = True
+            meta = _cd_metadata(toc)
+            if s["auto_start"] == "if_tags" and not meta.get("mbid"):
+                print(f"[sources] cd auto-start: disc {toc['discid']} unknown to MusicBrainz, waiting for the owner")
+                continue
+            if not _cd_default_target(s) and len(_rip_writable_sources()) != 1:
+                print("[sources] cd auto-start: no default folder set and more than one writable source")
+                continue
+            with app.app_context():
+                _body, status = _cd_start_rip({}, toc, auto=True)
+            print(f"[sources] cd auto-start: disc {toc['discid']} -> {status}")
+        except Exception as e:
+            print(f"[sources] cd monitor error: {e}")
+
+
+@app.route("/api/cd/rip/status", methods=["GET"])
+def api_cd_rip_status():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    return jsonify(_rip_state_for_reader())
+
+
+def _rip_state_for_reader():
+    """The rip status with its line in the reader's language: the worker
+    writes a hifi_i18n code and its values (hifi-rip-cd.py msg()), and the
+    kiosk and the web admin may each be in another one. A status without a
+    code (an older worker) is handed back as written."""
+    st = _rip_state()
+    code = st.get("code")
+    if code:
+        values = st.get("vars") if isinstance(st.get("vars"), dict) else {}
+        if code.startswith("disk."):           # the system disk's reserve: sizes in bytes
+            try:
+                e = hdg.NoRoom("", int(values.get("need", 0)), int(values.get("room", 0)), int(values.get("reserve", 0)))
+                st["message"] = hdg.message(e, _hlang(), stopped=code == "disk.noRoomStopped")
+            except (TypeError, ValueError):
+                st["message"] = _ht(code, _hlang())
+        else:
+            st["message"] = _ht(code, _hlang(), **values)
+    return st
+
+
+@app.route("/api/cd/eject", methods=["POST"])
+def api_cd_eject():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    if _rip_running():
+        return _err("msg.ripInProgress", 409)
+    r = _run(["eject", CD_DEVICE], timeout=20)
+    return jsonify({"success": r.returncode == 0})
+
+
+@app.route("/api/internal/smb", methods=["GET"])
+def api_internal_smb():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    installed = _run(["which", "smbd"], timeout=5).returncode == 0
+    enabled = False
+    if installed:
+        try:
+            r = _run(["systemctl", "is-enabled", "smbd"], timeout=5)
+            enabled = r.returncode == 0 or (r.stdout or "").strip() == "enabled"
+        except Exception:
+            pass
+    shares = []
+    for s in _adopted_disk_sources():
+        shares.append({
+            "name": s.get("share") or "Musica",
+            "mountpoint": s.get("mountpoint") or s.get("path"),
+            "source_id": s.get("id"),
+            "type": s.get("type"),
+        })
+    password = ""
+    if os.path.exists(SAMBA_CRED_FILE):
+        try:
+            with open(SAMBA_CRED_FILE) as f:
+                cred = json.load(f)
+            password = cred.get("password", "")
+        except Exception:
+            pass
+    ips = _ip_addresses()
+    return jsonify({
+        "installed": installed,
+        "enabled": enabled,
+        "shares": shares,
+        "username": SAMBA_USER,
+        "password": password,
+        "host": "hifiplayer.local",
+        "ip": ips[0] if ips else "",
+    })
+
+
+@app.route("/api/internal/smb/regenerate", methods=["POST"])
+def api_internal_smb_regenerate():
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    if _run(["which", "smbd"], timeout=5).returncode != 0:
+        return _err("msg.sambaMissing", 424)
+    with _lock:
+        password = _create_samba_user(force_new_password=True)
+    return jsonify({"success": True, "username": SAMBA_USER, "password": password})
+
+
+@app.route("/api/usb", methods=["GET"])
+def api_usb():
+    """List USB devices that need attention: no recognized filesystem
+    (needs_format) or the last automatic mount attempt failed (error).
+    Healthy devices don't appear here — usb_sync() auto-adopts them as soon
+    as they're plugged in and they show up under /api/sources instead."""
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    # Serve the snapshot kept fresh by the background usb_monitor thread instead
+    # of re-scanning on every poll. Only force a scan if none has run yet.
+    entries = _usb_state
+    if entries is None:
+        try:
+            entries = usb_sync()
+        except Exception:
+            app.logger.exception("Failed to enumerate USB disks")
+            return jsonify({"disks": [], "error": "Unable to enumerate USB disks."}), 500
+    disks = [
+        {
+            "label": p.get("label") or p.get("name"),
+            "fstype": p.get("fstype"),
+            "size": p.get("size"),
+            "needs_format": p.get("needs_format", False),
+            "error": p.get("error"),
+            # Device node, used by the "Riprova" (manual retry adopt) action.
+            "path": p.get("path"),
+        }
+        for p in entries
+    ]
+    return jsonify({"disks": disks})
+
+
+# ─────────────────────────── Web UI ─────────────────────────────────
+# This page is the functional twin of the kiosk's SourcesManager.jsx +
+# InternalDisks.jsx, and it is what the web admin embeds and what the setup
+# wizard's QR code points a phone at. It used to be hardcoded Italian, so an
+# English user got an Italian page in the middle of an otherwise translated
+# setup. The catalog below deliberately reuses the *same key names and English
+# wording* as src/i18n/locales/{en,it}.json (`sources.*`) — those JSONs are
+# bundled into the Electron app by Vite and are not readable from here at
+# runtime, so they are mirrored rather than shared. Keep the two in sync when
+# either side changes wording.
+SOURCES_I18N = {
+    "en": {
+        "sources.title": "Music sources",
+        "sources.intro": "Add the folders that contain your music. When you are done, press Apply to update the library.",
+        "sources.back": "Back",
+        "sources.done": "Done",
+        "sources.loading": "Loading…",
+        "sources.active": "Active sources",
+        "sources.none": "No sources yet. Add one below.",
+        "sources.usbAttention": "USB devices needing attention",
+        "sources.usbNeedsFormat": "No recognized filesystem — format it from a computer.",
+        "sources.usbMountError": "Mount error",
+        "sources.usbRetry": "Retry",
+        "sources.addLocal": "Add local folder",
+        "sources.localPath": "Path on the device",
+        "sources.localPathPlaceholder": "/media/music",
+        "sources.addSmb": "Add network folder (SMB)",
+        "sources.server": "Server / IP",
+        "sources.share": "Share",
+        "sources.sharePlaceholder": "Music",
+        "sources.user": "User (empty = guest)",
+        "sources.userPlaceholder": "user",
+        "sources.pass": "Password",
+        "sources.smbRw": "Allow writing (needed to use it as a CD-rip destination)",
+        "sources.smbMakeRw": "Make writable",
+        "sources.smbMakeRo": "Make read-only",
+        "sources.mountAndAdd": "Mount and add",
+        "sources.mounting": "Mounting…",
+        "sources.mounted": "Mounted ✓",
+        "sources.added": "Added ✓",
+        "sources.remove": "Remove",
+        "sources.local": "LOCAL",
+        "sources.smbTag": "SMB",
+        "sources.mountedShort": "mounted",
+        "sources.notMounted": "not mounted",
+        "sources.ok": "ok",
+        "sources.missing": "missing",
+        "sources.error": "Error",
+        "sources.networkError": "Network error",
+        "sources.apply": "Apply & rescan library",
+        "sources.applyHint": "Saves the sources above and rescans the music library.",
+        "sources.playlistdirTitle": "Playlist folder",
+        "sources.playlistdirHint": "Where Lyrion saves the playlists you create from the player. The default is fine for most setups — pick a folder on your own disk if you want the playlists next to your music. Whichever folder you pick, you can also add it as a folder above and share it on the network, to copy playlists onto the device from a PC.",
+        "sources.playlistdirCurrent": "Current folder",
+        "sources.playlistdirUse": "Use this folder",
+        "sources.playlistdirDefault": "Restore default",
+        "sources.playlistdirSaving": "Saving…",
+        "sources.applying": "Applying…",
+        "sources.applied": "Done ✓",
+        "sources.internal.title": "Internal disks",
+        "sources.internal.none": "No additional internal disk detected.",
+        "sources.internal.tag": "INTERNAL",
+        "sources.internal.adopt": "Use as source",
+        "sources.internal.use": "Use",
+        "sources.internal.adopted": "Source added ✓",
+        "sources.internal.adoptedBadge": "adopted",
+        "sources.internal.adopting": "Mounting…",
+        "sources.internal.hasData": "contains data",
+        "sources.internal.remove": "Remove",
+        "sources.internal.removed": "Removed ✓",
+        "sources.internal.format": "Format…",
+        "sources.internal.wizardTitle": "Format disk",
+        "sources.internal.fsLabel": "Filesystem",
+        "sources.internal.fsExt4": "ext4 (recommended)",
+        "sources.internal.fsExfat": "exFAT",
+        "sources.internal.labelField": "Disk label",
+        "sources.internal.defaultLabel": "Music",
+        "sources.internal.cancel": "Cancel",
+        "sources.internal.next": "Next",
+        "sources.internal.backStep": "Back",
+        "sources.internal.warnTitle": "This will erase all data",
+        "sources.internal.warnBody": "All data on {model} ({size}, {path}) will be permanently erased. This cannot be undone.",
+        "sources.internal.typeToConfirm": "Type \"{label}\" to confirm",
+        "sources.internal.formatNow": "Format now",
+        "sources.internal.phasePreparing": "Preparing disk…",
+        "sources.internal.inProgress": "In progress…",
+        "sources.internal.keepPowered": "Keep the appliance powered on until this finishes.",
+        "sources.internal.doneAdopted": "Disk formatted and added as a source ✓",
+        "sources.internal.doneHint": "Copy your music to the network share below, then apply & rescan the library.",
+        "sources.internal.errorTitle": "Error",
+        "sources.internal.close": "Close",
+        "sources.internal.needOsUpdate": "A system update is required to enable network sharing (Samba) for internal disks.",
+        "sources.internal.smbTitle": "Network share",
+        "sources.internal.smbHelp": "Copy music from a PC by connecting to this path with the credentials below.",
+        "sources.internal.smbUser": "Username",
+        "sources.internal.smbPass": "Password",
+        "sources.internal.smbRegenerate": "Regenerate password",
+        # ── API messages ────────────────────────────────────────────
+        # Rendered verbatim by the kiosk's SourcesManager/InternalDisks, so an
+        # Italian string here showed up in the middle of the English UI. Every
+        # response also carries a stable `code`, so a client can translate on
+        # its own side later without another backend change.
+        "msg.noFile": "No file uploaded.",
+        "msg.fileTooLarge": "File too large.",
+        "msg.fileTooLarge20": "File too large (max 20 MB).",
+        "msg.fileEmpty": "The file is empty.",
+        "msg.saveFailed": "Could not save the file.",
+        "msg.badFilterFormat": "Unsupported format (use .wav or .txt).",
+        "msg.filterUploaded": "Filter uploaded. Enable it in Settings → DSP.",
+        "msg.notAllowedRemotely": "Not allowed from a remote connection.",
+        "msg.tooManyAttempts": "Too many attempts, try again in a few minutes.",
+        "msg.badPairToken": "Missing or invalid pairing token.",
+        "msg.dspUnavailable": "The DSP service is unavailable.",
+        "msg.dspUnreachable": "The DSP service is unreachable.",
+        "msg.skinInvalid": "Invalid skin value.",
+        "msg.skinBusy": "A skin change is already in progress.",
+        "msg.skinLmsMissing": "Lyrion is not installed on this device.",
+        "msg.skinInstalling": "Installing the Material web interface…",
+        "msg.skinApplying": "Applying the skin…",
+        "msg.skinApplied": "Skin applied.",
+        "msg.skinInstallFailed": "Could not download the Material web interface. Check the network connection and try again.",
+        "msg.skinApplyFailed": "Could not apply the skin.",
+        "msg.lmsSetupBusy": "Lyrion is already being set up.",
+        "msg.lmsSetupBadPlugin": "Unknown plugin.",
+        "msg.lmsSetupInstalling": "Installing the selected services…",
+        "msg.lmsSetupApplying": "Finishing the Lyrion setup…",
+        "msg.lmsSetupDone": "Lyrion is set up.",
+        "msg.lmsSetupFailed": "Could not finish the Lyrion setup.",
+        "msg.playlistdirSaved": "Playlist folder saved.",
+        "msg.playlistdirNotWritable": "Could not use {path} as the playlist folder.",
+        "msg.pathMissing": "Path missing.",
+        "msg.pathNotAllowed": "This path is not allowed.",
+        "msg.folderMissing": "The folder {path} does not exist.",
+        "msg.folderInRam": "This folder is only in the player's memory: what is copied into it is lost when the player restarts. Choose a folder inside a disk, or in Music on this player.",
+        "msg.smbFieldsRequired": "Server and share name are required.",
+        "msg.mountFailed": "Mount failed: {detail}",
+        "msg.badDevice": "Invalid device.",
+        "msg.diskNotFound": "Disk not found, or it is a system disk.",
+        "msg.sourceNotFound": "Source not found.",
+        "msg.noChange": "No change needed.",
+        "msg.subpathNotSupported": "This source type doesn't support a subfolder.",
+        "msg.subpathSaved": "Subfolder saved — the library is being updated.",
+        "msg.sourceActivated": "Source added — the library is being updated.",
+        "msg.rebootRequired": "Saved — reboot the device for this to take effect.",
+        "msg.pickPartition": "Select a partition that has a filesystem.",
+        "msg.partitionNoFs": "That partition has no filesystem.",
+        "msg.unsupportedFs": "Unsupported filesystem.",
+        "msg.badLabel": "Invalid disk label.",
+        "msg.labelTooLongExfat": "Label too long for exFAT (max 11 characters).",
+        "msg.confirmMismatch": "The confirmation does not match.",
+        "msg.alreadyAdopted": "This disk is already used as a source.",
+        "msg.unmountFirst": "The disk is mounted — unmount it first.",
+        "msg.osUpdateForExfat": "An OS update is required to format as exFAT.",
+        "msg.formatInProgress": "A format is already running.",
+        "msg.noAudioCd": "No audio CD in the drive.",
+        "msg.ripInProgress": "A rip is already running.",
+        "msg.noWritableTarget": "No writable destination: add a music folder or a disk in Music sources first.",
+        "msg.cdNoTracksSelected": "Pick at least one track to rip.",
+        "msg.cdDisabled": "CD ripping is turned off in Settings.",
+        "msg.cdInvalidValue": "Invalid value for {field}.",
+        "msg.cdTargetOutside": "The destination folder must be inside a writable music source (the music on this player, an internal or USB disk, or a writable network share).",
+        "msg.cdNoDrive": "No optical drive found.",
+        "msg.cdOffsetLookupFailed": "Could not reach the AccurateRip drive list: {err}",
+        "msg.cdOffsetNotFound": "{drive} is not in the AccurateRip drive list. Look it up at accuraterip.com/driveoffsets.htm and type the offset by hand.",
+        "msg.cdOffsetFound": "Offset {offset} set, as listed for {drive}.",
+        "msg.ripNotRunning": "No rip is running.",
+        "msg.sambaMissing": "Samba is not installed.",
+
+        # ── Network folders: what went wrong, in words ──────────────
+        "msg.smbBadCredentials": "Wrong username or password for this device.",
+        "msg.smbPasswordExpired": "That account's password has expired — change it on the device that shares the folder.",
+        "msg.smbAccountLocked": "That account is locked or disabled on the device that shares the folder.",
+        "msg.smbLoginNotStored": "The username and password could not be stored safely on this device, so the folder was not added.",
+        "msg.smbNoSuchShare": "There is no shared folder with this name on that device.",
+        "msg.smbUnreachable": "{server} is not answering. Check that it is switched on and on the same network.",
+        "msg.smbProtocol": "This device speaks a version of file sharing the player cannot use.",
+        "msg.smbNeedsAuth": "This device asks who you are: enter the username and password you use on it.",
+        "msg.smbNoClient": "This player cannot list shared folders yet — update it, or type the folder name yourself.",
+        "msg.smbListFailed": "Could not read the list of shared folders from this device.",
+        "msg.smbTestFailed": "Could not open this shared folder.",
+        # ── File manager ───────────────────────────────────────────
+        "msg.fileProtected": "This folder is a music source: remove it from the sources list instead of deleting it here.",
+        "msg.fileReadOnly": "This folder cannot be changed: it is read-only.",
+        "msg.fileIntoItself": "A folder cannot be copied into itself.",
+        "msg.fileExists": "\u201c{name}\u201d already exists here.",
+        "msg.badName": "Invalid name.",
+        "msg.unsafeFolderName": "This folder's name contains characters that cannot be used here (a line break, a backslash, or a % followed by a letter): rename the folder first.",
+        "msg.fileOpFailed": "The operation did not finish: {detail}",
+        "msg.jobNotFound": "This operation is no longer available.",
+        "files.rootMusic": "System disk",
+        "files.rootNetwork": "Network folders",
+        "files.rootInternal": "Second disk",
+        "files.rootUsb": "USB drives",
+        "files.rootPlaylists": "Playlists",
+        "files.rootHome": "Personal folders",
+    },
+    "it": {
+        "sources.title": "Sorgenti musicali",
+        "sources.intro": "Aggiungi le cartelle che contengono la tua musica. Al termine premi Applica per aggiornare la libreria.",
+        "sources.back": "Indietro",
+        "sources.done": "Fatto",
+        "sources.loading": "Caricamento…",
+        "sources.active": "Sorgenti attive",
+        "sources.none": "Nessuna sorgente. Aggiungine una qui sotto.",
+        "sources.usbAttention": "Dispositivi USB da controllare",
+        "sources.usbNeedsFormat": "Nessun filesystem riconosciuto — formattala da un computer.",
+        "sources.usbMountError": "Errore di montaggio",
+        "sources.usbRetry": "Riprova",
+        "sources.addLocal": "Aggiungi cartella locale",
+        "sources.localPath": "Percorso sul dispositivo",
+        "sources.localPathPlaceholder": "/media/musica",
+        "sources.addSmb": "Aggiungi cartella di rete (SMB)",
+        "sources.server": "Server / IP",
+        "sources.share": "Condivisione",
+        "sources.sharePlaceholder": "Musica",
+        "sources.user": "Utente (vuoto = ospite)",
+        "sources.userPlaceholder": "utente",
+        "sources.pass": "Password",
+        "sources.smbRw": "Consenti scrittura (necessario per usarla come destinazione del rip CD)",
+        "sources.smbMakeRw": "Rendi scrivibile",
+        "sources.smbMakeRo": "Rendi sola lettura",
+        "sources.mountAndAdd": "Monta e aggiungi",
+        "sources.mounting": "Montaggio…",
+        "sources.mounted": "Montata ✓",
+        "sources.added": "Aggiunta ✓",
+        "sources.remove": "Rimuovi",
+        "sources.local": "LOCALE",
+        "sources.smbTag": "SMB",
+        "sources.mountedShort": "montato",
+        "sources.notMounted": "non montato",
+        "sources.ok": "ok",
+        "sources.missing": "mancante",
+        "sources.error": "Errore",
+        "sources.networkError": "Errore di rete",
+        "sources.apply": "Applica e scansiona libreria",
+        "sources.applyHint": "Salva le sorgenti qui sopra e riscansiona la libreria musicale.",
+        "sources.playlistdirTitle": "Cartella playlist",
+        "sources.playlistdirHint": "Dove Lyrion salva le playlist che crei dal player. Per la maggior parte dei casi va bene quella predefinita — scegli una cartella sul tuo disco se le vuoi vicino alla musica. Qualunque cartella scegli, puoi anche aggiungerla qui sopra e condividerla in rete, per copiarci dentro le playlist da un PC.",
+        "sources.playlistdirCurrent": "Cartella attuale",
+        "sources.playlistdirUse": "Usa questa cartella",
+        "sources.playlistdirDefault": "Ripristina predefinita",
+        "sources.playlistdirSaving": "Salvataggio…",
+        "sources.applying": "Applico…",
+        "sources.applied": "Fatto ✓",
+        "sources.internal.title": "Dischi interni",
+        "sources.internal.none": "Nessun disco interno aggiuntivo rilevato.",
+        "sources.internal.tag": "INTERNO",
+        "sources.internal.adopt": "Usa come sorgente",
+        "sources.internal.use": "Usa",
+        "sources.internal.adopted": "Sorgente aggiunta ✓",
+        "sources.internal.adoptedBadge": "adottato",
+        "sources.internal.adopting": "Montaggio…",
+        "sources.internal.hasData": "dati presenti",
+        "sources.internal.remove": "Rimuovi",
+        "sources.internal.removed": "Rimossa ✓",
+        "sources.internal.format": "Formatta…",
+        "sources.internal.wizardTitle": "Formatta disco",
+        "sources.internal.fsLabel": "Filesystem",
+        "sources.internal.fsExt4": "ext4 (consigliato)",
+        "sources.internal.fsExfat": "exFAT",
+        "sources.internal.labelField": "Etichetta disco",
+        "sources.internal.defaultLabel": "Musica",
+        "sources.internal.cancel": "Annulla",
+        "sources.internal.next": "Avanti",
+        "sources.internal.backStep": "Indietro",
+        "sources.internal.warnTitle": "Questa operazione cancella tutti i dati",
+        "sources.internal.warnBody": "Tutti i dati su {model} ({size}, {path}) verranno cancellati in modo permanente. L'operazione non può essere annullata.",
+        "sources.internal.typeToConfirm": "Digita \"{label}\" per confermare",
+        "sources.internal.formatNow": "Formatta ora",
+        "sources.internal.phasePreparing": "Preparazione disco…",
+        "sources.internal.inProgress": "In corso…",
+        "sources.internal.keepPowered": "Tieni acceso l'apparecchio finché l'operazione non termina.",
+        "sources.internal.doneAdopted": "Disco formattato e aggiunto come sorgente ✓",
+        "sources.internal.doneHint": "Copia la musica nella condivisione di rete qui sotto, poi applica e riscansiona la libreria.",
+        "sources.internal.errorTitle": "Errore",
+        "sources.internal.close": "Chiudi",
+        "sources.internal.needOsUpdate": "È necessario un aggiornamento di sistema per abilitare la condivisione di rete (Samba) dei dischi interni.",
+        "sources.internal.smbTitle": "Condivisione di rete",
+        "sources.internal.smbHelp": "Copia la musica da un PC collegandoti a questo percorso con le credenziali qui sotto.",
+        "sources.internal.smbUser": "Utente",
+        "sources.internal.smbPass": "Password",
+        "sources.internal.smbRegenerate": "Rigenera password",
+        # ── Messaggi API (vedi il blocco inglese) ───────────────────
+        "msg.noFile": "Nessun file caricato.",
+        "msg.fileTooLarge": "File troppo grande.",
+        "msg.fileTooLarge20": "File troppo grande (max 20 MB).",
+        "msg.fileEmpty": "Il file è vuoto.",
+        "msg.saveFailed": "Salvataggio fallito.",
+        "msg.badFilterFormat": "Formato non supportato (usa .wav o .txt).",
+        "msg.filterUploaded": "Filtro caricato. Attivalo da Impostazioni → DSP.",
+        "msg.notAllowedRemotely": "Non consentito da remoto.",
+        "msg.tooManyAttempts": "Troppi tentativi, riprova tra qualche minuto.",
+        "msg.badPairToken": "Token di pairing mancante o non valido.",
+        "msg.dspUnavailable": "Servizio DSP non disponibile.",
+        "msg.dspUnreachable": "Servizio DSP non raggiungibile.",
+        "msg.skinInvalid": "Valore skin non valido.",
+        "msg.skinBusy": "Un cambio di skin è già in corso.",
+        "msg.skinLmsMissing": "Lyrion non è installato su questo dispositivo.",
+        "msg.skinInstalling": "Installazione dell'interfaccia web Material…",
+        "msg.skinApplying": "Applicazione della skin…",
+        "msg.skinApplied": "Skin applicata.",
+        "msg.skinInstallFailed": "Impossibile scaricare l'interfaccia web Material. Controlla la connessione di rete e riprova.",
+        "msg.skinApplyFailed": "Impossibile applicare la skin.",
+        "msg.lmsSetupBusy": "La configurazione di Lyrion è già in corso.",
+        "msg.lmsSetupBadPlugin": "Plugin sconosciuto.",
+        "msg.lmsSetupInstalling": "Installazione dei servizi selezionati…",
+        "msg.lmsSetupApplying": "Completamento della configurazione di Lyrion…",
+        "msg.lmsSetupDone": "Lyrion è configurato.",
+        "msg.lmsSetupFailed": "Impossibile completare la configurazione di Lyrion.",
+        "msg.playlistdirSaved": "Cartella playlist salvata.",
+        "msg.playlistdirNotWritable": "Impossibile usare {path} come cartella playlist.",
+        "msg.pathMissing": "Percorso mancante.",
+        "msg.pathNotAllowed": "Percorso non consentito.",
+        "msg.folderMissing": "La cartella {path} non esiste.",
+        "msg.folderInRam": "Questa cartella sta solo nella memoria dell'apparecchio: quello che ci copi si perde al riavvio. Scegli una cartella dentro un disco, oppure in Musica su questo apparecchio.",
+        "msg.smbFieldsRequired": "Server e nome condivisione obbligatori.",
+        "msg.mountFailed": "Mount fallito: {detail}",
+        "msg.badDevice": "Device non valido.",
+        "msg.diskNotFound": "Disco non trovato o di sistema.",
+        "msg.sourceNotFound": "Sorgente non trovata.",
+        "msg.noChange": "Nessuna modifica necessaria.",
+        "msg.subpathNotSupported": "Questo tipo di sorgente non supporta una sottocartella.",
+        "msg.subpathSaved": "Sottocartella salvata — la libreria si sta aggiornando.",
+        "msg.sourceActivated": "Sorgente aggiunta — la libreria si sta aggiornando.",
+        "msg.rebootRequired": "Salvato — riavvia il dispositivo perché la modifica abbia effetto.",
+        "msg.pickPartition": "Seleziona una partizione con filesystem.",
+        "msg.partitionNoFs": "Partizione senza filesystem.",
+        "msg.unsupportedFs": "Filesystem non supportato.",
+        "msg.badLabel": "Etichetta non valida.",
+        "msg.labelTooLongExfat": "Etichetta troppo lunga per exFAT (max 11 caratteri).",
+        "msg.confirmMismatch": "Conferma non corrispondente.",
+        "msg.alreadyAdopted": "Disco già adottato come sorgente.",
+        "msg.unmountFirst": "Disco montato, smontalo prima.",
+        "msg.osUpdateForExfat": "Aggiornamento OS richiesto per formattare exFAT.",
+        "msg.formatInProgress": "Formattazione già in corso.",
+        "msg.noAudioCd": "Nessun CD audio nel lettore.",
+        "msg.ripInProgress": "Rip già in corso.",
+        "msg.noWritableTarget": "Nessuna destinazione scrivibile: aggiungi prima una cartella di musica o un disco in Sorgenti musicali.",
+        "msg.cdNoTracksSelected": "Scegli almeno una traccia da rippare.",
+        "msg.cdDisabled": "Il rip dei CD è disattivato nelle Impostazioni.",
+        "msg.cdInvalidValue": "Valore non valido per {field}.",
+        "msg.cdTargetOutside": "La cartella di destinazione deve stare dentro una sorgente musicale scrivibile (la musica su questo apparecchio, un disco interno o USB, o una condivisione di rete scrivibile).",
+        "msg.cdNoDrive": "Nessun lettore ottico trovato.",
+        "msg.cdOffsetLookupFailed": "Elenco AccurateRip dei lettori non raggiungibile: {err}",
+        "msg.cdOffsetNotFound": "{drive} non è nell'elenco AccurateRip dei lettori. Cercalo su accuraterip.com/driveoffsets.htm e scrivi l'offset a mano.",
+        "msg.cdOffsetFound": "Offset {offset} impostato, come indicato per {drive}.",
+        "msg.ripNotRunning": "Nessun rip in corso.",
+        "msg.sambaMissing": "Samba non installato.",
+
+        # ── Network folders: what went wrong, in words ──────────────
+        "msg.smbBadCredentials": "Nome utente o password non corretti per questo dispositivo.",
+        "msg.smbPasswordExpired": "La password di questo account è scaduta: cambiala sul dispositivo che condivide la cartella.",
+        "msg.smbAccountLocked": "Questo account è bloccato o disattivato sul dispositivo che condivide la cartella.",
+        "msg.smbLoginNotStored": "Non è stato possibile conservare in modo sicuro nome utente e password su questo dispositivo: la cartella non è stata aggiunta.",
+        "msg.smbNoSuchShare": "Su quel dispositivo non c'è nessuna cartella condivisa con questo nome.",
+        "msg.smbUnreachable": "{server} non risponde. Controlla che sia acceso e sulla stessa rete.",
+        "msg.smbProtocol": "Questo dispositivo usa una versione della condivisione file che il lettore non sa usare.",
+        "msg.smbNeedsAuth": "Questo dispositivo chiede chi sei: inserisci il nome utente e la password che usi su di esso.",
+        "msg.smbNoClient": "Questo lettore non sa ancora elencare le cartelle condivise: aggiornalo, oppure scrivi tu il nome della cartella.",
+        "msg.smbListFailed": "Non è stato possibile leggere l'elenco delle cartelle condivise di questo dispositivo.",
+        "msg.smbTestFailed": "Non è stato possibile aprire questa cartella condivisa.",
+        # ── File manager ───────────────────────────────────────────
+        "msg.fileProtected": "Questa cartella è una sorgente musicale: toglila dall'elenco delle sorgenti invece di cancellarla da qui.",
+        "msg.fileReadOnly": "Questa cartella non si può modificare: è in sola lettura.",
+        "msg.fileIntoItself": "Una cartella non si può copiare dentro sé stessa.",
+        "msg.fileExists": "\u201c{name}\u201d esiste già qui.",
+        "msg.badName": "Nome non valido.",
+        "msg.unsafeFolderName": "Il nome di questa cartella contiene caratteri che qui non si possono usare (un a capo, una barra rovesciata o un % seguito da una lettera): rinomina prima la cartella.",
+        "msg.fileOpFailed": "L'operazione non è stata completata: {detail}",
+        "msg.jobNotFound": "Questa operazione non è più disponibile.",
+        "files.rootMusic": "Disco di sistema",
+        "files.rootNetwork": "Cartelle di rete",
+        "files.rootInternal": "Secondo disco",
+        "files.rootUsb": "Chiavette USB",
+        "files.rootPlaylists": "Playlist",
+        "files.rootHome": "Cartelle personali",
+    },
+}
+DEFAULT_LANG = "en"
+
+
+def _req_lang():
+    """Language for this request: explicit ?lang= wins (the web admin and the
+    kiosk QR both pass their own), then the X-UI-Lang header our own frontends
+    send, then the browser's Accept-Language, then the appliance default.
+    Mirrors how src/i18n/index.jsx picks a locale.
+
+    X-UI-Lang matters more than it looks: the Qt kiosk and the web admin both
+    send it (and nothing else), so without it every `message` in this
+    catalog -- including every "wrong username or password" -- reached an
+    Italian owner in English."""
+    # What gets returned is always one of our own catalog's keys, never the
+    # request's string itself (it ends up in the page's <html lang=...>).
+    wanted = (request.args.get("lang") or "").strip().lower()[:2]
+    for code in SOURCES_I18N:
+        if code == wanted:
+            return code
+    wanted = (request.headers.get("X-UI-Lang") or "").strip().lower()[:2]
+    for code in SOURCES_I18N:
+        if code == wanted:
+            return code
+    header = request.headers.get("Accept-Language", "")
+    for part in header.split(","):
+        wanted = part.split(";")[0].strip().lower()[:2]
+        for code in SOURCES_I18N:
+            if code == wanted:
+                return code
+    return DEFAULT_LANG
+
+
+def _t(key, lang=None, **vars):
+    """Translate `key`, falling back to the default language and then to the key
+    itself, with {placeholder} interpolation."""
+    lang = lang or DEFAULT_LANG
+    table = SOURCES_I18N.get(lang) or SOURCES_I18N[DEFAULT_LANG]
+    text = table.get(key) or SOURCES_I18N[DEFAULT_LANG].get(key) or key
+    for k, v in vars.items():
+        text = text.replace("{" + k + "}", str(v))
+    return text
+
+
+def _m(key, **vars):
+    """Translate an API message in the caller's language. Safe to call from a
+    worker thread with no request context, where it falls back to the default."""
+    try:
+        lang = _req_lang()
+    except Exception:
+        lang = DEFAULT_LANG
+    return _t(key, lang, **vars)
+
+
+def _err(key, status, **vars):
+    """Standard failure body: a stable `code` for clients that translate on
+    their own, plus a `message` already in the caller's language for those
+    (the kiosk, the companion app) that render it verbatim."""
+    return jsonify({"success": False, "code": key, "message": _m(key, **vars)}), status
+
+
+@app.route("/")
+def index():
+    # Gate the page itself, not just the API calls it makes: without this, any
+    # device on the LAN could load this page directly (bypassing the webui:443
+    # session and the companion app's pairing flow entirely) and get the full
+    # Sources UI. Loopback (Electron kiosk, webui's own proxied requests) and
+    # a valid ?token= (the QR-carried phone flow, and webui's minted token —
+    # see sources_app() in webui_server.py) still get through, matching
+    # _require_pair_token()'s existing exemptions.
+    denied = _require_pair_token()
+    if denied:
+        return denied
+    lang = _req_lang()
+    # Only the page's own strings are shipped to the browser; the msg.* half of
+    # the catalog is server-side only.
+    strings = {k: v for k, v in SOURCES_I18N[lang].items() if k.startswith("sources.")}
+    # Reached mid first-boot setup (webui_server.py's captive page links here
+    # with ?setup=1): the library scan is kicked off once at the end of the
+    # setup wizard (see _lms_setup_apply), so "Apply & rescan library" is
+    # misleading/redundant here — swap in setup-appropriate copy for just these
+    # two strings, in whichever language is active. Overriding this local dict
+    # (not SOURCES_I18N itself) leaves the normal Settings -> Sources page's
+    # wording untouched.
+    if request.args.get("setup") == "1":
+        strings["sources.apply"] = {"en": "Save sources", "it": "Salva sorgenti"}.get(lang, "Save sources")
+        strings["sources.applyHint"] = {
+            "en": "Saves the sources above. Your library is scanned once, at the end of the setup.",
+            "it": "Salva le sorgenti qui sopra. La libreria viene scansionata una volta sola, al termine della configurazione.",
+        }.get(lang, strings["sources.applyHint"])
+    html = (INDEX_HTML
+            .replace("__LANG__", lang)
+            .replace("__PAGE_TITLE__", _t("sources.title", lang))
+            .replace("__I18N__", json.dumps(strings, ensure_ascii=False)))
+    return Response(html, mimetype="text/html")
+
+
+INDEX_HTML = r"""<!DOCTYPE html>
+<html lang="__LANG__">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Osmium Sound — __PAGE_TITLE__</title>
+<style>
+  :root { --gold:#d4af37; --bg:#0a0a0a; --surface:#161616; --border:#252525; --silver:#c0c0c0; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:#fff; }
+  .wrap { max-width:640px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { font-size:20px; display:flex; align-items:center; gap:8px; }
+  h1 .dot { width:10px; height:10px; border-radius:50%; background:var(--gold); box-shadow:0 0 8px var(--gold); }
+  h2 { font-size:14px; color:var(--silver); text-transform:uppercase; letter-spacing:.08em; margin:28px 0 10px; }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:16px; margin-bottom:12px; }
+  label { display:block; font-size:12px; color:var(--silver); margin:8px 0 4px; }
+  input { width:100%; background:var(--bg); border:1px solid var(--border); color:#fff; border-radius:10px; padding:11px 12px; font-size:15px; }
+  input:focus { outline:none; border-color:var(--gold); }
+  button { border:0; border-radius:10px; padding:11px 16px; font-weight:600; font-size:14px; cursor:pointer; }
+  .primary { background:var(--gold); color:#000; }
+  .ghost { background:rgba(255,255,255,.06); color:#fff; }
+  .danger { background:transparent; color:#e66; border:1px solid rgba(238,102,102,.4); }
+  .row { display:flex; gap:10px; align-items:center; justify-content:space-between; }
+  .src { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:12px 0; border-bottom:1px solid var(--border); }
+  .src:last-child { border-bottom:0; }
+  .src .meta { min-width:0; }
+  .src .name { font-size:14px; word-break:break-all; }
+  .src .sub { font-size:12px; color:var(--silver); }
+  .tag { font-size:10px; padding:2px 7px; border-radius:6px; background:rgba(212,175,55,.15); color:var(--gold); margin-left:6px; }
+  .ok { color:#5fce8f; } .bad { color:#e66; }
+  .msg { margin-top:10px; font-size:13px; min-height:18px; }
+  .applybar { position:fixed; left:0; right:0; bottom:0; background:#0d0d0dee; backdrop-filter:blur(8px); border-top:1px solid var(--border); padding:10px 16px 12px; }
+  .applybar .inner { max-width:640px; margin:0 auto; }
+  .applybar .hint { font-size:12px; color:var(--silver); margin:0 0 8px; }
+  .applybar .actions { display:flex; gap:10px; align-items:center; }
+  .topbar { position:sticky; top:0; z-index:50; background:#0d0d0dee; backdrop-filter:blur(8px); border-bottom:1px solid var(--border); padding:10px 16px; }
+  .topbar .inner { max-width:640px; margin:0 auto; display:flex; gap:12px; align-items:center; }
+  .topbar a { color:var(--gold); text-decoration:none; font-size:14px; font-weight:600; }
+  .topbar .ttl { font-size:14px; color:var(--silver); }
+</style>
+</head>
+<body>
+<!-- Shown only when there is somewhere to go back TO: a ?back= target passed by
+     the embedder, or ordinary browser history (a phone that scanned the setup
+     wizard's QR lands here with neither, and gets no dead-end button). -->
+<div class="topbar" id="topbar" style="display:none"><div class="inner">
+  <a href="#" id="backLink" onclick="goBack();return false">← <span data-i18n="sources.back"></span></a>
+  <span class="ttl" data-i18n="sources.title"></span>
+</div></div>
+
+<div class="wrap">
+  <h1><span class="dot"></span> <span data-i18n="sources.title"></span></h1>
+  <p style="color:var(--silver);font-size:14px" data-i18n="sources.intro"></p>
+
+  <h2 data-i18n="sources.active"></h2>
+  <div class="card" id="list"><div style="color:var(--silver);font-size:14px" data-i18n="sources.loading"></div></div>
+
+  <div id="usbSection" style="display:none">
+  <h2 data-i18n="sources.usbAttention"></h2>
+  <div class="card" id="usbList"></div>
+  </div>
+
+  <h2 data-i18n="sources.internal.title"></h2>
+  <div class="card" id="internalList"><div style="color:var(--silver);font-size:14px" data-i18n="sources.loading"></div></div>
+  <div class="msg" id="internalMsg"></div>
+
+  <h2 data-i18n="sources.addLocal"></h2>
+  <div class="card">
+    <label data-i18n="sources.localPath"></label>
+    <input id="localPath" data-i18n-ph="sources.localPathPlaceholder">
+    <div style="height:10px"></div>
+    <button class="ghost" onclick="addLocal()" data-i18n="sources.addLocal"></button>
+    <div class="msg" id="localMsg"></div>
+  </div>
+
+  <h2 data-i18n="sources.addSmb"></h2>
+  <div class="card">
+    <div class="row"><div style="flex:1"><label data-i18n="sources.server"></label><input id="smbServer" placeholder="192.168.0.20"></div>
+    <div style="flex:1"><label data-i18n="sources.share"></label><input id="smbShare" data-i18n-ph="sources.sharePlaceholder"></div></div>
+    <div class="row"><div style="flex:1"><label data-i18n="sources.user"></label><input id="smbUser" data-i18n-ph="sources.userPlaceholder"></div>
+    <div style="flex:1"><label data-i18n="sources.pass"></label><input id="smbPass" type="password" placeholder="••••••"></div></div>
+    <div style="height:10px"></div>
+    <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--silver)">
+      <input type="checkbox" id="smbRw" style="width:auto" checked> <span data-i18n="sources.smbRw"></span>
+    </label>
+    <div style="height:12px"></div>
+    <button class="ghost" onclick="addSmb()" data-i18n="sources.mountAndAdd"></button>
+    <div class="msg" id="smbMsg"></div>
+  </div>
+
+  <h2 data-i18n="sources.playlistdirTitle"></h2>
+  <div class="card">
+    <p class="hint" style="margin:0 0 10px" data-i18n="sources.playlistdirHint"></p>
+    <label data-i18n="sources.playlistdirCurrent"></label>
+    <input id="playlistdir" placeholder="/var/lib/squeezeboxserver/playlists">
+    <div style="height:10px"></div>
+    <div class="row">
+      <button class="ghost" onclick="savePlaylistdir()" data-i18n="sources.playlistdirUse"></button>
+      <button class="ghost" onclick="resetPlaylistdir()" data-i18n="sources.playlistdirDefault"></button>
+    </div>
+    <div class="msg" id="playlistdirMsg"></div>
+  </div>
+</div>
+
+<!-- The gold button is an ACTION, not a counter: the caption says what it does,
+     and when there is a way back a second button makes the bar read as a pair
+     of choices rather than a status readout. -->
+<div class="applybar"><div class="inner">
+  <p class="hint" data-i18n="sources.applyHint"></p>
+  <div class="actions">
+    <button class="primary" style="flex:1" onclick="apply()" data-i18n="sources.apply"></button>
+    <button class="ghost" id="doneBtn" style="display:none" onclick="goBack()" data-i18n="sources.done"></button>
+    <span class="msg" id="applyMsg" style="margin:0"></span>
+  </div>
+</div></div>
+
+<script>
+// A remote (non-localhost) visit — reached either embedded in the web admin's
+// Settings/Setup pages (see admin-webui's SourcesFrame.vue, which mints this
+// token itself) or via webui_server.py's own sources_app() route — carries a
+// pairing token in the URL (?token=...). Attach it to every call this page
+// makes so /api/* routes that now require pairing (see _require_pair_token())
+// keep working from a plain phone/PC browser, not just from the Electron
+// kiosk (which is exempt via 127.0.0.1). Backup/restore lives natively in the
+// web admin's own Settings page now (Vue, calling the same /api/backup/*
+// endpoints directly) — this page no longer duplicates it.
+const QS = new URLSearchParams(location.search);
+const PAIR_TOKEN = QS.get('token') || '';
+const LANG = document.documentElement.lang || 'it';
+// Reached mid first-boot setup (webui_server.py's captive page links here
+// with ?setup=1): Apply shouldn't force an immediate Lyrion restart/scan,
+// since the wizard applies the final source list itself, once, right before
+// handing off to Lyrion's own setup wizard.
+const SETUP_MODE = QS.get('setup') === '1';
+
+// ── i18n ────────────────────────────────────────────────────────────
+// Strings for the selected language are injected server-side (see _req_lang);
+// T() mirrors the {placeholder} interpolation of src/i18n/index.jsx.
+const I18N = __I18N__;
+function T(key, vars){
+  let s = I18N[key] != null ? I18N[key] : key;
+  if (vars) for (const k in vars) s = s.split('{'+k+'}').join(vars[k]);
+  return s;
+}
+function applyI18n(root){
+  (root||document).querySelectorAll('[data-i18n]').forEach(el=>{
+    el.textContent = T(el.getAttribute('data-i18n'));
+  });
+  (root||document).querySelectorAll('[data-i18n-ph]').forEach(el=>{
+    el.setAttribute('placeholder', T(el.getAttribute('data-i18n-ph')));
+  });
+}
+applyI18n();
+
+// ── navigation back to whatever embedded/linked us ──────────────────
+const BACK_TO = QS.get('back') || '';
+// When embedded (web admin Settings/Setup) the surrounding page already owns
+// navigation, and history.length reflects the whole tab's joint session
+// history — so it would light up a back bar that both looks wrong inside the
+// frame and would navigate somewhere unexpected. Only an embedder that asks
+// for it explicitly, via ?back=, gets one.
+const FRAMED = window.self !== window.top;
+function goBack(){
+  if (BACK_TO) { location.href = BACK_TO; return; }
+  if (history.length > 1) { history.back(); return; }
+  location.href = '/';
+}
+if (BACK_TO || (!FRAMED && history.length > 1)) {
+  document.getElementById('topbar').style.display = '';
+  document.getElementById('doneBtn').style.display = '';
+  if (BACK_TO) document.getElementById('backLink').href = BACK_TO;
+}
+
+async function j(url, opts){
+  opts = opts || {};
+  if (PAIR_TOKEN) {
+    opts.headers = Object.assign({}, opts.headers, {'Authorization': 'Bearer ' + PAIR_TOKEN});
+  }
+  // Backend messages are translated per request, so every call carries the
+  // language this page is rendered in.
+  const sep = url.indexOf('?') >= 0 ? '&' : '?';
+  const r=await fetch(url + sep + 'lang=' + encodeURIComponent(LANG), opts); return r.json();
+}
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+async function load(){
+  const d=await j('/api/sources');
+  const el=document.getElementById('list');
+  if(!d.sources.length){ el.innerHTML=`<div style="color:var(--silver);font-size:14px">${esc(T('sources.none'))}</div>`; return; }
+  el.innerHTML=d.sources.map(s=>{
+            const isSmb=s.type==='smb';
+    const isInternal=s.type==='internal';
+    const isUsb=s.type==='usb';
+    const mountState=s.mounted?`<span class="ok">${esc(T('sources.mountedShort'))}</span>`
+                              :`<span class="bad">${esc(T('sources.notMounted'))}</span>`;
+    const status=(isSmb||isInternal||isUsb)?mountState
+                      :(s.exists?`<span class="ok">${esc(T('sources.ok'))}</span>`
+                                :`<span class="bad">${esc(T('sources.missing'))}</span>`);
+    const sub=isSmb?('//'+esc(s.server)+'/'+esc(s.share)+' → '+esc(s.mountpoint))
+              :(isInternal||isUsb)?(esc(s.mountpoint||s.path||''))
+              :esc(s.path);
+    const tag=isSmb?(s.rw?T('sources.smbTag')+' · RW':T('sources.smbTag')):isInternal?T('sources.internal.tag'):isUsb?'USB':T('sources.local');
+    const rwBtn=isSmb?`<button class="ghost" onclick="setSmbRw('${s.id}',${s.rw?'false':'true'})">${esc(s.rw?T('sources.smbMakeRo'):T('sources.smbMakeRw'))}</button>`:'';
+    return `<div class="src"><div class="meta"><div class="name">${esc(s.name)}<span class="tag">${esc(tag)}</span></div>
+      <div class="sub">${sub} · ${status}</div></div>
+      <div style="display:flex;gap:6px">${rwBtn}<button class="danger" onclick="rm('${s.id}')">${esc(T('sources.remove'))}</button></div></div>`;
+  }).join('');
+}
+async function addLocal(){
+  const path=document.getElementById('localPath').value.trim();
+  const m=document.getElementById('localMsg'); m.textContent='…';
+  const r=await j('/api/sources/local',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})});
+  m.textContent=r.success?T('sources.added'):(r.message||T('sources.error')); m.className='msg '+(r.success?'ok':'bad');
+  if(r.success){document.getElementById('localPath').value='';load();}
+}
+// Playlist folder — where Lyrion saves playlists created from the player.
+// ensure_playlistdir() already picks a working default; this is the override,
+// the last thing Lyrion's own setup wizard used to ask for.
+let PLAYLISTDIR_DEFAULT = '';
+async function loadPlaylistdir(){
+  const d = await j('/api/playlistdir');
+  if (!d || !d.success) return;
+  PLAYLISTDIR_DEFAULT = d.default || '';
+  document.getElementById('playlistdir').value = d.path || '';
+}
+async function setPlaylistdir(path){
+  const m=document.getElementById('playlistdirMsg'); m.textContent=T('sources.playlistdirSaving'); m.className='msg';
+  const r=await j('/api/playlistdir',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})});
+  m.textContent=r.success?(r.message||T('sources.applied')):(r.message||T('sources.error'));
+  m.className='msg '+(r.success?'ok':'bad');
+  if(r.success) document.getElementById('playlistdir').value=r.path||path;
+}
+function savePlaylistdir(){
+  const path=document.getElementById('playlistdir').value.trim();
+  if(!path) return;
+  setPlaylistdir(path);
+}
+function resetPlaylistdir(){ if(PLAYLISTDIR_DEFAULT) setPlaylistdir(PLAYLISTDIR_DEFAULT); }
+async function addSmb(){
+  const body={server:smbServer.value,share:smbShare.value,username:smbUser.value,password:smbPass.value,rw:document.getElementById('smbRw').checked};
+  const m=document.getElementById('smbMsg'); m.textContent=T('sources.mounting');
+  const r=await j('/api/sources/smb',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  m.textContent=r.success?(T('sources.mounted')+' '+(r.message||'')):(r.message||T('sources.error')); m.className='msg '+(r.success?'ok':'bad');
+  if(r.success){smbPass.value='';document.getElementById('smbRw').checked=true;load();}
+}
+async function rm(id){ await j('/api/sources/'+id,{method:'DELETE'}); load(); }
+async function setSmbRw(id,rw){
+  const m=document.getElementById('smbMsg'); m.textContent=T('sources.mounting');
+  const r=await j('/api/sources/'+id+'/rw',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rw})});
+  m.textContent=r.success?(r.message||T('sources.mounted')):(r.message||T('sources.error')); m.className='msg '+(r.success?'ok':'bad');
+  if(r.success) load();
+}
+
+async function apply(){
+  const m=document.getElementById('applyMsg');
+  if (SETUP_MODE) {
+    // Sources are already persisted by each add/remove call above — what
+    // /api/apply additionally does is push mediadirs into Lyrion's prefs and
+    // restart it, which is also what triggers Lyrion's own scan-on-restart.
+    // The wizard does that exactly once, right before handing off to
+    // Lyrion's own setup wizard, so it isn't duplicated here.
+    m.textContent=T('sources.applied'); m.className='msg ok';
+    return;
+  }
+  m.textContent=T('sources.applying'); m.className='msg';
+  const r=await j('/api/apply',{method:'POST'});
+  m.textContent=r.message||(r.success?T('sources.applied'):T('sources.error')); m.className='msg '+(r.success?'ok':'bad');
+}
+
+// ── USB devices needing attention ───────────────────────────────────
+// Healthy USB drives auto-adopt the instant they're plugged in (mount
+// read-write + Samba share, see sources_server.py's usb_sync()) — no action
+// here, they just show up in the sources list above. This panel only ever
+// lists what auto-adoption couldn't handle on its own: no recognized
+// filesystem, or a failed mount attempt. Device paths are kept in an array
+// and referenced by index in onclick handlers, so a label with quotes/
+// specials can never break the markup.
+let usbDevices=[];
+async function loadUsb(){
+  let d; try{ d=await j('/api/usb'); }catch(e){ return; }
+  const section=document.getElementById('usbSection');
+  const el=document.getElementById('usbList'); usbDevices=[];
+  if(!d.disks || !d.disks.length){ section.style.display='none'; return; }
+  section.style.display='';
+  el.innerHTML=d.disks.map(dk=>{
+    const devi=usbDevices.push(dk.path||'')-1;
+    const tag=`USB${dk.fstype?(' '+esc(dk.fstype)):''}${dk.size?(' · '+esc(dk.size)):''}`;
+    const head=`<div class="name">${esc(dk.label)||'USB'}<span class="tag">${tag}</span></div>`;
+    const reason=`<div class="sub" style="color:#e66">${dk.needs_format?esc(T('sources.usbNeedsFormat')):esc(T('sources.usbMountError'))+': '+esc(dk.error||'')}</div>`;
+    const retry=(!dk.needs_format&&dk.path)?`<button class="ghost" onclick="retryUsb(${devi})">${esc(T('sources.usbRetry'))}</button>`:'';
+    return `<div style="margin-bottom:14px">${head}${reason}<div style="height:8px"></div><div class="row" style="gap:8px">${retry}</div></div>`;
+  }).join('');
+}
+async function retryUsb(i){
+  const device=usbDevices[i]; if(!device) return;
+  const r=await j('/api/usb/adopt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device})});
+  if(r.success){ loadUsb(); load(); } else { alert(r.message||T('sources.error')); }
+}
+
+// ── Internal disks (adopt existing filesystem / format) ─────────────
+// Mirrors the kiosk's InternalDisks.jsx: enumerate non-USB/non-system block
+// devices, adopt an existing filesystem as a source, or run the guided format
+// wizard (choose fs + label, type-to-confirm the destructive wipe, poll
+// progress). Disk objects are kept in an array and referenced by index in
+// onclick handlers so a model/label with quotes can never break the markup.
+let internalDisks=[];
+const fmtSize=(bytes)=>{ const n=Number(bytes)||0; const gb=n/1024**3; if(gb<=0) return ''; return gb>=1000?((gb/1024).toFixed(1)+' TB'):(Math.round(gb)+' GB'); };
+function internalMsg(t,cls){ const el=document.getElementById('internalMsg'); el.textContent=t||''; el.className='msg'+(cls?(' '+cls):''); }
+async function loadInternal(){
+  let d; try{ d=await j('/api/internal/disks'); }catch(e){ return; }
+  internalDisks=d.disks||[];
+  const el=document.getElementById('internalList');
+  if(!internalDisks.length){ el.innerHTML=`<div style="color:var(--silver);font-size:14px">${esc(T('sources.internal.none'))}</div>`; return; }
+  el.innerHTML=internalDisks.map((dk,di)=>{
+    const fsParts=(dk.partitions||[]).filter(p=>p.fstype);
+    const badges=`${esc(fmtSize(dk.size))}`+(dk.adopted?` · <span style="color:#5fce8f">${esc(T('sources.internal.adoptedBadge'))}</span>`:(dk.has_data?(' · '+esc(T('sources.internal.hasData'))):''));
+    const sub=`${esc(dk.path)}${dk.fstype?(' · '+esc(dk.fstype)):''}${dk.label?(' · '+esc(dk.label)):''}`;
+    const head=`<div class="name">${esc(dk.model||dk.path)}<span class="tag">${badges}</span></div><div class="sub">${sub}</div>`;
+    let actions;
+    if(dk.adopted){
+      actions=`<button class="danger" onclick="removeInternal('${esc(dk.source_id||'')}')">${esc(T('sources.internal.remove'))}</button>`;
+    } else {
+      const adoptBtn=fsParts.length===1?`<button class="ghost" onclick="adoptInternal(${di},'${esc(fsParts[0].path)}')">${esc(T('sources.internal.adopt'))}</button>`:'';
+      actions=`${adoptBtn}<button class="danger" onclick="openFormatWizard(${di})">${esc(T('sources.internal.format'))}</button>`;
+    }
+    const multi=(!dk.adopted && fsParts.length>1)?('<div style="height:8px"></div>'+fsParts.map(p=>
+      `<div class="src"><div class="meta"><div class="sub">${esc(p.path)} · ${esc(p.fstype)}${p.label?(' · '+esc(p.label)):''}</div></div><button class="ghost" onclick="adoptInternal(-1,'${esc(p.path)}')">${esc(T('sources.internal.use'))}</button></div>`
+    ).join(''))+'':'';
+    return `<div style="margin-bottom:14px"><div class="row">${head}<div style="display:flex;gap:8px;flex-shrink:0">${actions}</div></div>${multi}</div>`;
+  }).join('');
+}
+async function adoptInternal(_di,device){
+  internalMsg(T('sources.internal.adopting'));
+  const r=await j('/api/internal/adopt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device})});
+  internalMsg(r.success?T('sources.internal.adopted'):(r.message||T('sources.error')), r.success?'ok':'bad');
+  if(r.success){ loadInternal(); load(); }
+}
+async function removeInternal(sourceId){
+  if(!sourceId) return;
+  await j('/api/sources/'+sourceId,{method:'DELETE'});
+  internalMsg(T('sources.internal.removed'),'ok');
+  loadInternal(); load();
+}
+
+// Format wizard state (single instance — one disk formatted at a time).
+let fmtDisk=null, fmtStep='choose', fmtFs='ext4', fmtLabel=T('sources.internal.defaultLabel'), fmtPollTimer=null;
+function openFormatWizard(di){
+  fmtDisk=internalDisks[di]; if(!fmtDisk) return;
+  fmtStep='choose'; fmtFs='ext4'; fmtLabel=T('sources.internal.defaultLabel'); window.fmtTypedVal='';
+  renderFormatWizard();
+}
+function closeFormatWizard(){
+  if(fmtPollTimer){ clearInterval(fmtPollTimer); fmtPollTimer=null; }
+  fmtDisk=null;
+  document.getElementById('fmtOverlay')?.remove();
+}
+function renderFormatWizard(){
+  document.getElementById('fmtOverlay')?.remove();
+  if(!fmtDisk) return;
+  const ov=document.createElement('div');
+  ov.id='fmtOverlay';
+  ov.style.cssText='position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.8);display:flex;align-items:center;justify-content:center;padding:20px';
+  let inner='';
+  if(fmtStep==='choose'){
+    inner=`<h3 style="margin:0 0 4px">${esc(T('sources.internal.wizardTitle'))}</h3>
+      <p style="color:var(--silver);font-size:13px;margin:0 0 16px">${esc(fmtDisk.model||fmtDisk.path)} · ${esc(fmtSize(fmtDisk.size))}</p>
+      <label>${esc(T('sources.internal.fsLabel'))}</label>
+      <div class="row" style="gap:10px;margin-bottom:10px">
+        <button class="${fmtFs==='ext4'?'primary':'ghost'}" style="flex:1" onclick="fmtFs='ext4';renderFormatWizard()">${esc(T('sources.internal.fsExt4'))}</button>
+        <button class="${fmtFs==='exfat'?'primary':'ghost'}" style="flex:1" onclick="fmtFs='exfat';renderFormatWizard()">${esc(T('sources.internal.fsExfat'))}</button>
+      </div>
+      <label>${esc(T('sources.internal.labelField'))}</label>
+      <input id="fmtLabelInput" value="${esc(fmtLabel)}" maxlength="${fmtFs==='exfat'?11:16}" oninput="fmtLabel=this.value">
+      <div style="height:16px"></div>
+      <div class="row" style="gap:10px">
+        <button class="ghost" style="flex:1" onclick="closeFormatWizard()">${esc(T('sources.internal.cancel'))}</button>
+        <button class="primary" style="flex:1" onclick="window.fmtTypedVal='';fmtStep='confirm';renderFormatWizard()">${esc(T('sources.internal.next'))}</button>
+      </div>`;
+  } else if(fmtStep==='confirm'){
+    inner=`<h3 style="margin:0 0 4px;color:#e66">⚠ ${esc(T('sources.internal.warnTitle'))}</h3>
+      <p style="color:var(--silver);font-size:13px;margin:0 0 16px">${esc(T('sources.internal.warnBody',{model:(fmtDisk.model||fmtDisk.path),size:fmtSize(fmtDisk.size),path:fmtDisk.path}))}</p>
+      <label>${esc(T('sources.internal.typeToConfirm',{label:fmtLabel.trim()}))}</label>
+      <input id="fmtTypedInput" oninput="window.fmtTypedVal=this.value;document.getElementById('fmtConfirmBtn').disabled=(this.value.trim()!==fmtLabel.trim())">
+      <div style="height:16px"></div>
+      <div class="row" style="gap:10px">
+        <button class="ghost" style="flex:1" onclick="fmtStep='choose';renderFormatWizard()">${esc(T('sources.internal.backStep'))}</button>
+        <button id="fmtConfirmBtn" class="danger" style="flex:1;border-color:#e66" ${(!window.fmtTypedVal||window.fmtTypedVal.trim()!==fmtLabel.trim())?'disabled':''} onclick="startFormat()">${esc(T('sources.internal.formatNow'))}</button>
+      </div>`;
+  } else if(fmtStep==='progress'){
+    inner=`<div style="text-align:center;padding:10px 0">
+      <p id="fmtProgressMsg" style="color:#fff">${esc(T('sources.internal.phasePreparing'))}</p>
+      <div style="width:100%;height:8px;background:var(--bg);border-radius:99px;overflow:hidden;margin:14px 0">
+        <div id="fmtProgressBar" style="height:100%;width:0%;background:var(--gold);transition:width .4s"></div>
+      </div>
+      <p style="color:var(--silver);font-size:12px">${esc(T('sources.internal.keepPowered'))}</p>
+    </div>`;
+  } else if(fmtStep==='done'){
+    inner=`<div style="text-align:center;padding:10px 0">
+      <p style="color:#5fce8f;font-size:18px;margin:0 0 8px">${esc(T('sources.internal.doneAdopted'))}</p>
+      <p style="color:var(--silver);font-size:13px;margin:0 0 16px">${esc(T('sources.internal.doneHint'))}</p>
+      <button class="primary" style="width:100%" onclick="closeFormatWizard();loadInternal();load();loadSmbCard();">${esc(T('sources.internal.close'))}</button>
+    </div>`;
+  } else if(fmtStep==='error'){
+    inner=`<div style="text-align:center;padding:10px 0">
+      <p style="color:#e66;font-size:16px;margin:0 0 8px">${esc(T('sources.internal.errorTitle'))}</p>
+      <p style="color:var(--silver);font-size:13px;margin:0 0 16px">${esc(window.fmtErrorMsg||'')}</p>
+      <button class="ghost" style="width:100%" onclick="closeFormatWizard()">${esc(T('sources.internal.close'))}</button>
+    </div>`;
+  }
+  ov.innerHTML=`<div class="card" style="max-width:420px;width:100%;margin:0">${inner}</div>`;
+  document.body.appendChild(ov);
+}
+async function startFormat(){
+  fmtStep='progress'; renderFormatWizard();
+  let d;
+  try{
+    const r=await j('/api/internal/format',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({device:fmtDisk.path, fs:fmtFs, label:fmtLabel, confirm:fmtDisk.confirm})});
+    d=r;
+  }catch(e){ window.fmtErrorMsg=T('sources.networkError'); fmtStep='error'; renderFormatWizard(); return; }
+  if(d && d.success===false){ window.fmtErrorMsg=d.message||T('sources.error'); fmtStep='error'; renderFormatWizard(); return; }
+  fmtPollTimer=setInterval(async()=>{
+    let s; try{ s=await j('/api/internal/format/status'); }catch(e){ return; }
+    const pct=Math.max(0,Math.min(100,Math.round(s.progress||0)));
+    const bar=document.getElementById('fmtProgressBar'); if(bar) bar.style.width=pct+'%';
+    const msg=document.getElementById('fmtProgressMsg'); if(msg) msg.textContent=s.message||T('sources.internal.inProgress');
+    if(s.state==='done'){ clearInterval(fmtPollTimer); fmtPollTimer=null; fmtStep='done'; renderFormatWizard(); }
+    else if(s.state==='error'){ clearInterval(fmtPollTimer); fmtPollTimer=null; window.fmtErrorMsg=s.message||T('sources.error'); fmtStep='error'; renderFormatWizard(); }
+  },2000);
+}
+
+// SMB share credentials card for adopted internal disks (installed check +
+// username/password + regenerate), appended below the internal disks list.
+async function loadSmbCard(){
+  let d; try{ d=await j('/api/internal/smb'); }catch(e){ return; }
+  document.getElementById('smbCardWrap')?.remove();
+  if(!d.shares || !d.shares.length) return;
+  const wrap=document.createElement('div');
+  wrap.id='smbCardWrap';
+  if(!d.installed){
+    wrap.innerHTML=`<div class="card" style="border-color:#a86;color:#dba"><p style="margin:0;font-size:13px">${esc(T('sources.internal.needOsUpdate'))}</p></div>`;
+  } else {
+    const rows=d.shares.map(s=>`<div style="font-size:13px;color:var(--silver)">\\\\${esc(d.ip||d.host)}\\${esc(s.name)}</div>`).join('');
+    wrap.innerHTML=`<div class="card">
+      <div style="font-weight:600;margin-bottom:6px">${esc(T('sources.internal.smbTitle'))}</div>
+      <p style="color:var(--silver);font-size:13px;margin:0 0 10px">${esc(T('sources.internal.smbHelp'))}</p>
+      ${rows}
+      <div class="row" style="margin-top:10px">
+        <div><div style="font-size:11px;color:var(--silver)">${esc(T('sources.internal.smbUser'))}</div><div>${esc(d.username)}</div></div>
+        <div><div style="font-size:11px;color:var(--silver)">${esc(T('sources.internal.smbPass'))}</div><div>${esc(d.password)}</div></div>
+      </div>
+      <div style="height:10px"></div>
+      <button class="ghost" onclick="regenSmb()">${esc(T('sources.internal.smbRegenerate'))}</button>
+    </div>`;
+  }
+  document.getElementById('internalList').insertAdjacentElement('afterend', wrap);
+}
+async function regenSmb(){ await j('/api/internal/smb/regenerate',{method:'POST'}); loadSmbCard(); }
+
+load();
+loadUsb();
+loadInternal();
+loadSmbCard();
+loadPlaylistdir();
+// sources_server.py auto-adopts USB drives in the background, so poll the
+// active-sources list too — matches loadUsb()'s cadence, picks up a freshly
+// mounted drive without a manual reload.
+setInterval(load, 4000);
+setInterval(loadUsb, 4000);
+setInterval(loadInternal, 5000);
+</script>
+</body>
+</html>"""
+
+if __name__ == "__main__":
+    try:
+        os.makedirs(MOUNT_ROOT, exist_ok=True)
+    except Exception:
+        pass
+    # Share logins written in the clear before they were sealed at rest: done
+    # once here, before the remount below reads them.
+    try:
+        _seal_stored_logins()
+    except Exception as e:
+        print(f"[sources] _seal_stored_logins error: {e}")
+    # Re-mount known SMB shares on startup (survives reboots). Runs in the
+    # background with retries: boot no longer waits for the network, so the NAS
+    # may not be reachable yet — keep trying instead of failing once.
+    threading.Thread(target=remount_all_retry, daemon=True, name="smb-remount").start()
+    # Auto-adopt USB sticks/drives as soon as they're plugged in (mount
+    # read-write + Samba share, no user action needed — see usb_sync()).
+    threading.Thread(target=usb_monitor, daemon=True, name="usb-monitor").start()
+    threading.Thread(target=cd_monitor, daemon=True, name="cd-monitor").start()
+    # One-time cleanup of "local" sources left over from the old ephemeral
+    # read-only USB browse mount (removed — see the USB drives section above).
+    try:
+        _migrate_stale_usb_sources()
+    except Exception as e:
+        print(f"[sources] _migrate_stale_usb_sources error: {e}")
+    # Watch for completed disk-format jobs and adopt the resulting partition.
+    threading.Thread(target=_format_watcher, daemon=True, name="format-watcher").start()
+    # The group the network shares and Lyrion have in common. Done here, before
+    # anything that owns a folder, so the one restart it may cost (Lyrion only
+    # picks up a new supplementary group when it starts) lands at boot rather
+    # than in the middle of a listening session.
+    try:
+        _ensure_share_group()
+    except Exception as e:
+        print(f"[sources] _ensure_share_group error: {e}")
+    # The one place local music can live on the A/B layout (see
+    # DATA_MUSIC_ROOT). After _ensure_share_group(), whose gid it takes.
+    try:
+        _ensure_music_root()
+    except Exception as e:
+        print(f"[sources] _ensure_music_root error: {e}")
+    # What earlier versions left root-owned in the shared folders (file
+    # manager, rip worker) becomes the share account's, as the disks come up
+    # (see _repair_shared_ownership).
+    threading.Thread(target=_repair_shared_ownership_loop, daemon=True,
+                     name="owner-repair").start()
+    # Make sure Lyrion has a writable playlist folder ("save as playlist"),
+    # owned so that a PC on the network can write into it too.
+    try:
+        ensure_playlistdir()
+    except Exception as e:
+        print(f"[sources] ensure_playlistdir error: {e}")
+    # Fix up Windows path separators in playlists dropped into that folder.
+    threading.Thread(target=playlist_normalizer_loop, daemon=True,
+                     name="playlist-normalizer").start()
+    # Let Tailscale-only clients (e.g. Lyrplay, or Server settings from the
+    # phone) through Lyrion's own IP-based access controls.
+    try:
+        ensure_lms_trusted_networks()
+    except Exception as e:
+        print(f"[sources] ensure_lms_trusted_networks error: {e}")
+    # Auto-install Material Skin (and sync the Osmium theme files) whenever a
+    # local Lyrion is present — see _lms_skin_autoinstall for the contract.
+    threading.Thread(target=_lms_skin_autoinstall, daemon=True,
+                     name="lms-skin-autoinstall").start()
+    # Ensure the internal-storage mount root exists.
+    try:
+        os.makedirs(INTERNAL_MOUNT_ROOT, exist_ok=True)
+    except Exception:
+        pass
+    # Re-generate Samba shares on startup so adopted disks are reachable even if
+    # the service was restarted.
+    try:
+        regen_samba_shares()
+    except Exception as e:
+        print(f"[sources] regen_samba_shares error: {e}")
+    # Album/artist information: the library walk that fills the cache in the
+    # background (it waits a couple of minutes, and only runs while both the
+    # online information and the prefetch settings are on).
+    hmeta.start_background()
+    # threaded=True so the USB/SMB mount scans and a slow Lyrion restart don't
+    # serialise behind each other and block the phone/PC web UI.
+    app.run(host="0.0.0.0", port=8080, threaded=True)

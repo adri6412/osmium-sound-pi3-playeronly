@@ -1,0 +1,478 @@
+// hifi-qt — l'interfaccia dell'apparecchio in Qt Quick, dritta su DRM/KMS
+// (piattaforma eglfs, nessun compositore), con la stessa tela logica
+// 1024x600 della UI Electron e della UI in C.
+//
+//   --assets DIR      cartella degli asset (default: accanto al binario)
+//   --locales DIR     cartella con en.json/it.json
+//   --expanded        parte col player espanso
+//   --wizard setup|install   forza una delle due schermate iniziali (sviluppo)
+//
+// Variabili d'ambiente:
+//   HIFI_HOST         host dei servizi (default 127.0.0.1)
+//   HIFI_CONFIG_DIR   cartella dei file di configurazione (default /etc/hifi-player)
+//   HIFI_DEV          abilita il canale di collaudo /tmp/hifi-qt.cmd
+//   QT_QPA_PLATFORM   eglfs sull'apparecchio; xcb/offscreen in sviluppo
+#include "api.h"
+#include "i18n.h"
+#include "library.h"
+#include "player.h"
+#include "kmsmode.h"
+#include "remote.h"
+#include "touchwatch.h"
+#include "btghid.h"
+#include "qritem.h"
+#include "spring.h"
+#include "sys.h"
+#include "vumeter.h"
+#include <QFile>
+#include <QRegularExpression>
+#include <QFont>
+#include <QFontDatabase>
+#include <QGuiApplication>
+#include <QMouseEvent>
+#include <QQmlContext>
+#include <QQmlEngine>
+#include <QQmlExpression>
+#include <QQuickItem>
+#include <QQuickView>
+#include <QScreen>
+#include <QThread>
+#include <QTimer>
+#include <QWheelEvent>
+#include <QWindow>
+#include <QtDebug>
+#include <QSocketNotifier>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <signal.h>
+#include <sys/socket.h>
+#include <unistd.h>
+// Touch injection for the test channel: goes through the QPA layer, the same
+// path a real touchscreen (libinput/evdev) takes, so touch-vs-mouse delivery
+// differences show up in the rig. The header ships with qt6-base-private-dev;
+// without it the "touch" command just is not compiled in.
+#if __has_include(<qpa/qwindowsysteminterface.h>)
+#include <qpa/qwindowsysteminterface.h>
+#include <QPointingDevice>
+#define HIFI_HAVE_QPA_TOUCH 1
+#endif
+
+static QQuickView *g_view = nullptr;
+static Remote *g_remote = nullptr;
+
+// Segnala a Sys ogni evento di input, prima che lo consumi la scena, e porta
+// al telecomando i tasti che arrivano per la strada di Qt.
+class InputWatch : public QObject {
+public:
+    InputWatch(Sys *s, Remote *r, QQuickView *v, TouchWatch *t) : m_sys(s), m_remote(r), m_view(v), m_touch(t) {}
+    // The arrow cursor goes while the remote drives. A remote that Qt also
+    // counts as a mouse (an air mouse, the bridge of one) put the arrow on
+    // the screen, standing wherever it last was, while the keys moved the
+    // spotlight. From the first remote action the cursor is parked; a real
+    // mouse movement (not one of our injected presses) brings it back.
+    void park() {
+        if (m_parked || !m_sys->pointerEnabled()) return;
+        m_parked = true;
+        QGuiApplication::setOverrideCursor(QCursor(Qt::BlankCursor));
+    }
+    void unpark() {
+        if (!m_parked) return;
+        m_parked = false;
+        QGuiApplication::restoreOverrideCursor();
+    }
+    // Settings switched the pointer: Sys cleared every override, ours too
+    void pointerChanged() { m_parked = false; }
+protected:
+    bool eventFilter(QObject *, QEvent *e) override {
+        switch (e->type()) {
+        case QEvent::TouchBegin:
+            // the touch reached the interface: TouchWatch compares it with
+            // what the kernel saw (a touch in the kernel and none here = the
+            // screen "not answering" while it works)
+            if (m_touch) m_touch->noteQt();
+            m_sys->noteInput(); m_sys->notePointer(); break;
+        case QEvent::MouseButtonPress:
+            m_sys->noteInput(); m_sys->notePointer(); break;
+        case QEvent::TouchUpdate: case QEvent::TouchEnd:
+            if (m_touch) m_touch->noteQt();
+            if (e->type() == QEvent::TouchUpdate) m_sys->noteInput();
+            break;
+        case QEvent::MouseMove: case QEvent::Wheel:
+            m_sys->noteInput();
+            if (!m_sys->injecting()) unpark();
+            break;
+        case QEvent::KeyPress: {
+            m_sys->noteInput();
+            QKeyEvent *ke = static_cast<QKeyEvent *>(e);
+            const int k = ke->key();
+            // 🚨 Il telecomando si serve QUI e non da un Keys.onPressed in QML:
+            // un gestore in QML vede solo i tasti che il fuoco gli lascia
+            // passare, e il fuoco in questa interfaccia ce l'ha quasi sempre
+            // nessuno. Mentre si scrive in un campo, pero', i tasti sono di chi
+            // scrive: quelli non si toccano.
+            if (m_remote && m_view) {
+                QQuickItem *f = m_view->activeFocusItem();
+                const bool typing = f && (f->inherits("QQuickTextInput") || f->inherits("QQuickTextEdit"));
+                const QString act = m_remote->actionForQtKey(k);
+                // in collaudo si vede in chiaro cosa arriva dalla via di Qt:
+                // serve a capire se i tasti di un telecomando non preso in
+                // esclusiva passano davvero da li'
+                if (m_sys->devMode())
+                    qInfo("key Qt: 0x%x -> %s%s", k, act.isEmpty() ? "(niente)" : qPrintable(act), typing ? " (si sta scrivendo)" : "");
+                // The on-screen keyboard takes OK and Back as its own keys (space and
+                // enter, backspace) while a real keyboard types into it; the arrows
+                // still move the spotlight over its keys.
+                // 🚨 takesTyping sits on the keyboard root, but spatial navigation
+                // gives the active focus to one of its key buttons -- so look up the
+                // whole ancestor chain, not just the focused item, or backspace/enter/
+                // space get dispatched as back/ok instead (issue #114: backspace closed
+                // the keyboard, enter and space activated the spotlit "1").
+                bool vkHost = false;
+                for (QQuickItem *i = f; i; i = i->parentItem())
+                    if (i->property("takesTyping").toBool()) { vkHost = true; break; }
+                const bool vkOwnsKey = vkHost && (act == "ok" || act == "back");
+                if (!act.isEmpty() && !typing && !vkOwnsKey) { m_remote->dispatch(act, ke->isAutoRepeat(), "qt"); return true; }
+            }
+            break;
+        }
+        default: break;
+        }
+        return false;
+    }
+private:
+    Sys *m_sys;
+    Remote *m_remote;
+    QQuickView *m_view;
+    TouchWatch *m_touch;
+    bool m_parked = false;
+};
+static volatile sig_atomic_t g_shot = 0;
+static void onUsr1(int) { g_shot = 1; }
+// systemctl stop manda SIGTERM: uscita pulita dal ciclo degli eventi, non un
+// processo "ucciso" (che systemd segna come fallito).
+// 🚨 Dal gestore del segnale si scrive UN byte su una coppia di socket e
+// basta (write() e' sicura in un gestore, QCoreApplication::exit() no: prende
+// lock e tocca il ciclo degli eventi, e se il segnale arriva mentre il thread
+// principale li tiene si resta appesi). Il byte lo legge un QSocketNotifier
+// nel ciclo degli eventi, che chiude da li'.
+static int g_termFd[2] = {-1, -1};
+static void onTerm(int) {
+    const int saved = errno;
+    const char c = 1;
+    ssize_t n = ::write(g_termFd[1], &c, 1);
+    (void)n;
+    errno = saved;
+}
+
+static QPointF canvasToWin(double x, double y) {
+    QQuickItem *root = g_view->rootObject();
+    // through the canvas item itself, so a turned screen (Sys.rotation) is
+    // taken into account along with the scale and the bars
+    if (QQuickItem *canvas = qvariant_cast<QQuickItem *>(root->property("app")))
+        return canvas->mapToScene(QPointF(x, y));
+    double s = root->property("s").toDouble();
+    double ox = root->property("ox").toDouble(), oy = root->property("oy").toDouble();
+    return QPointF(ox + x * s, oy + y * s);
+}
+
+// il mouse del canale di collaudo: passa dal livello QPA come un mouse vero
+// (l'implementazione, col perche', sta in sys.cpp — la usa anche il telecomando)
+static void mouse(QEvent::Type t, QPointF p, Qt::MouseButton b = Qt::LeftButton) {
+    hifiSendMouse(g_view, t, p, b);
+}
+
+static void keyPress(int key, const QString &text = QString()) {
+    QKeyEvent d(QEvent::KeyPress, key, Qt::NoModifier, text);
+    QKeyEvent u(QEvent::KeyRelease, key, Qt::NoModifier, text);
+    QCoreApplication::sendEvent(g_view, &d);
+    QCoreApplication::sendEvent(g_view, &u);
+}
+
+#ifdef HIFI_HAVE_QPA_TOUCH
+// One finger on a fake touchscreen: down/move/up in canvas coordinates. Each
+// event carries its own timestamp (16 ms apart, like a 60 Hz panel) so that
+// Flickable's velocity/threshold arithmetic sees a plausible gesture.
+static void touch(const QString &phase, const QPointF &p) {
+    static QPointingDevice *dev = nullptr;
+    static ulong ts = 1000;
+    if (!dev) {
+        dev = new QPointingDevice("test touchscreen", 1, QInputDevice::DeviceType::TouchScreen, QPointingDevice::PointerType::Finger,
+                                  QInputDevice::Capability::Position | QInputDevice::Capability::Area, 10, 0);
+        QWindowSystemInterface::registerInputDevice(dev);
+    }
+    QWindowSystemInterface::TouchPoint tp;
+    tp.id = 0;
+    tp.state = phase == "down" ? QEventPoint::Pressed : phase == "up" ? QEventPoint::Released : QEventPoint::Updated;
+    QPointF g = g_view->mapToGlobal(p.toPoint());
+    tp.area = QRectF(g.x() - 2, g.y() - 2, 4, 4);
+    tp.normalPosition = QPointF(g.x() / qMax(1, g_view->width()), g.y() / qMax(1, g_view->height()));
+    ts += 16;
+    QWindowSystemInterface::handleTouchEvent<QWindowSystemInterface::SynchronousDelivery>(g_view, ts, dev, {tp});
+}
+#endif
+
+// Collaudo da remoto: /tmp/hifi-qt.cmd, una riga per comando (coordinate
+// della tela 1024x600). Il file viene consumato e cancellato.
+//   tap X Y | hold X Y | move X Y | release X Y | scroll X Y DY
+//   touch down|move|up X Y   (finto touchscreen, via QPA)
+//   type testo | key esc|enter|backspace|left|right|up|down|play|next|prev|volup...
+//   remote AZIONE   (telecomando finto: playPause, next, down, ok, back...)
+//   shot [file] | eval <javascript nel contesto della radice> | quit
+static void cmdfilePoll() {
+    QFile f("/tmp/hifi-qt.cmd");
+    if (!f.exists() || !f.open(QIODevice::ReadOnly | QIODevice::Text)) return;
+    QList<QByteArray> lines = f.readAll().split('\n');
+    f.close();
+    QFile::remove("/tmp/hifi-qt.cmd");
+    for (QByteArray l : lines) {
+        QString line = QString::fromUtf8(l).trimmed();
+        if (line.isEmpty()) continue;
+        QStringList a = line.split(' ', Qt::SkipEmptyParts);
+        const QString c = a[0];
+        if ((c == "tap" || c == "hold" || c == "move" || c == "release") && a.size() >= 3) {
+            QPointF p = canvasToWin(a[1].toDouble(), a[2].toDouble());
+            if (c == "tap") { mouse(QEvent::MouseButtonPress, p); mouse(QEvent::MouseButtonRelease, p); }
+            else if (c == "hold") mouse(QEvent::MouseButtonPress, p);
+            else if (c == "move") mouse(QEvent::MouseMove, p);
+            else mouse(QEvent::MouseButtonRelease, p);
+#ifdef HIFI_HAVE_QPA_TOUCH
+        } else if (c == "touch" && a.size() >= 4) {
+            touch(a[1], canvasToWin(a[2].toDouble(), a[3].toDouble()));
+#endif
+        } else if (c == "scroll" && a.size() >= 4) {
+            QPointF p = canvasToWin(a[1].toDouble(), a[2].toDouble());
+            double dy = a[3].toDouble();
+            QWheelEvent ev(p, g_view->mapToGlobal(p.toPoint()), QPoint(), QPoint(0, (int)(-dy * 120 / 100)), Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase, false);
+            QCoreApplication::sendEvent(g_view, &ev);
+        } else if (c == "type") {
+            QString text = line.mid(5);
+            for (QChar ch : text) keyPress(0, QString(ch));
+        } else if (c == "key" && a.size() >= 2) {
+            static const QHash<QString, int> keys = {{"esc", Qt::Key_Escape}, {"enter", Qt::Key_Return}, {"backspace", Qt::Key_Backspace},
+                                                     {"left", Qt::Key_Left}, {"right", Qt::Key_Right}, {"up", Qt::Key_Up}, {"down", Qt::Key_Down}, {"tab", Qt::Key_Tab},
+                                                     // i tasti di una tastiera multimediale: la strada dei tasti Qt,
+                                                     // quella che NON passa da evdev (vedi remote.h)
+                                                     {"play", Qt::Key_MediaTogglePlayPause}, {"next", Qt::Key_MediaNext}, {"prev", Qt::Key_MediaPrevious},
+                                                     {"stop", Qt::Key_MediaStop}, {"volup", Qt::Key_VolumeUp}, {"voldown", Qt::Key_VolumeDown},
+                                                     {"mute", Qt::Key_VolumeMute}, {"home", Qt::Key_HomePage}, {"menu", Qt::Key_Menu},
+                                                     {"search", Qt::Key_Search}, {"back", Qt::Key_Back}};
+            if (keys.contains(a[1])) keyPress(keys[a[1]]);
+        } else if (c == "remote" && a.size() >= 2) {
+            // un telecomando finto: l'azione entra dove entrerebbe quella di
+            // un telecomando vero, dopo la lettura di evdev
+            if (g_remote) g_remote->dispatch(a[1], a.size() >= 3 && a[2] == "repeat", "evdev");
+        } else if (c == "shot") {
+            QString path = a.size() >= 2 ? a[1] : "/tmp/hifi-qt.png";
+            // dopo che gli eventi appena iniettati sono stati disegnati
+            QTimer::singleShot(150, [path]() { QImage img = g_view->grabWindow(); img.save(path); qInfo("shot: %s", qPrintable(path)); });
+        } else if (c == "eval") {
+            QQmlExpression e(g_view->rootContext(), g_view->rootObject(), line.mid(5));
+            QVariant r = e.evaluate();
+            if (e.hasError()) qWarning("eval: %s", qPrintable(e.error().toString()));
+            else qInfo("eval: %s", qPrintable(r.toString()));
+            QFile out("/tmp/hifi-qt.out");
+            if (out.open(QIODevice::WriteOnly | QIODevice::Text)) out.write((e.hasError() ? "ERR " + e.error().toString() : r.toString()).toUtf8() + "\n");
+        } else if (c == "quit") {
+            QCoreApplication::quit();
+        }
+    }
+}
+
+int main(int argc, char *argv[]) {
+    if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM")) qputenv("QT_QPA_PLATFORM", "eglfs");
+    // Modo video da /etc/hifi-player/ui-resolution e, con piu' monitor, cosa
+    // mostra ciascuno da /etc/hifi-player/ui-screens (duplica di serie, o
+    // "only:<uscita>"): prima che eglfs apra il DRM.
+    if (qEnvironmentVariable("QT_QPA_PLATFORM") == "eglfs" && qEnvironmentVariableIsEmpty("QT_QPA_EGLFS_KMS_CONFIG")) {
+        QString cdir = qEnvironmentVariable("HIFI_CONFIG_DIR");
+        if (cdir.isEmpty()) cdir = "/etc/hifi-player";
+        auto firstLine = [&](const QString &name, const QString &fallback) {
+            QFile f(cdir + "/" + name);
+            QString v;
+            if (f.open(QIODevice::ReadOnly)) v = QString::fromUtf8(f.readLine()).trimmed();
+            return v.isEmpty() ? fallback : v;
+        };
+        QString cfg = kmsConfigFor(firstLine("ui-resolution", "auto"), firstLine("ui-screens", "mirror"));
+        if (!cfg.isEmpty()) { qputenv("QT_QPA_EGLFS_KMS_CONFIG", cfg.toUtf8()); qputenv("QT_QPA_EGLFS_ALWAYS_SET_MODE", "1"); }
+    }
+    QGuiApplication app(argc, argv);
+    app.setApplicationName("hifi-qt");
+
+    const QString base = QCoreApplication::applicationDirPath();
+    QString assets = base + "/assets", locales = base + "/locales", wizard;
+    bool expanded = false, wizardDry = false;
+    QStringList args = app.arguments();
+    for (int i = 1; i < args.size(); i++) {
+        if (args[i] == "--assets" && i + 1 < args.size()) assets = args[++i];
+        else if (args[i] == "--locales" && i + 1 < args.size()) locales = args[++i];
+        else if (args[i] == "--expanded") expanded = true;
+        else if (args[i] == "--wizard" && i + 1 < args.size()) { wizard = args[++i]; wizardDry = true; }
+    }
+
+    // Modalita' installer decisa dalla riga di comando del kernel, come fa
+    // l'app Electron con /boot_mode: la voce "Installa" del menu della ISO
+    // aggiunge hifi.installer=1. Serve perche' la ISO a filesystem unico non
+    // ha piu' un sistema live separato in cui mettere un'unita' diversa: c'e'
+    // solo l'immagine, e l'unica differenza fra "installa" e "prova" e' questa
+    // parola sulla riga di comando. L'argomento --wizard, se passato a mano,
+    // resta prioritario (serve in sviluppo).
+    if (wizard.isEmpty()) {
+        QFile cmdline("/proc/cmdline");
+        if (cmdline.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            const QString c = QString::fromUtf8(cmdline.readAll());
+            // 🚨 Not a dry run: this one really installs. forcedWizard was
+            // born for --wizard, which only exists so a developer can look at
+            // the screens, and it puts the wizard in preview mode -- so on a
+            // real ISO the kiosk's "Erase and install" button answered
+            // "Forced preview - install not started" and did nothing.
+            if (c.split(QRegularExpression("\\s+")).contains("hifi.installer=1"))
+                { wizard = "install"; wizardDry = false; }
+        }
+    }
+
+    // Il carattere dell'apparecchio: DejaVu Sans (il body stack di Electron
+    // sul dispositivo si risolve li').
+    QFont font("DejaVu Sans");
+    font.setPixelSize(14);
+    app.setFont(font);
+
+    Api api;
+    Sys sys(assets);
+    sys.setIconDir(base + "/icons");
+    sys.setForcedWizard(wizard, wizardDry);
+    sys.setStartExpanded(expanded);
+    I18n i18n(locales, sys.conf("ui-language", "en"));
+    api.setLang(i18n.lang());
+    QObject::connect(&i18n, &I18n::langChanged, &api, [&api, &i18n]() { api.setLang(i18n.lang()); });
+    Player player;
+    // I telecomandi: chiavetta USB o Bluetooth gia' accoppiato, letti da evdev
+    // e tradotti in azioni che App.qml smista (remote.h).
+    Remote remote(sys.configDir());
+    TouchWatch touch;
+    g_remote = &remote;
+    // Il ponte per i telecomandi Bluetooth che il nucleo rifiuta (btghid.h):
+    // quando ne rimette in piedi uno, nasce un /dev/input nuovo e Remote deve
+    // andarselo a prendere subito.
+    // 🚨 In un thread suo: le chiamate a BlueZ bloccano, e bloccando il thread
+    // dell'interfaccia lo schermo resta fermo (misurato: 28 secondi con un
+    // telecomando Xiaomi). Il segnale torna al thread dell'interfaccia da solo.
+    BtGattHid btghid;
+    QThread btThread;
+    btghid.moveToThread(&btThread);
+    QObject::connect(&btThread, &QThread::started, &btghid, &BtGattHid::begin);
+    QObject::connect(&btghid, &BtGattHid::bridgedChanged, &remote, &Remote::rescan);
+    btThread.start();
+    // 🚨 Il ponte puo' essere dentro una chiamata a BlueZ che blocca (fino a
+    // 25 s l'una, il timeout di D-Bus): gli si chiede di fermarsi fra una
+    // chiamata e l'altra, e se non ce la fa in tempo NON si distrugge un
+    // QThread ancora in corsa (qFatal: abort, core dump, unita' "failed") —
+    // si esce subito con _exit(), senza distruttori: quello che resterebbe da
+    // chiudere (socket, /dev/uhid) lo chiude il nucleo insieme al processo.
+    auto stopBridge = [&btThread](int rc) -> int {
+        btThread.requestInterruption();
+        btThread.quit();
+        if (!btThread.wait(5000)) {
+            qWarning("hifi-qt: il ponte Bluetooth non si ferma (chiamata a BlueZ in corso), uscita immediata");
+            fflush(stdout);
+            fflush(stderr);
+            _exit(rc);
+        }
+        return rc;
+    };
+    QObject::connect(&remote, &Remote::action, &sys, [&sys]() { sys.noteInput(); });
+    VuMeter vu;
+    LibraryModel library;
+    QObject::connect(&player, &Player::connectedChanged, &library, [&]() { library.setProperty("playerId", player.playerId()); });
+    QObject::connect(&player, &Player::playerChanged, &library, [&]() { library.setProperty("playerId", player.playerId()); });
+
+    qmlRegisterType<Spring>("Hifi", 1, 0, "Spring");
+    qmlRegisterType<QrItem>("Hifi", 1, 0, "QrCode");
+    // singleton QML (tinte, traduzioni, agganci), senza qmldir
+    qmlRegisterSingletonType(QUrl::fromLocalFile(base + "/qml/Theme.qml"), "Hifi.Ui", 1, 0, "Theme");
+    qmlRegisterSingletonType(QUrl::fromLocalFile(base + "/qml/Tr.qml"), "Hifi.Ui", 1, 0, "Tr");
+    qmlRegisterSingletonType(QUrl::fromLocalFile(base + "/qml/Ui.qml"), "Hifi.Ui", 1, 0, "Ui");
+    qmlRegisterSingletonType(QUrl::fromLocalFile(base + "/qml/Nav.qml"), "Hifi.Ui", 1, 0, "Nav");
+    qmlRegisterSingletonType(QUrl::fromLocalFile(base + "/qml/Meta.qml"), "Hifi.Ui", 1, 0, "Meta");
+    qmlRegisterUncreatableType<LibraryModel>("Hifi", 1, 0, "LibraryModel", "usare l'istanza Library");
+
+    QQuickView view;
+    g_view = &view;
+    view.setColor(QColor("#0a0a0a"));
+    view.setResizeMode(QQuickView::SizeRootObjectToView);
+    QQmlContext *ctx = view.rootContext();
+    ctx->setContextProperty("Api", &api);
+    ctx->setContextProperty("Sys", &sys);
+    ctx->setContextProperty("I18n", &i18n);
+    ctx->setContextProperty("Player", &player);
+    ctx->setContextProperty("Remote", &remote);
+    ctx->setContextProperty("Vu", &vu);
+    ctx->setContextProperty("Library", &library);
+    view.engine()->addImportPath(base + "/qml");
+    api.setEngine(view.engine());
+    sys.setWindow(&view);
+    InputWatch watch(&sys, &remote, &view, &touch);
+    view.installEventFilter(&watch);
+    QObject::connect(&remote, &Remote::action, &watch, [&watch]() { watch.park(); });
+    QObject::connect(&sys, &Sys::pointerEnabledChanged, &watch, [&watch]() { watch.pointerChanged(); });
+    if (!sys.pointerEnabled()) QGuiApplication::setOverrideCursor(QCursor(Qt::BlankCursor));
+
+    view.setSource(QUrl::fromLocalFile(base + "/qml/Main.qml"));
+    if (view.status() == QQuickView::Error) {
+        for (const QQmlError &e : view.errors()) fprintf(stderr, "qml: %s\n", qPrintable(e.toString()));
+        return stopBridge(1);
+    }
+    if (qEnvironmentVariableIsSet("HIFI_WINDOW")) {           // sviluppo: finestra normale
+        QStringList wh = qEnvironmentVariable("HIFI_WINDOW").split('x');
+        view.resize(wh.value(0, "1280").toInt(), wh.value(1, "720").toInt());
+        view.show();
+    } else view.showFullScreen();
+    qInfo("hifi-qt: %dx%d su %s", view.width(), view.height(), qPrintable(QGuiApplication::platformName()));
+    player.start();
+
+    signal(SIGUSR1, onUsr1);
+    // senza la coppia di socket il gestore non avrebbe dove scrivere: si
+    // lascia a SIGTERM il suo effetto di serie (il processo termina)
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, g_termFd) == 0) {
+        auto *termNote = new QSocketNotifier(g_termFd[0], QSocketNotifier::Read, &app);
+        QObject::connect(termNote, &QSocketNotifier::activated, &app, []() {
+            char b[16];
+            while (::read(g_termFd[0], b, sizeof(b)) > 0) {}
+            qInfo("hifi-qt: SIGTERM/SIGINT, si esce");
+            QCoreApplication::exit(0);
+        });
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = onTerm;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_RESTART;
+        sigaction(SIGTERM, &sa, nullptr);
+        sigaction(SIGINT, &sa, nullptr);
+    } else {
+        qWarning("hifi-qt: socketpair per SIGTERM non riuscita (%s)", strerror(errno));
+    }
+    // collaudo: quanti fotogrammi al secondo disegna la scena (a riposo deve essere ~0)
+    static int frames = 0;
+    QObject::connect(&view, &QQuickWindow::frameSwapped, [&]() { frames++; });
+    QTimer fpsLog;
+    if (sys.devMode()) {
+        QObject::connect(&fpsLog, &QTimer::timeout, [&]() { qInfo("fps: %.1f", frames / 5.0); frames = 0; });
+        fpsLog.start(5000);
+    }
+    // 🚨 solo in collaudo: in produzione questo timer si sveglierebbe 5 volte al
+    // secondo per non fare niente (lo scatto via SIGUSR1 serve solo qui)
+    QTimer poll;
+    if (sys.devMode()) {
+        QObject::connect(&poll, &QTimer::timeout, [&]() {
+            if (g_shot) { g_shot = 0; sys.shot("/tmp/hifi-qt.png"); }
+            cmdfilePoll();
+        });
+        poll.start(200);
+    }
+
+    bool ok = false;
+    int secs = qEnvironmentVariableIntValue("HIFI_QT_SECONDS", &ok);
+    if (ok && secs > 0) QTimer::singleShot(secs * 1000, &app, &QGuiApplication::quit);
+    const int rc = app.exec();
+    return stopBridge(rc);
+}

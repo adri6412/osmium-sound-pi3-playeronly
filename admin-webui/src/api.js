@@ -1,0 +1,248 @@
+// Tiny fetch wrapper for the webui_server.py backend. Same-origin, so the
+// session cookie rides along automatically. Mutations carry the double-submit
+// CSRF token (read from the non-HttpOnly `csrf` cookie the server sets).
+
+import { useI18n } from './i18n';
+
+const { t, lang } = useI18n();
+
+function csrfToken() {
+  const m = document.cookie.match(/(?:^|;\s*)csrf=([^;]+)/);
+  return m ? decodeURIComponent(m[1]) : '';
+}
+
+// The page load normally brings the token with it. When it hasn't (an
+// index.html answered 304 from cache after the session cookie was dropped, a
+// restored tab), the admin would otherwise open with a burst of calls that all
+// leave cookie-less — the route guard, the update poll, the ~30 loaders in
+// Settings — and ask the server for a token each; the last answer to land wins
+// the cookie, under requests whose header was read before it. /api/csrf is the
+// one door that mints (see _set_csrf_cookie in webui_server.py), and this holds
+// every call until the single request through it has answered. Should it come
+// back with the jar still empty (cookies blocked, daemon down), the gate steps
+// aside rather than serialising the admin forever.
+let priming = null;
+let primeGaveUp = false;
+function primeCsrf() {
+  if (csrfToken() || primeGaveUp) return null;
+  if (!priming) {
+    priming = fetch('/api/csrf', { credentials: 'same-origin', cache: 'no-store' })
+      .catch(() => {})
+      .then(() => { priming = null; if (!csrfToken()) primeGaveUp = true; });
+  }
+  return priming;
+}
+
+async function req(path, { method = 'GET', body, retried = false } = {}) {
+  const headers = {};
+  // `no-store`: never read an API reply from the HTTP cache and never write
+  // one into it. Belt-and-braces with the no-store headers webui_server sends
+  // on /api/* -- a stale /api/auth/status is what makes a logged-out browser
+  // walk straight back into the admin on F5.
+  const opts = { method, headers, credentials: 'same-origin', cache: 'no-store' };
+  if (body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  // So api_server/sources_server (behind webui_server's proxy — see _proxy()
+  // there) return `message` text in the language the owner actually picked,
+  // instead of always Italian.
+  headers['X-UI-Lang'] = lang.value;
+  if (method !== 'GET') {
+    await primeCsrf();
+    headers['X-CSRF-Token'] = csrfToken();
+  }
+  let res, data;
+  try {
+    res = await fetch(path, opts);
+  } catch (e) {
+    return { ok: false, status: 0, data: { message: t('common.networkError') } };
+  }
+  try {
+    data = await res.json();
+  } catch (_) {
+    data = {};
+  }
+  // Two documents priming at the same instant (the admin and the Library
+  // editor, or a second tab) can still leave header and cookie one token apart.
+  // The guard refuses the request before the route runs, so nothing happened on
+  // the device: read the cookie again and send it once more.
+  if (res.status === 403 && data && data.code === 'auth.csrfInvalid' && !retried) {
+    return req(path, { method, body, retried: true });
+  }
+  return { ok: res.ok, status: res.status, data };
+}
+
+// Multipart uploads (a room-correction filter, a backup to restore): the same
+// single retry on a refused CSRF token as req(). fetch serialises the same
+// FormData afresh on each call, so it can simply be sent again.
+async function upload(path, body, retried = false) {
+  await primeCsrf();
+  const headers = { 'X-CSRF-Token': csrfToken(), 'X-UI-Lang': lang.value };
+  let res, data;
+  try {
+    res = await fetch(path, { method: 'POST', body, headers, credentials: 'same-origin' });
+  } catch (e) {
+    return { ok: false, status: 0, data: { message: t('common.networkError') } };
+  }
+  try { data = await res.json(); } catch (_) { data = {}; }
+  if (res.status === 403 && data && data.code === 'auth.csrfInvalid' && !retried) {
+    return upload(path, body, true);
+  }
+  return { ok: res.ok, status: res.status, data };
+}
+
+// Lyrion JSON-RPC (per-player prefs: transitions, ReplayGain, fixed volume).
+// Proxied through webui_server's /api/lyrion to avoid CORS — see that route's
+// comment in webui_server.py. Same request shape as the kiosk's own
+// lyrionApi.js (LYRION_BASE there is always this device's local LMS, so this
+// only resolves prefs for a local server, same as the proxy).
+async function lyrionRequest(playerMac, command) {
+  const r = await req('/api/lyrion', { method: 'POST', body: { id: 1, method: 'slim.request', params: [playerMac, command] } });
+  return { ok: r.ok, status: r.status, data: r.data && r.data.result };
+}
+
+export const api = {
+  get: (p) => req(p),
+  post: (p, body) => req(p, { method: 'POST', body }),
+  del: (p) => req(p, { method: 'DELETE' }),
+
+  lyrionPlayers: async () => {
+    const r = await lyrionRequest('', ['serverstatus', 0, 999]);
+    return (r.data && r.data.players_loop) || [];
+  },
+  // Lyrion returns the queried value under `_p2` (and sometimes under the
+  // pref name itself) — same fallback as the kiosk's getPlayerPref.
+  lyrionGetPref: async (playerMac, pref) => {
+    const r = await lyrionRequest(playerMac, ['playerpref', pref, '?']);
+    return (r.data && (r.data._p2 ?? r.data[pref])) ?? null;
+  },
+  lyrionSetPref: (playerMac, pref, value) => lyrionRequest(playerMac, ['playerpref', pref, value]),
+  // server-scoped commands (no player): serverstatus, info total, rescan…
+  lyrionQuery: (command) => lyrionRequest('', command),
+
+  // auth
+  authStatus: () => req('/api/auth/status'),
+  setup: (username, password) => req('/api/auth/setup', { method: 'POST', body: { username, password } }),
+  login: (username, password) => req('/api/auth/login', { method: 'POST', body: { username, password } }),
+  logout: () => req('/api/auth/logout', { method: 'POST' }),
+  changePassword: (username, current_password, new_password) =>
+    req('/api/auth/change-password', { method: 'POST', body: { username, current_password, new_password } }),
+
+  // provisioning
+  provisionStatus: () => req('/api/provision/status'),
+  // `band` ('2.4' / '5' / '6') only when the same name is on more than one of
+  // them and the owner picked one — see webui_server._picked_band.
+  provisionWifiConnect: (ssid, password, band = '') =>
+    req('/api/provision/wifi_connect', { method: 'POST', body: { ssid, password, band } }),
+  provisionClaimMode: (mode) =>
+    req('/api/provision/claim_mode', { method: 'POST', body: { mode, source: 'web' } }),
+  provisionFinalize: () => req('/api/provision/finalize', { method: 'POST' }),
+
+  // installer (sessione live avviata dalla voce "Installa"): il backend
+  // inoltra ad api_server, che fa il lavoro vero
+  installDisks: () => req('/api/provision/install_disks'),
+  installStart: (device) => req('/api/provision/install_start', { method: 'POST', body: { device } }),
+  installStatus: () => req('/api/provision/install_status'),
+
+  // system (proxied to api_server through webui_server)
+  sys: (p) => req('/api/system/' + p),
+  sysPost: (p, body) => req('/api/system/' + p, { method: 'POST', body }),
+
+  // DSP room-correction filter (FIR) — file lives on sources_server, forwarded
+  // raw through webui_server; upload takes multipart/form-data.
+  dspFirStatus: () => req('/api/system/dsp_fir'),
+  dspFirUpload: (file) => {
+    const body = new FormData();
+    body.append('file', file);
+    return upload('/api/system/dsp_fir', body);
+  },
+  dspFirRemove: () => req('/api/system/dsp_fir', { method: 'DELETE' }),
+
+  // Backup/restore — files live on sources_server.py, forwarded raw through
+  // webui_server (session-gated: see /api/system/backup* in webui_server.py).
+  backupList: () => req('/api/system/backup/list'),
+  backupStatus: () => req('/api/system/backup/status'),
+  backupSettings: () => req('/api/system/backup/settings'),
+  backupSettingsSave: (settings) => req('/api/system/backup/settings', { method: 'POST', body: settings }),
+  backupPassphraseSave: (passphrase) =>
+    req('/api/system/backup/passphrase', { method: 'POST', body: { passphrase } }),
+  backupPassphraseReveal: () => req('/api/system/backup/passphrase?reveal=1'),
+  backupCreate: (passphrase, categories) =>
+    req('/api/system/backup/create', { method: 'POST', body: { passphrase, categories } }),
+  backupDelete: (id) => req('/api/system/backup/' + id, { method: 'DELETE' }),
+  backupRestore: (id, passphrase, categories) =>
+    req('/api/system/backup/' + id + '/restore', { method: 'POST', body: { passphrase, categories } }),
+  backupDownloadUrl: (id) => (id ? '/api/system/backup/' + id : '/api/system/backup'),
+  restoreStatus: () => req('/api/system/restore/status'),
+  restoreUpload: (file, passphrase, categories) => {
+    const body = new FormData();
+    body.append('file', file);
+    if (passphrase) body.append('passphrase', passphrase);
+    if (categories) body.append('categories', categories.join(','));
+    return upload('/api/system/restore', body);
+  },
+
+  // Music sources — live on sources_server.py, forwarded raw through
+  // webui_server (session-gated: see /api/system/sources|usb|internal|apply
+  // in webui_server.py). Powers SourcesPanel.vue.
+  sourcesList: () => req('/api/system/sources'),
+  sourcesAddLocal: (path, samba = false) => req('/api/system/sources/local', { method: 'POST', body: { path, samba } }),
+  localBrowse: (path = '') => req('/api/system/local/browse?path=' + encodeURIComponent(path)),
+  localMkdir: (path, name) => req('/api/system/local/mkdir', { method: 'POST', body: { path, name } }),
+  // CD ripping — Settings → CD ripping; lives on sources_server.py, forwarded
+  // by webui_server's /api/system/cd/<rest> (session-gated).
+  cdSettings: () => req('/api/system/cd/settings'),
+  cdSettingsSet: (body) => req('/api/system/cd/settings', { method: 'POST', body }),
+  cdOffsetLookup: () => req('/api/system/cd/settings/offset_lookup', { method: 'POST', body: {} }),
+  cdEject: () => req('/api/system/cd/eject', { method: 'POST', body: {} }),
+  cdCancel: () => req('/api/system/cd/cancel', { method: 'POST', body: {} }),
+  // the rip itself (CdRipNow.vue): the disc in the drive, start, progress
+  cdInfo: (release = '') => req('/api/system/cd/info' + (release ? '?release=' + encodeURIComponent(release) : '')),
+  cdRip: (body) => req('/api/system/cd/rip', { method: 'POST', body }),
+  cdRipStatus: () => req('/api/system/cd/rip/status'),
+  sourcesAddSmb: ({ server, share, username, password, rw, defer_activation }) =>
+    req('/api/system/sources/smb', { method: 'POST', body: { server, share, username, password, rw, defer_activation } }),
+  // Guided "add a network folder": the appliance looks for file servers on the
+  // LAN (mDNS + NetBIOS + a 445 sweep) and lists what each one shares, so the
+  // owner picks from a list instead of typing a share name they have never
+  // seen. All three live under /api/sources/, which webui_server already
+  // forwards — see the comment above sourcesList.
+  smbDiscoverStart: () => req('/api/system/sources/smb/discover', { method: 'POST' }),
+  smbDiscoverStatus: () => req('/api/system/sources/smb/discover'),
+  smbShares: ({ server, username, password }) =>
+    req('/api/system/sources/smb/shares', { method: 'POST', body: { server, username, password } }),
+  smbTest: ({ server, share, username, password }) =>
+    req('/api/system/sources/smb/test', { method: 'POST', body: { server, share, username, password } }),
+  sourcesSetRw: (id, rw) => req('/api/system/sources/' + id + '/rw', { method: 'POST', body: { rw } }),
+  sourcesSetSubpath: (id, subpath) => req('/api/system/sources/' + id + '/subpath', { method: 'POST', body: { subpath } }),
+  sourcesBrowse: (id, path = '') => req('/api/system/sources/' + id + '/browse?path=' + encodeURIComponent(path)),
+  sourcesRemove: (id) => req('/api/system/sources/' + id, { method: 'DELETE' }),
+  sourcesApply: () => req('/api/system/apply', { method: 'POST' }),
+  // Playlist folder — a Lyrion pref, so it lives on sources_server.py behind
+  // webui's session-gated /api/system/playlistdir forwarder.
+  playlistdirGet: () => req('/api/system/playlistdir'),
+  playlistdirSet: (path) => req('/api/system/playlistdir', { method: 'POST', body: { path } }),
+  usbList: () => req('/api/system/usb'),
+  usbAdopt: (device) => req('/api/system/usb/adopt', { method: 'POST', body: { device } }),
+  internalDisks: () => req('/api/system/internal/disks'),
+  internalAdopt: (device) => req('/api/system/internal/adopt', { method: 'POST', body: { device } }),
+  internalFormat: ({ device, fs, label, confirm }) =>
+    req('/api/system/internal/format', { method: 'POST', body: { device, fs, label, confirm } }),
+  internalFormatStatus: () => req('/api/system/internal/format/status'),
+  internalSmb: () => req('/api/system/internal/smb'),
+  internalSmbRegenerate: () => req('/api/system/internal/smb/regenerate', { method: 'POST' }),
+
+  // File manager (Files.vue). Under /api/system/local/ for the same reason as
+  // the sources calls above: webui_server forwards that whole prefix, and it
+  // carries GET and POST only — which is why deleting is a POST.
+  filesList: (path = '') => req('/api/system/local/list?path=' + encodeURIComponent(path)),
+  filesMkdir: (path, name) => req('/api/system/local/mkdir', { method: 'POST', body: { path, name } }),
+  filesRename: (path, name) => req('/api/system/local/rename', { method: 'POST', body: { path, name } }),
+  // exists: what to do with a name already in `dest` -- 'keep' both (default),
+  // 'skip' it (folders merged) or 'replace' it (folders merged)
+  filesCopy: (paths, dest, exists = 'keep') => req('/api/system/local/copy', { method: 'POST', body: { paths, dest, exists } }),
+  filesMove: (paths, dest, exists = 'keep') => req('/api/system/local/move', { method: 'POST', body: { paths, dest, exists } }),
+  filesDelete: (paths) => req('/api/system/local/delete', { method: 'POST', body: { paths } }),
+  filesJob: (id) => req('/api/system/local/job?id=' + encodeURIComponent(id)),
+};

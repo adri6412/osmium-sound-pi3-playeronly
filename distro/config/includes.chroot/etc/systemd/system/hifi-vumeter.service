@@ -1,0 +1,25 @@
+[Unit]
+Description=HiFi Player - Squeezelite VU Meter WebSocket Daemon
+# Ordering only, on purpose: no Requires=/Wants=/BindsTo= on squeezelite.
+# Requires= made this enabled unit pull squeezelite up at every boot even on a
+# "server only" box whose owner had disabled it, and stop propagation took the
+# VU meters down with `systemctl disable --now squeezelite` (enable --now did
+# not bring them back). The daemon copes with squeezelite being absent or
+# restarted on its own (it re-globs the /dev/shm segment), and it also serves
+# Bluetooth playback, so it has every reason to run without the player.
+After=network.target squeezelite.service
+
+[Service]
+Type=simple
+User=hifi
+WorkingDirectory=/usr/local/bin
+# The journal is this daemon's only log (it runs as hifi and cannot write into
+# the root-only /var/log/hifi): unbuffered, so a line reaches journald when it
+# is printed rather than whenever an 8 KiB stdout buffer happens to fill.
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /usr/local/bin/vu_meter_daemon.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
