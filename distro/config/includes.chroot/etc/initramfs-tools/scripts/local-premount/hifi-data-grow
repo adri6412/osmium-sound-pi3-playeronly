@@ -1,20 +1,22 @@
 #!/bin/sh
 # shellcheck disable=SC2154,SC1091  # ROOT is set by the initramfs init; /scripts/functions only exists there
-# Osmium Sound — first boot of the ready-made disk image (build-usb-image.sh).
+# Osmium Sound — first boot of the ready-made disk image.
 #
-# That image is written straight onto a USB stick or a disk with Etcher, Rufus
+# The image is written straight onto an SD card or a disk with Etcher, Rufus
 # or dd, so it cannot know how big the medium is: it carries the same A/B
-# layout the installer writes, but with a tiny, unformatted last partition
-# named "hifi-data-grow" in place of hifi-data. Here, with the root not
-# mounted yet, that partition is stretched to the end of the medium, formatted
-# as the installer would, seeded with the first-run marker, and only then
-# renamed hifi-data — from which point scripts/local-bottom/hifi-state mounts
-# it like on any installed unit.
+# layout the installer writes, but with a tiny, unformatted last partition (p4)
+# in place of a real hifi-data. Here, with the root not mounted yet, that
+# partition is stretched to the end of the medium, formatted as the installer
+# would and seeded with the first-run marker — from which point
+# scripts/local-bottom/hifi-state mounts it like on any installed unit.
 #
-# The name is the trigger, and nothing else: no installed or converted device
-# has a partition called that, so this can never touch real data. Every step
-# before the rename can be repeated: a power cut halfway leaves the old name,
-# and the next boot simply does it all again.
+# This image uses an MBR table (the Pi GPU bootrom reads only MBR), where
+# partitions carry no labels, so the trigger is the filesystem, not a name: p4
+# is the data partition by position (mirrors hifi-ab-lib.sh: data = 4), and a
+# p4 that does not yet hold an ext4 is the untouched seed this image ships. A
+# p4 that already holds ext4 is an ordinary hifi-data and is left alone, so
+# every run is idempotent: a power cut halfway simply leaves p4 unformatted and
+# the next boot does it all again.
 PREREQ=""
 prereqs() { echo "$PREREQ"; }
 case "${1:-}" in
@@ -52,19 +54,28 @@ disk=$(basename "$(readlink -f "/sys/class/block/${rootdev#/dev/}/..")")
 diskdev="/dev/$disk"
 [ -b "$diskdev" ] || exit 0
 
-# The partition by its GPT name, read with sfdisk: blkid would have to be
-# asked without its cache, and hifi-state asks it again after the rename.
-pn=
+# The data partition is p4 of the root disk (fixed MBR numbering, the same as
+# hifi-ab-lib.sh ab_part_by_name). Find its /dev node through sysfs.
+pn=4
+part=
 for d in /sys/class/block/"$disk"*; do
     [ -f "$d/partition" ] || continue
-    n=$(cat "$d/partition")
-    if [ "$("$SFDISK" --part-label "$diskdev" "$n" 2>/dev/null)" = hifi-data-grow ]; then
-        pn=$n
+    if [ "$(cat "$d/partition" 2>/dev/null)" = "$pn" ]; then
         part="/dev/$(basename "$d")"
         break
     fi
 done
-[ -n "$pn" ] || exit 0
+[ -n "$part" ] || exit 0
+
+# Already carries a filesystem (every boot after the first): it is an ordinary
+# hifi-data, leave it. On MBR there is no label to key on, so the presence of a
+# filesystem is the stand-in for the old "renamed to hifi-data" signal — and,
+# unlike a trial mount, blkid never risks reformatting a real filesystem whose
+# journal merely needs replay. Only an unformatted seed (empty TYPE) falls
+# through to grow + format + seed below.
+if [ -n "$(blkid -o value -s TYPE "$part" 2>/dev/null)" ]; then
+    exit 0
+fi
 
 LOG=/run/hifi-data-grow.log
 say() {
@@ -75,12 +86,10 @@ say() {
 plymouth display-message --text="Osmium Sound: preparing the disk for first use…" 2>/dev/null || true
 say "growing $part (partition $pn of $diskdev) to the end of the disk"
 
-# 1. The backup GPT goes to the real end of the medium: it was written at the
-# end of the image, a few GB in. 2. The last partition takes all that follows.
-# --no-reread: the kernel holds no partition of this disk open yet, but the
-# check would still refuse while udev looks at it; partx tells it below.
-"$SFDISK" --relocate gpt-bak-std "$diskdev" >> "$LOG" 2>&1 \
-    || say "W: could not move the backup GPT to the end of the disk"
+# The last partition takes all that follows it to the end of the medium. MBR
+# has no backup table to relocate to the end (unlike GPT), so this is a single
+# resize. --no-reread: the kernel holds no partition of this disk open yet, but
+# the check would still refuse while udev looks at it; partx tells it below.
 echo ', +' | "$SFDISK" --no-reread --no-tell-kernel -N "$pn" "$diskdev" >> "$LOG" 2>&1 \
     || say "W: sfdisk could not grow partition $pn"
 "$PARTX" -u --nr "$pn" "$diskdev" >> "$LOG" 2>&1 \
@@ -91,8 +100,8 @@ say "partition $pn: $(( $(cat "/sys/class/block/${part#/dev/}/size" 2>/dev/null 
 # Formatted exactly as hifi-disk-install.sh formats it. -t ext4 spelled out
 # and /etc/mke2fs.conf in the initrd: without them mke2fs falls back to ext2.
 if ! "$MKE2FS" -t ext4 -F -q -m 1 -L hifi-data -O metadata_csum_seed "$part" >> "$LOG" 2>&1; then
-    # Left with its old name: hifi-state finds no data partition, runs this
-    # boot on a tmpfs, and the next boot tries again.
+    # Left unformatted: hifi-state finds no ext4 on p4, runs this boot on a
+    # tmpfs, and the next boot tries again.
     say "E: mke2fs failed on $part"
     exit 0
 fi
@@ -112,11 +121,7 @@ else
     exit 0
 fi
 
-# Last: from here on this is an ordinary hifi-data partition.
-if "$SFDISK" --no-reread --no-tell-kernel --part-label "$diskdev" "$pn" hifi-data >> "$LOG" 2>&1; then
-    rm -f /run/blkid/blkid.tab /etc/blkid.tab 2>/dev/null || true
-    say "done: $part is hifi-data"
-else
-    say "E: could not rename partition $pn to hifi-data"
-fi
+# From here on p4 holds an ext4 labelled hifi-data (the mke2fs above): that is
+# the signal hifi-state keys on, so there is no partition rename to do on MBR.
+say "done: $part is hifi-data"
 exit 0

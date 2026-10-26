@@ -35,12 +35,22 @@ rootdev=$(awk -v m="${rootmnt}" '$2 == m { d = $1 } END { print d }' /proc/mount
 rootdev=$(readlink -f "$rootdev" 2>/dev/null || echo "$rootdev")
 name=${rootdev#/dev/}
 disk=$(basename "$(readlink -f "/sys/class/block/$name/..")")
-find_part() {  # nome GPT -> /dev/…  (blkid legge la GPT: l'uevent non ha PARTNAME)
+find_part() {  # logical name -> /dev/…  (MBR has no partition labels, so map to
+               # the fixed partition number, the same as hifi-ab-lib.sh
+               # ab_part_by_name; "EFI System" has no match and is skipped —
+               # on this fork the FAT boot partition is mounted by
+               # hifi-rauc-config, not here).
+    case "$1" in
+        hifi-boot)                _want=1 ;;
+        hifi-root-a)              _want=2 ;;
+        hifi-root-b)              _want=3 ;;
+        hifi-data|hifi-data-grow) _want=4 ;;
+        *)                        return 1 ;;
+    esac
     for d in /sys/class/block/"$disk"*; do
         [ -f "$d/partition" ] || continue
-        dev="/dev/$(basename "$d")"
-        if [ "$(blkid -o value -s PARTLABEL "$dev" 2>/dev/null)" = "$1" ]; then
-            echo "$dev"
+        if [ "$(cat "$d/partition" 2>/dev/null)" = "$_want" ]; then
+            printf '/dev/%s\n' "$(basename "$d")"
             return 0
         fi
     done
