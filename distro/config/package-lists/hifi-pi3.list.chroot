@@ -179,6 +179,13 @@ rauc-service
 zstd
 # busybox: in the initrd it gives grep/sed/cp/tr to the hifi-state scripts.
 busybox
+# --variant=minbase gives only the essential set, so these are NOT present the
+# way they are in the x86 live-build base. The initrd hook (hooks/hifi-state)
+# and scripts/local-premount/hifi-data-grow need them to fsck/grow/format the
+# data partition on first boot: e2fsprogs -> e2fsck/mke2fs/fsck.ext4, fdisk ->
+# sfdisk. Without e2fsprogs the build dies at "the initrd is missing sbin/e2fsck".
+e2fsprogs
+fdisk
 
 # Compressed swap in RAM — the appliance has no disk swap; without it the
 # kernel livelocks under memory pressure (see zram-generator.conf).
