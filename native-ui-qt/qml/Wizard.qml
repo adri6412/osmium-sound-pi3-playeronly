@@ -40,15 +40,28 @@ Item {
     property int progress: 0
     property int countdown: 0
 
-    Component.onCompleted: {
+    // true once the API has answered the startup probe at all (not whether a
+    // wizard is due). Until then we keep retrying: the API (api_server :8000)
+    // can bind a few seconds after the kiosk paints, e.g. on a slow board where
+    // its boot-time network recovery delays the listen — a single one-shot
+    // probe would miss that window and the first-boot wizard would never show.
+    property bool probed: false
+    function probe() {
         if (Sys.forcedWizard) { dry = Sys.wizardDry; mode = Sys.forcedWizard === "install" ? 2 : 1; start(); return }
         Api.get(Api.apiBase + "/boot_mode", function(ok, d) {
-            if (ok && d && d.mode === "installer") { mode = 2; start(); return }
+            if (ok && d && d.mode === "installer") { probed = true; mode = 2; start(); return }
             Api.get(Api.apiBase + "/provision_status", function(ok2, d2) {
-                if (ok2 && d2 && typeof d2 === "object" && (d2.pending || !d2.completed)) { mode = 1; readProvision(d2); start() }
+                if (ok2 && d2 && typeof d2 === "object") {
+                    probed = true
+                    if (d2.pending || !d2.completed) { mode = 1; readProvision(d2); start() }
+                }
             }, 6000)
         }, 6000)
     }
+    Component.onCompleted: probe()
+    // Retry the probe until the API answers once; stops as soon as it does
+    // (mode becomes 1/2 for a wizard, or probed=true when it says "completed").
+    Timer { interval: 2000; repeat: true; running: !root.probed && root.mode === 0; onTriggered: root.probe() }
     function start() { readNet(); if (mode === 1) pollProvision(); if (mode === 2) readInstall() }
     function readNet() {
         Api.get(Api.apiBase + "/network_status", function(ok, d) {

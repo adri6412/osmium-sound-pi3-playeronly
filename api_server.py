@@ -10928,7 +10928,14 @@ if __name__ == '__main__':
     # control of the appliance.
     # threaded=True so a slow handler (apt/systemctl/network reconfig, or a
     # 15s OTA fetch) doesn't block the kiosk UI's other requests behind it.
-    _startup_network_recovery()
+    # Network recovery can block for tens of seconds (nmcli networking on +
+    # device managed, each up to its own timeout) when NetworkManager is still
+    # settling at boot — on a slow board (Pi3) that used to run BEFORE app.run(),
+    # so :8000 opened late. The kiosk's first-boot wizard polls /provision_status
+    # exactly ONCE at startup (Wizard.qml Component.onCompleted; its retry Timer
+    # only runs once mode!=0), so a late bind meant the wizard was never shown
+    # and "the APIs don't respond". Recover in the background; bind the socket now.
+    threading.Thread(target=_startup_network_recovery, daemon=True, name='net-recovery').start()
     threading.Thread(target=_resume_playback_after_boot, daemon=True).start()
     threading.Thread(target=_reconcile_rotation_boot, daemon=True, name='rotation-boot').start()
     threading.Thread(target=_vu_store_background, daemon=True, name='vu-store').start()
