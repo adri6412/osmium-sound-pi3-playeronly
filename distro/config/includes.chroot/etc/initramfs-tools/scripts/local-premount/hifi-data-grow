@@ -54,36 +54,6 @@ disk=$(basename "$(readlink -f "/sys/class/block/${rootdev#/dev/}/..")")
 diskdev="/dev/$disk"
 [ -b "$diskdev" ] || exit 0
 
-# ── DIAGNOSTIC (temporary) ────────────────────────────────────────────────
-# Keep a log and copy it onto the FAT boot partition (p1, readable from
-# Windows) on EVERY exit, success or failure, so a first-boot that never shows
-# the wizard can be read back from the SD card without a serial cable. Revert
-# once the MBR first-boot data path is confirmed.
-LOG=/run/hifi-data-grow.log
-: > "$LOG" 2>/dev/null || true
-say() {
-    echo "hifi-data-grow: $*" >> "$LOG"
-    log_begin_msg "hifi-data-grow: $*"
-    log_end_msg
-}
-flush_log_to_fat() {
-    _p1=
-    for _d in /sys/class/block/"$disk"*; do
-        [ -f "$_d/partition" ] || continue
-        [ "$(cat "$_d/partition" 2>/dev/null)" = "1" ] || continue
-        _p1="/dev/$(basename "$_d")"; break
-    done
-    [ -n "$_p1" ] || return 0
-    mkdir -p /run/fatlog 2>/dev/null || true
-    if mount -t vfat -o rw "$_p1" /run/fatlog 2>/dev/null; then
-        cat "$LOG" > /run/fatlog/osmium-datagrow.log 2>/dev/null || true
-        sync; umount /run/fatlog 2>/dev/null || true
-    fi
-}
-trap flush_log_to_fat EXIT
-say "start: disk=$diskdev root=$rootdev slot=$slot"
-# ──────────────────────────────────────────────────────────────────────────
-
 # The data partition is p4 of the root disk (fixed MBR numbering, the same as
 # hifi-ab-lib.sh ab_part_by_name). Find its /dev node through sysfs.
 pn=4
@@ -95,11 +65,7 @@ for d in /sys/class/block/"$disk"*; do
         break
     fi
 done
-if [ -z "$part" ]; then
-    say "E: no partition $pn found on $diskdev"
-    exit 0
-fi
-say "p4=$part TYPE before=[$(blkid -o value -s TYPE "$part" 2>/dev/null)]"
+[ -n "$part" ] || exit 0
 
 # Already carries a filesystem (every boot after the first): it is an ordinary
 # hifi-data, leave it. On MBR there is no label to key on, so the presence of a
@@ -108,10 +74,15 @@ say "p4=$part TYPE before=[$(blkid -o value -s TYPE "$part" 2>/dev/null)]"
 # journal merely needs replay. Only an unformatted seed (empty TYPE) falls
 # through to grow + format + seed below.
 if [ -n "$(blkid -o value -s TYPE "$part" 2>/dev/null)" ]; then
-    say "already formatted — nothing to do"
     exit 0
 fi
 
+LOG=/run/hifi-data-grow.log
+say() {
+    echo "hifi-data-grow: $*" >> "$LOG"
+    log_begin_msg "hifi-data-grow: $*"
+    log_end_msg
+}
 plymouth display-message --text="Osmium Sound: preparing the disk for first use…" 2>/dev/null || true
 say "growing $part (partition $pn of $diskdev) to the end of the disk"
 
@@ -134,7 +105,6 @@ if ! "$MKE2FS" -t ext4 -F -q -m 1 -L hifi-data -O metadata_csum_seed "$part" >> 
     say "E: mke2fs failed on $part"
     exit 0
 fi
-say "mke2fs ok; TYPE now=[$(blkid -o value -s TYPE "$part" 2>/dev/null)]"
 
 # The installer's seeding, minus what hifi-state already does by itself (the
 # folders and the machine-id): the first-run marker, without which the unit
@@ -144,7 +114,6 @@ if mount -t ext4 "$part" /run/hifi-data-grow >> "$LOG" 2>&1; then
     mkdir -p /run/hifi-data-grow/etc/upper/hifi-player /run/hifi-data-grow/log
     printf 'pending\n' > /run/hifi-data-grow/etc/upper/hifi-player/provisioning-pending
     cp "$LOG" /run/hifi-data-grow/log/data-grow.log 2>/dev/null || true
-    say "marker seeded: $( [ -e /run/hifi-data-grow/etc/upper/hifi-player/provisioning-pending ] && echo yes || echo NO )"
     sync
     umount /run/hifi-data-grow
 else

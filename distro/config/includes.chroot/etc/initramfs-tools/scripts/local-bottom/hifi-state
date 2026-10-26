@@ -35,31 +35,6 @@ rootdev=$(awk -v m="${rootmnt}" '$2 == m { d = $1 } END { print d }' /proc/mount
 rootdev=$(readlink -f "$rootdev" 2>/dev/null || echo "$rootdev")
 name=${rootdev#/dev/}
 disk=$(basename "$(readlink -f "/sys/class/block/$name/..")")
-# ── DIAGNOSTIC (temporary) ────────────────────────────────────────────────
-# Keep a log and copy it onto the FAT boot partition (p1, readable from
-# Windows) on EVERY exit, so a first-boot that never shows the wizard can be
-# read back from the SD card without a serial cable. Revert once the MBR
-# first-boot data path is confirmed.
-LOG=/run/hifi-state.log
-: > "$LOG" 2>/dev/null || true
-dlog() { echo "hifi-state: $*" >> "$LOG"; }
-flush_log_to_fat() {
-    _p1=
-    for _d in /sys/class/block/"$disk"*; do
-        [ -f "$_d/partition" ] || continue
-        [ "$(cat "$_d/partition" 2>/dev/null)" = "1" ] || continue
-        _p1="/dev/$(basename "$_d")"; break
-    done
-    [ -n "$_p1" ] || return 0
-    mkdir -p /run/fatlog 2>/dev/null || true
-    if mount -t vfat -o rw "$_p1" /run/fatlog 2>/dev/null; then
-        cat "$LOG" > /run/fatlog/osmium-state.log 2>/dev/null || true
-        sync; umount /run/fatlog 2>/dev/null || true
-    fi
-}
-trap flush_log_to_fat EXIT
-dlog "start: root=$rootdev disk=$disk slot=$slot"
-# ──────────────────────────────────────────────────────────────────────────
 find_part() {  # logical name -> /dev/…  (MBR has no partition labels, so map to
                # the fixed partition number, the same as hifi-ab-lib.sh
                # ab_part_by_name; "EFI System" has no match and is skipped —
@@ -105,13 +80,10 @@ while [ "$attempt" -lt 15 ] && [ "$mounted" = 0 ]; do
     fsck.ext4 -p "$datadev" >/dev/null 2>&1 || true
     mount -t ext4 -o noatime "$datadev" "$D" && mounted=1
 done
-dlog "after loop: datadev=[$datadev] mounted=$mounted attempts=$attempt TYPE=[$(blkid -o value -s TYPE "$datadev" 2>/dev/null)]"
 if [ "$mounted" = 0 ]; then
     log_warning_msg "hifi-state: partizione hifi-data non disponibile dopo ${attempt} tentativi — stato volatile (tmpfs), le impostazioni di questo avvio NON verranno conservate"
-    dlog "FALLBACK tmpfs — no persistent /data this boot"
     mount -t tmpfs -o mode=0755 tmpfs "$D"
 fi
-dlog "marker on /data after mount: $( [ -e "$D/etc/upper/hifi-player/provisioning-pending" ] && echo yes || echo NO )"
 espdev=$(find_part "EFI System") || espdev=
 # ── factory reset ──────────────────────────────────────────────────────
 # Erasing the data partition happens HERE, not on a running system: /data holds
@@ -209,7 +181,6 @@ mount -t overlay overlay \
     "${rootmnt}/etc" || log_warning_msg "hifi-state: overlay su /etc fallito — /etc resta in sola lettura"
 mount --bind "$D/var" "${rootmnt}/var" || log_warning_msg "hifi-state: bind di /var fallito"
 mount --bind "$D/home" "${rootmnt}/home" || log_warning_msg "hifi-state: bind di /home fallito"
-dlog "after overlay: /etc marker visible = $( [ -e "${rootmnt}/etc/hifi-player/provisioning-pending" ] && echo yes || echo NO )"
 
 if [ -n "$espdev" ]; then
     mkdir -p "${rootmnt}/boot/efi"
