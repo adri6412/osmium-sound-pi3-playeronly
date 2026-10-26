@@ -1,0 +1,233 @@
+name: Build Osmium Pi3 image (manual)
+
+# Builds the Raspberry Pi 3B (arm64, player-only) system image and the
+# flashable SD-card .img, on a native arm64 runner. Mirror of the x86
+# build-iso.yml, but there is no live ISO and no GRUB: the Pi boots through its
+# GPU firmware -> U-Boot -> boot.scr, and the image is a RAUC A/B disk.
+#
+#   Actions -> "Build Osmium Pi3 image (manual)" -> Run workflow
+#     • version : e.g. 2.6.0-pi.1 (goes into IMAGE_VERSION / RAUC manifest)
+#     • suite   : Debian suite (default: trixie — Qt6/labwc need Debian 13)
+#     • sign    : sign the RAUC bundle with the repo secrets (default: true).
+#                 Untick to stop at the rootfs.squashfs + .img (no .raucb) for a
+#                 quick hardware spin without the production keys.
+#
+# Signing keys come from repository secrets, NEVER from the tree:
+#   RAUC_SIGNING_CERT / RAUC_SIGNING_KEY  the X.509 cert+key for the .raucb
+#   OTA_SIGNING_KEY                       the Ed25519 key for the .img sidecar
+# The public keyring (distro/rauc-keys/keyring.pem) and OTA pubkey
+# (distro/ota-keys/ota-pubkey.pem) are checked in and used to verify.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Image version (e.g. 2.6.0-pi.1)'
+        required: true
+        type: string
+      suite:
+        description: 'Debian suite'
+        required: false
+        type: string
+        default: 'trixie'
+      sign:
+        description: 'Sign the RAUC bundle with the repo secrets (untick for an unsigned test build)'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  # 🚨 On the bare arm64 runner, not in a container: it builds the Qt interface
+  # that lands in /opt/hifi-qt. build-payload.sh builds it natively inside a
+  # `debian:trixie` docker container, which on an arm64 runner is arm64 — so the
+  # binary is a real aarch64 build with no qemu and no extra flags. It cannot
+  # run inside the image container (no docker there), same reason as the x86 ISO.
+  qt-payload:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Build the Qt on-screen interface payload (arm64)
+        run: bash native-ui-qt/ci/build-payload.sh qtui
+
+      - name: Verify the payload really is aarch64
+        run: |
+          set -eu
+          file qtui/hifi-qt || true
+          mach=$(od -An -tu1 -j18 -N1 qtui/hifi-qt | tr -d ' ')
+          [ "$mach" = 183 ] || { echo "::error::qtui/hifi-qt is not an aarch64 ELF (e_machine=$mach, want 183)"; exit 1; }
+
+      - name: Upload the Qt payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: qt-payload
+          path: qtui
+          retention-days: 1
+          if-no-files-found: error
+
+  # The system image (rootfs.squashfs + the RAUC bundle) and the flashable
+  # SD-card .img. Built in a privileged debian:trixie container on the arm64
+  # runner, so debootstrap/mksquashfs/losetup/rauc all run native arm64.
+  image:
+    runs-on: ubuntu-24.04-arm
+    # 🚨 It consumes the qt-payload artifact, so it cannot start beside the job
+    # that produces it (the download would fail with "Artifact not found").
+    needs: qt-payload
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    container:
+      image: debian:trixie
+      options: --privileged
+      volumes:
+        - /mnt:/mnt
+    steps:
+      - name: Install base tooling (container is minimal)
+        run: |
+          set -eux
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git xz-utils sudo python3 build-essential \
+            debootstrap debian-archive-keyring rsync fakeroot \
+            squashfs-tools dosfstools mtools \
+            rauc e2fsprogs zstd openssl initramfs-tools-core \
+            u-boot-tools file fdisk mount util-linux
+
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: admin-webui/package-lock.json
+
+      - name: Fetch the Qt interface built by the qt-payload job
+        uses: actions/download-artifact@v8
+        with:
+          name: qt-payload
+          path: qtui
+
+      - name: Build web-admin (Vue)
+        run: |
+          if [ -f admin-webui/package.json ]; then
+            (cd admin-webui && npm ci && npm run build)
+          else
+            echo "::error::admin-webui/package.json missing — cannot build the web-admin UI" >&2
+            exit 1
+          fi
+
+      - name: Inject the payloads into includes.chroot
+        # build-pi3.sh overlays config/includes.chroot as-is (no --qt-dir), so
+        # the Qt payload and the web-admin dist must already be in it, exactly
+        # where the x86 build-distro.sh injects them (/opt/hifi-qt, /opt/hifi-webui).
+        run: |
+          set -eux
+          chmod 755 qtui/hifi-qt
+          [ -f qtui/hifi-media-player ] && chmod 755 qtui/hifi-media-player || true
+          QT_DEST=distro/config/includes.chroot/opt/hifi-qt
+          WEBUI_DEST=distro/config/includes.chroot/opt/hifi-webui/dist
+          mkdir -p "$QT_DEST" "$WEBUI_DEST"
+          cp -a qtui/. "$QT_DEST/"
+          [ -f admin-webui/dist/index.html ] || { echo "::error::admin-webui/dist missing after build"; exit 1; }
+          cp -a admin-webui/dist/. "$WEBUI_DEST/"
+
+      - name: Build the Pi3 system image (+ RAUC bundle)
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_SUITE: ${{ inputs.suite }}
+          INPUT_SIGN: ${{ inputs.sign }}
+          RAUC_SIGNING_CERT: ${{ secrets.RAUC_SIGNING_CERT }}
+          RAUC_SIGNING_KEY: ${{ secrets.RAUC_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          mkdir -p /mnt/pi3-out
+          export IMAGE_OUT=/mnt/pi3-out IMAGE_WORK=/mnt
+          chmod +x distro/build-pi3.sh distro/build-image-pi3.sh
+          ARGS=(--version "$INPUT_VERSION" --suite "$INPUT_SUITE")
+          if [ "$INPUT_SIGN" = "true" ]; then
+            if [ -z "${RAUC_SIGNING_CERT:-}" ] || [ -z "${RAUC_SIGNING_KEY:-}" ]; then
+              echo "::error::sign=true but RAUC_SIGNING_CERT / RAUC_SIGNING_KEY secrets are not set"
+              exit 1
+            fi
+            umask 077
+            printf '%s' "$RAUC_SIGNING_CERT" > "$RUNNER_TEMP/rauc-cert.pem"
+            printf '%s' "$RAUC_SIGNING_KEY"  > "$RUNNER_TEMP/rauc-key.pem"
+            # --keep-rootfs: keep the rootfs.squashfs next to the signed .raucb,
+            # build-image-pi3.sh needs it to assemble the disk .img.
+            ARGS+=(--cert "$RUNNER_TEMP/rauc-cert.pem" --key "$RUNNER_TEMP/rauc-key.pem" --keep-rootfs)
+          else
+            # No keys: stop at the rootfs.squashfs (no bundle). The disk .img is
+            # still built below from that squashfs for a hardware spin.
+            ARGS+=(--no-bundle)
+          fi
+          ./distro/build-pi3.sh "${ARGS[@]}"
+          rm -f "$RUNNER_TEMP/rauc-cert.pem" "$RUNNER_TEMP/rauc-key.pem"
+          ls -lh /mnt/pi3-out
+
+      - name: Assemble the flashable SD-card image
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          SQ="/mnt/pi3-out/osmium-pi3-${INPUT_VERSION}.rootfs.squashfs"
+          [ -f "$SQ" ] || { echo "::error::rootfs.squashfs not found: $SQ"; exit 1; }
+          IMAGE_WORK=/mnt ./distro/build-image-pi3.sh \
+            --rootfs "$SQ" \
+            --out "/mnt/pi3-out/osmium-pi3-${INPUT_VERSION}.img"
+          # xz: what Raspberry Pi Imager, Etcher and Rufus all open as-is. The
+          # empty slot B costs almost nothing (already-compressed squashfs).
+          xz -T0 -6 -v "/mnt/pi3-out/osmium-pi3-${INPUT_VERSION}.img"
+          ls -lh /mnt/pi3-out
+
+      - name: Checksum + sign the disk image
+        env:
+          OTA_SIGNING_KEY: ${{ secrets.OTA_SIGNING_KEY }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          cd /mnt/pi3-out
+          IMG="osmium-pi3-${INPUT_VERSION}.img.xz"
+          sha256sum "$IMG" > "$IMG.sha256"
+          if [ -z "${OTA_SIGNING_KEY:-}" ]; then
+            echo "::notice::OTA_SIGNING_KEY not set — disk image left unsigned (checksum only)"
+          else
+            umask 077
+            printf '%s' "$OTA_SIGNING_KEY" > "$RUNNER_TEMP/ota-key.pem"
+            openssl pkeyutl -sign -inkey "$RUNNER_TEMP/ota-key.pem" -rawin \
+              -in "$IMG.sha256" -out "$IMG.sha256.sig"
+            rm -f "$RUNNER_TEMP/ota-key.pem"
+            openssl pkeyutl -verify -pubin \
+              -inkey "$GITHUB_WORKSPACE/distro/ota-keys/ota-pubkey.pem" \
+              -rawin -in "$IMG.sha256" -sigfile "$IMG.sha256.sig" \
+              || { echo "::error::the signature does not verify against the shipped public key"; exit 1; }
+          fi
+          ls -lh
+
+      - name: Upload the RAUC bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: osmium-pi3-raucb-${{ inputs.version }}
+          path: |
+            /mnt/pi3-out/osmium-pi3-*.raucb*
+            /mnt/pi3-out/osmium-pi3-*.info.txt
+            /mnt/pi3-out/osmium-pi3-*.build-info.txt
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload the flashable disk image
+        uses: actions/upload-artifact@v4
+        with:
+          name: osmium-pi3-img-${{ inputs.version }}
+          path: /mnt/pi3-out/osmium-pi3-*.img.xz*
+          retention-days: 14
+          if-no-files-found: error
