@@ -1,10 +1,13 @@
-# Osmium Sound — this device's RAUC configuration.
-# REGENERATED ON EVERY BOOT by /usr/local/sbin/hifi-rauc-config.sh (device
-# names differ between eMMC, SATA and NVMe): do not edit by hand.
+# Osmium Sound (Raspberry Pi 3B) — this device's RAUC configuration.
+# REGENERATED ON EVERY BOOT by /usr/local/sbin/hifi-rauc-config.sh (the slot
+# device names are filled in from the real partitions): do not edit by hand.
 [system]
-compatible=osmium-x86_64
-bootloader=grub
-grubenv=/boot/efi/EFI/debian/grubenv
+compatible=osmium-rpi3
+# U-Boot backend: RAUC marks slots good/bad through fw_setenv/fw_printenv
+# (BOOT_ORDER + BOOT_<slot>_LEFT in uboot.env on the FAT boot partition), the
+# redundant counterpart of the x86 grubenv scheme. See /etc/fw_env.config and
+# distro/uboot/boot.cmd. No `grubenv=` line here: there is no GRUB on the Pi.
+bootloader=uboot
 data-directory=/data/rauc
 bundle-formats=-plain
 
@@ -12,8 +15,10 @@ bundle-formats=-plain
 path=/etc/rauc/keyring.pem
 use-bundle-signing-time=true
 
-# type=raw: the image is a squashfs written to the partition exactly as it is
-# (a converted legacy root, ext4, is overwritten the same way).
+# type=raw: the image is a squashfs written to the partition exactly as it is.
+# The post-install hook (distro/rauc/hook.sh) then copies the slot's kernel,
+# initramfs and DTB onto the FAT boot partition as vmlinuz-<bootname> etc., so
+# U-Boot can load them without having to read squashfs.
 [slot.rootfs.0]
 device=@SLOT_A@
 type=raw

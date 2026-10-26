@@ -1,0 +1,28 @@
+# Osmium Sound — Raspberry Pi 3B firmware configuration.
+#
+# The VideoCore GPU firmware is the real first-stage loader on a Pi: it reads
+# this file and loads what `kernel=` points at. Here that is U-Boot, NOT Linux:
+# U-Boot then reads boot.scr and picks the RAUC A/B slot (see boot.cmd). Do not
+# point `kernel=` straight at a vmlinuz — that would bypass the A/B selector.
+arm_64bit=1
+kernel=u-boot.bin
+
+# Serial console on the GPIO header, for bring-up and for reading U-Boot. Costs
+# nothing in production and is the only way to see the boot on a headless unit.
+enable_uart=1
+
+# KMS/DRM for the Qt kiosk (eglfs on the vc4 scanout + v3d render node). The
+# Pi3 GPU (VideoCore IV) is weak — see the memory on heavy animations — but the
+# full-KMS driver is still the right one for a DRM/eglfs surface.
+dtoverlay=vc4-kms-v3d
+max_framebuffers=2
+disable_overscan=1
+
+# Bit-perfect player: the on-board analog/HDMI audio is off. Output goes to a
+# USB DAC (works with no overlay) or to an I2S HAT — enable exactly one of the
+# lines below for the HAT in use (left commented: USB DAC is the default path).
+dtparam=audio=off
+#dtoverlay=hifiberry-dac
+#dtoverlay=hifiberry-dacplus
+#dtoverlay=allo-boss-dac-pcm512x-audio
+#dtoverlay=iqaudio-dacplus

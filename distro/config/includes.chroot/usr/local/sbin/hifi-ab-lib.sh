@@ -39,7 +39,14 @@ AB_SLOT_A_MARGIN_MIN_MIB="${AB_SLOT_A_MARGIN_MIN_MIB:-192}"  # margine minimo
 AB_DATA_MIN_MIB="${AB_DATA_MIN_MIB:-1536}"
 AB_HEAD_MIB="${AB_HEAD_MIB:-513}"        # p1 (1 MiB) + ESP (512 MiB)
 AB_RESIZE_TAX="${AB_RESIZE_TAX:-155}"    # minimo resize2fs ≈ occupato × 1,55
-AB_ESP_MNT=/boot/efi
+# Raspberry Pi fork: the "ESP" is the FAT boot partition (PARTLABEL hifi-boot)
+# that holds the Pi firmware, u-boot.bin, boot.scr, the per-slot kernels and
+# uboot.env. Debian mounts it at /boot/firmware. The grub* paths below still
+# exist for the dormant x86 legacy-conversion scripts (which never run on a
+# born-RAUC Pi image); on the Pi they resolve to a path that is simply absent,
+# so the grubenv-guarded code (record_proof/rearm_other) is a silent no-op.
+AB_BOOT_PARTLABEL="${AB_BOOT_PARTLABEL:-hifi-boot}"
+AB_ESP_MNT=/boot/firmware
 AB_ESP_DIR="$AB_ESP_MNT/EFI/debian"
 AB_GRUBENV="$AB_ESP_DIR/grubenv"
 AB_STUB="$AB_ESP_DIR/grub.cfg"
@@ -57,6 +64,18 @@ AB_IMAGE_MARKER=/usr/lib/osmium/IMAGE_VERSION
 AB_IMAGE_ID_FILE=/boot/grub/osmium-id.env
 # Extra boots a proven image gets after a bad one before the fallback.
 AB_PROVEN_ATTEMPTS=2
+
+# Which bootloader this device uses, read from the generated RAUC config:
+# "uboot" on the Pi, "grub" on x86. Empty when the config is not there yet.
+ab_bootloader() {
+    sed -n 's/^[[:space:]]*bootloader=//p' "$AB_RAUC_CONF" 2>/dev/null | head -n 1
+}
+
+# U-Boot environment accessors (libubootenv fw_printenv/fw_setenv, configured by
+# /etc/fw_env.config). ab_uenv_get prints the value or nothing; ab_uenv_set
+# returns non-zero if the write fails (e.g. the boot partition is not mounted).
+ab_uenv_get() { fw_printenv -n "$1" 2>/dev/null; }
+ab_uenv_set() { fw_setenv "$1" "$2" 2>/dev/null; }
 
 ab_log() { printf 'I: [hifi-ab] %s\n' "$*" >&2; }
 
@@ -163,6 +182,8 @@ ab_booted_slot() {
 # Debian Installer non ha etichette e verrebbe altrimenti escluso dalla
 # conversione senza una vera ragione.
 ab_esp_dev() {
+    # Pi fork: the boot/firmware partition carries PARTLABEL hifi-boot.
+    ab_part_by_name "$AB_BOOT_PARTLABEL" 2>/dev/null && return 0
     ab_part_by_name "EFI System" 2>/dev/null && return 0
     _dk=$(ab_disk 2>/dev/null) || return 1
     _dn=${_dk#/dev/}

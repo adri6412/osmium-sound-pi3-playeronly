@@ -1,0 +1,190 @@
+# ── Osmium Sound (Raspberry Pi 3B, arm64, player-only) — package list ──────
+# IMPORTANT: one package per line, NO inline comments. The build passes whole
+# lines to apt, so a trailing "# ... a/b/c" becomes a bogus argument.
+#
+# This is the arm64 counterpart of hifi.list.chroot. Differences, by block:
+#   * kernel linux-image-arm64 instead of -amd64;
+#   * boot chain is Raspberry Pi firmware + U-Boot (RAUC u-boot backend), not
+#     GRUB/shim/EFI — see distro/uboot/ and system.conf.tmpl;
+#   * firmware trimmed to what a Pi uses (onboard Broadcom Wi-Fi/BT + common USB);
+#   * Intel/AMD GPU tools dropped, Mesa v3d/vc4 GLES added for the Qt eglfs kiosk;
+#   * no bundled Lyrion runtime (player-only: joins an external server).
+# The on-screen UI is kept COMPLETE for now (Xorg + labwc stack still here);
+# trimming to a lean eglfs-only stack is a later, hardware-tested step.
+
+# Kernel (Debian arm64) + Raspberry Pi GPU firmware (bootcode/start*.elf/fixup*)
+linux-image-arm64
+raspi-firmware
+
+# Bootloader: 64-bit U-Boot for the Pi (loaded by config.txt as the "kernel"),
+# the RAUC u-boot backend's env tools, and mkimage/mkenvimage for the image build.
+#   u-boot-rpi        provides /usr/lib/u-boot/rpi_arm64/u-boot.bin
+#   libubootenv-tool  fw_printenv/fw_setenv (RAUC reads/writes BOOT_ORDER here)
+#   u-boot-tools      mkimage (boot.scr) + mkenvimage (initial uboot.env)
+u-boot-rpi
+libubootenv-tool
+u-boot-tools
+
+# Network time — a separate package since Debian 12, NOT part of systemd.
+systemd-timesyncd
+
+# Firmware — onboard Broadcom (Pi3 Wi-Fi + Bluetooth) plus the common USB
+# Wi-Fi/Ethernet dongles people plug into a headless player. The Intel wireless
+# blob and the x86 CPU/GPU microcode bundles are gone (never on a Pi).
+firmware-brcm80211
+firmware-misc-nonfree
+firmware-realtek
+firmware-atheros
+wireless-regdb
+wpasupplicant
+
+# Xorg + minimal display stack (no desktop environment) — kept as-is for now.
+xserver-xorg-core
+xserver-xorg-video-all
+xserver-xorg-input-all
+x11-xserver-utils
+xinit
+lightdm
+unclutter
+labwc
+wlr-randr
+xwayland
+
+# Mesa userspace for the Pi GPU (vc4 scanout + v3d render), for Qt eglfs/KMS:
+# the DRI drivers, EGL and GLES, and libinput for touch/keyboard under eglfs.
+libgl1-mesa-dri
+libegl1
+libegl-mesa0
+libgles2
+libgbm1
+libdrm2
+libinput10
+
+# Fonts — CJK glyphs for album/track names, DejaVu as the Latin/Cyrillic base.
+fonts-noto-cjk
+fonts-dejavu-core
+
+# Audio
+alsa-utils
+
+# Audio CD support — this player has no local Lyrion "CD Player" plugin; the
+# optical drive is read locally only to rip CDs into the library (hifi-rip-cd.py)
+cdparanoia
+libcdio-utils
+icedax
+
+# CD ripping to library (hifi-rip-cd.py: encode + tag + TOC lookup + eject)
+flac
+cd-discid
+eject
+
+# Audio tooling used locally (transcoding to a local Lyrion is gone on this
+# fork — an external server does that): sox + ffmpeg for CD ripping and the
+# (deferred, Pi-unlikely) PCM to DSD / DSP path, wavpack for tag reading.
+sox
+wavpack
+ffmpeg
+
+# Squeezelite (Debian build has VISEXPORT; -v exports /dev/shm/squeezelite-*)
+squeezelite
+
+# Bluetooth speakers (A2DP source). None of it runs unless the owner turns
+# Bluetooth on: the units ship unenabled.
+bluez
+bluez-tools
+bluez-alsa-utils
+libasound2-plugin-bluez
+
+# NOTE: network audio receivers (AirPlay, UPnP/DLNA, Spotify Connect) are NOT
+# system packages — they are plugins of the EXTERNAL Lyrion, installed from
+# that server's own web UI. Nothing to install on this player.
+
+# Python services (api_server.py + vu_meter_daemon.py + sources_server.py)
+python3
+python3-flask
+python3-flask-cors
+python3-psutil
+python3-websockets
+python3-yaml
+python3-numpy
+python3-mutagen
+
+# Network shares (SMB mounting for music sources + serving internal disks)
+cifs-utils
+samba
+smbclient
+exfatprogs
+ntfs-3g
+wsdd2
+
+# Image build helpers also used on-device (unsquashfs, mkfs.vfat)
+squashfs-tools
+dosfstools
+
+# mDNS/Bonjour discovery (so an external Lyrion or a NAS as name.local resolves)
+avahi-daemon
+avahi-utils
+libnss-mdns
+
+# Process utilities used by the A/B and maintenance scripts (killall/fuser from
+# psmisc, pgrep/ps from procps). No local Lyrion perl runtime on this fork.
+psmisc
+procps
+
+# Boot splash (hidden/branded boot)
+plymouth
+plymouth-themes
+
+# System / networking
+sudo
+openssh-server
+curl
+ca-certificates
+openssl
+isc-dhcp-client
+iproute2
+network-manager
+dnsmasq-base
+locales
+
+# Automatic security updates (config in /etc/apt/apt.conf.d/52hifi-unattended).
+unattended-upgrades
+
+# Rotates /var/log/hifi/*.log (config in /etc/logrotate.d/hifi).
+logrotate
+
+# lspci — model string for the admin dashboard (api_server.py gpu_model()).
+pciutils
+
+# ── on-screen UI (Qt 6 Quick, direct DRM/KMS via eglfs) ───────────────────
+# The interface files arrive with the system payload (/opt/hifi-qt); here are
+# only the libraries. kbd = chvt (the unit brings tty1 to the front first).
+kbd
+qt6-qpa-plugins
+libqt6dbus6
+qt6-image-formats-plugins
+qml6-module-qtquick
+qml6-module-qtquick-window
+qml6-module-qtquick-effects
+qml6-module-qtquick-shapes
+qml6-module-qtquick-vectorimage
+qml6-module-qtqml-workerscript
+
+# ── A/B scheme (RAUC) ─────────────────────────────────────────────────────
+# rauc writes the inactive slot from the image bundle and keeps BOOT_ORDER/
+# BOOT_<slot>_LEFT in the U-Boot env (uboot.env on the FAT boot partition);
+# rauc-service is the D-Bus daemon the API queries. zstd compresses the initrd.
+rauc
+rauc-service
+zstd
+# busybox: in the initrd it gives grep/sed/cp/tr to the hifi-state scripts.
+busybox
+
+# Compressed swap in RAM — the appliance has no disk swap; without it the
+# kernel livelocks under memory pressure (see zram-generator.conf).
+systemd-zram-generator
+systemd-oomd
+
+# Network-interface power saving off (hifi-nic-powersave-off.sh): iw + ethtool.
+iw
+ethtool
