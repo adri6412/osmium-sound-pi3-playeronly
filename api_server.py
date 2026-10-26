@@ -2710,80 +2710,50 @@ def _is_own_address(addr):
     return addr.startswith('127.') or addr in _own_addresses()
 
 def get_lms_role():
+    # Player-only fork: there is no internal Lyrion. A device that has not been
+    # pointed at an external server yet (still the 127.0.0.1 placeholder) is
+    # reported as "follow" with no host, so the setup flow asks for one.
     host = _current_lms_host()
-    if host == '127.0.0.1':
-        return {'mode': 'local', 'host': None}
+    if host in ('127.0.0.1', 'localhost') or not host:
+        return {'mode': 'follow', 'host': None}
     return {'mode': 'follow', 'host': host}
 
-def _set_local_lyrion_enabled(enable):
-    """Start+enable, or stop+disable, this device's OWN Lyrion Music Server.
-
-    Following another server does not merely make the local one redundant: as
-    long as it keeps running it still answers on 127.0.0.1:9000, and anything
-    that reaches loopback before it has read this role talks to that empty
-    local server instead of the one being followed. The kiosk resolves the
-    server address asynchronously at startup (Api::refreshLmsHost), so on a
-    boot where the answer is late it latches onto the local one — which is the
-    "sometimes it connects to the local server anyway" owners report. Stopping
-    it is not enough on its own: without `disable` the unit comes straight back
-    at the next boot, so the choice would only hold until the next restart.
-
-    Best effort: the role itself is already persisted in
-    /etc/default/squeezelite by the time this runs, and a device that never
-    installed Lyrion has a unit that cannot start (ConditionPathExists on
-    /data/lyrion/current) or no unit at all — neither is a reason to report the
-    role change as failed.
-    """
-    action = ['enable', '--now'] if enable else ['disable', '--now']
-    try:
-        if enable:
-            # A deliberate start must not be vetoed by the unit's crash-loop
-            # limit (five starts in five minutes), which counts every stop and
-            # start the setup does too — see sources_server._systemctl_lyrion.
-            _run(['systemctl', 'reset-failed', LYRION_UNIT], timeout=15)
-        r = _run(['systemctl'] + action + [LYRION_UNIT], timeout=60)
-        if r.returncode != 0:
-            log.warning("set_lms_role: systemctl %s %s failed: %s",
-                        action[0], LYRION_UNIT, (r.stderr or '').strip())
-        return r.returncode == 0
-    except Exception:
-        log.exception("set_lms_role: systemctl %s %s failed", action[0], LYRION_UNIT)
-        return False
-
 def set_lms_role(mode, host):
+    # Player-only fork: this device never runs its own Lyrion, so the only
+    # valid role is "follow" an external server. The old "local" mode (and the
+    # start/stop of a bundled Lyrion unit that went with it) is gone.
     if mode == 'local':
-        target = '127.0.0.1'
-    elif mode == 'follow':
-        host = host.strip().rstrip('.').lower() if isinstance(host, str) else host
-        if not (_valid_ipv4(host) or _valid_hostname(host)):
-            return {'success': False, 'code': 'lms.invalidHost',
-                    'message': _t('lms.invalidHost', _lang(), host=host)}
-        if host in ('127.0.0.1', 'localhost') or (_valid_ipv4(host) and host.startswith('127.')):
-            return {'success': False, 'code': 'lms.useLocalMode',
-                    'message': _t('lms.useLocalMode', _lang())}
-        # squeezelite resolves the name once when it starts; a typo would only
-        # show after the reboot the owner is asked for next, as a player that
-        # never connects. Check it here while there is still a form to fix it.
-        if _valid_ipv4(host):
-            addrs = {host}
-        elif host in _own_host_names():
-            addrs = None
-        else:
-            addrs = _lookup_host(host)
-            if not addrs:
-                return {'success': False, 'code': 'lms.hostNotFound',
-                        'message': _t('lms.hostNotFound', _lang(), host=host)}
-        # 🚨 Following this very box (its LAN address, its name, its .local
-        # name — discovery lists the local Lyrion too) switches the local
-        # Lyrion off and then points the player at it: no music, and
-        # hifi-lyrion-ensure keeps it off at every boot after.
-        if addrs is None or any(_is_own_address(a) for a in addrs):
-            return {'success': False, 'code': 'lms.ownAddress',
-                    'message': _t('lms.ownAddress', _lang(), host=host)}
-        target = host
-    else:
+        return {'success': False, 'code': 'lms.noInternalServer',
+                'message': _t('lms.noInternalServer', _lang())}
+    if mode != 'follow':
         return {'success': False, 'code': 'lms.invalidMode',
                 'message': _t('lms.invalidMode', _lang(), mode=mode)}
+    host = host.strip().rstrip('.').lower() if isinstance(host, str) else host
+    if not (_valid_ipv4(host) or _valid_hostname(host)):
+        return {'success': False, 'code': 'lms.invalidHost',
+                'message': _t('lms.invalidHost', _lang(), host=host)}
+    if host in ('127.0.0.1', 'localhost') or (_valid_ipv4(host) and host.startswith('127.')):
+        return {'success': False, 'code': 'lms.noInternalServer',
+                'message': _t('lms.noInternalServer', _lang())}
+    # squeezelite resolves the name once when it starts; a typo would only
+    # show after the reboot the owner is asked for next, as a player that
+    # never connects. Check it here while there is still a form to fix it.
+    if _valid_ipv4(host):
+        addrs = {host}
+    elif host in _own_host_names():
+        addrs = None
+    else:
+        addrs = _lookup_host(host)
+        if not addrs:
+            return {'success': False, 'code': 'lms.hostNotFound',
+                    'message': _t('lms.hostNotFound', _lang(), host=host)}
+    # 🚨 This box has no Lyrion of its own: pointing the player at its own
+    # address (LAN address, name, or .local name) would leave it with nothing
+    # to connect to. Refuse it and keep asking for the real server.
+    if addrs is None or any(_is_own_address(a) for a in addrs):
+        return {'success': False, 'code': 'lms.ownAddress',
+                'message': _t('lms.ownAddress', _lang(), host=host)}
+    target = host
 
     try:
         _sq_update(lambda model: model.update(server=target))
@@ -2791,17 +2761,14 @@ def set_lms_role(mode, host):
         log.exception("set_lms_role: write config failed")
         return {'success': False, 'code': 'lms.sqConfigMissing',
                 'message': _t('lms.sqConfigMissing', _lang())}
-    # PCM → DSD only converts on this device's own Lyrion: its rules follow
-    # the choice, written before that Lyrion is started or stopped below.
+    # PCM → DSD rules still follow the chosen server. On this fork there is no
+    # local Lyrion to convert on, so this is effectively a no-op, but the code
+    # is kept intact for now (to be evaluated on real Pi3B hardware).
     try:
         sq.sync_pcm2dsd(SQUEEZELITE_CONF, ZONES_CONF, PCM2DSD_MAP, LMS_CONVERT,
                         SQUEEZELITE_DEFAULT, DSP_TARGET_FILE)
     except Exception:
         log.exception("set_lms_role: PCM to DSD rules")
-    # Before the player restart below, so squeezelite comes back up with the
-    # local server already stopped (following) or already running (standalone)
-    # and can only land on the one that was just chosen.
-    _set_local_lyrion_enabled(mode == 'local')
     # The zones play from the same server as the built-in player.
     try:
         sq.sync_zones(ZONES_CONF, restart={z['id'] for z in sq.load_zones(ZONES_CONF)})
@@ -2811,15 +2778,14 @@ def set_lms_role(mode, host):
     try:
         r = _restart_squeezelite_if_enabled()
         if r.returncode != 0:
-            return {'success': True, 'host': target if mode == 'follow' else None,
+            return {'success': True, 'host': target,
                     'message': _t('lms.serverSetRestartWarn', _lang(),
                                   target=target, err=(r.stderr or '').strip())}
     except Exception:
         log.exception("set_lms_role: squeezelite restart failed")
-        return {'success': True, 'host': target if mode == 'follow' else None,
+        return {'success': True, 'host': target,
                 'message': _t('lms.serverSetRestartFailed', _lang(), target=target)}
-    msg = (_t('lms.localRestored', _lang()) if mode == 'local'
-           else _t('lms.serverSet', _lang(), target=target))
+    msg = _t('lms.serverSet', _lang(), target=target)
     # A boot that came up without its data partition writes to a tmpfs /etc:
     # the change applies right now and is gone at the next restart, with the
     # previous choice back — which is exactly how "I set it back and at
@@ -2827,7 +2793,7 @@ def set_lms_role(mode, host):
     # reporting a clean success.
     if _data_partition_mounted() is False:
         msg = msg + ' — ' + _t('lms.volatileBoot', _lang())
-    return {'success': True, 'host': target if mode == 'follow' else None, 'message': msg}
+    return {'success': True, 'host': target, 'message': msg}
 
 # ── Player name (-n) — every device ships as "OsmiumSound" by default, which
 # makes them indistinguishable once two are grouped for multiroom. Letting an

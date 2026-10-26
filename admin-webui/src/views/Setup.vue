@@ -121,10 +121,9 @@ const rcGroups = computed(() => {
   return out;
 });
 
-// Internal vs external, offered up front: someone adding a player to a house
-// that already runs Lyrion should not have to install a second server and then
-// go hunting through Settings to turn it off again.
-const lmsMode = ref('local');       // 'local' = internal | 'follow' = external
+// This device has no Lyrion server of its own: it always follows an external
+// one on the network. There is no internal/external choice to make.
+const lmsMode = ref('follow');      // always 'follow' on this player-only fork
 const lmsHost = ref('');
 const lmsServers = ref([]);
 const lmsBusy = ref(false);
@@ -140,12 +139,6 @@ async function useExternalLms() {
   lmsBusy.value = false;
   if (!(r.ok && r.data.success !== false)) lyrionError.value = (r.data && r.data.message) || t('setup.lyrionExternalFailed');
   else lyrionError.value = '';
-}
-function pickLmsMode(m) {
-  lmsMode.value = m;
-  lyrionError.value = '';
-  if (m === 'follow' && !lmsServers.value.length) discoverLms();
-  if (m === 'local') api.sysPost('lms_role', { mode: 'local' });
 }
 
 async function checkLyrion() {
@@ -271,7 +264,7 @@ async function afterAuth() {
     currentDevice.value = res.data.current || 'default';
   }
   stage.value = provisioning.value ? 'configure' : 'done';
-  if (stage.value === 'configure') { checkLyrion(); loadRemote(); }
+  if (stage.value === 'configure') { discoverLms(); loadRemote(); }
 }
 
 async function pickDevice(id) {
@@ -324,55 +317,20 @@ async function finish() {
     </div>
     <div class="card">
       <h3><span class="dot"></span>{{ t('setup.lyrionTitle') }}</h3>
-      <p class="sub">{{ t('setup.lyrionModeHint') }}</p>
-      <div class="seg">
-        <button :class="{ active: lmsMode === 'local' }" @click="pickLmsMode('local')">{{ t('setup.lyrionInternal') }}</button>
-        <button :class="{ active: lmsMode === 'follow' }" @click="pickLmsMode('follow')">{{ t('setup.lyrionExternal') }}</button>
+
+      <!-- Player-only: no server to install, just point at the existing one. -->
+      <p class="sub">{{ t('setup.lyrionExternalHint') }}</p>
+      <div v-for="s in lmsServers" :key="s.ip" class="net between" @click="lmsHost = s.ip">
+        <span>{{ s.name || s.ip }}</span><span class="muted">{{ s.ip }}</span>
       </div>
-
-      <!-- External: no install needed at all, just point at the existing one. -->
-      <template v-if="lmsMode === 'follow'">
-        <p class="sub" style="margin-top: 12px;">{{ t('setup.lyrionExternalHint') }}</p>
-        <div v-for="s in lmsServers" :key="s.ip" class="net between" @click="lmsHost = s.ip">
-          <span>{{ s.name || s.ip }}</span><span class="muted">{{ s.ip }}</span>
-        </div>
-        <p v-if="!lmsServers.length" class="muted">{{ lmsBusy ? t('setup.lyrionSearching') : t('setup.lyrionNoneFound') }}</p>
-        <label>{{ t('setup.lyrionServerIp') }}</label>
-        <input v-model="lmsHost" placeholder="192.168.1.10 / nas.local" />
-        <div class="row" style="margin-top: 10px;">
-          <button class="secondary" :disabled="lmsBusy" @click="discoverLms">{{ t('setup.lyrionSearch') }}</button>
-          <button :disabled="lmsBusy || !lmsHost" @click="useExternalLms">{{ t('setup.lyrionUseExternal') }}</button>
-        </div>
-        <div v-if="lyrionError" class="msg err">{{ lyrionError }}</div>
-      </template>
-
-      <template v-else>
-        <p v-if="lyrionState === 'checking'" class="sub">{{ t('setup.lyrionChecking') }}</p>
-        <template v-else-if="lyrionState === 'missing'">
-          <p class="sub">{{ t('setup.lyrionMissingHint') }}</p>
-          <template v-if="!lyrionInstalling">
-            <button @click="installLyrion">{{ t('setup.lyrionInstall') }}</button>
-            <div v-if="lyrionError" class="msg err">{{ lyrionError }}</div>
-          </template>
-          <template v-else>
-            <div style="width: 100%; height: 8px; background: var(--panel); border-radius: 99px; overflow: hidden; margin: 10px 0;">
-              <div style="height: 100%; background: var(--gold); transition: width .4s;" :style="{ width: lyrionProgress + '%' }"></div>
-            </div>
-            <p class="muted">{{ lyrionMsg || t('setup.lyrionInstalling') }}</p>
-          </template>
-        </template>
-        <p v-else class="sub">{{ t('setup.lyrionInstalled') }}</p>
-        <template v-if="lyrionState === 'installed'">
-          <p class="sub" style="margin-top: 12px;">{{ t('setup.skinHint') }}</p>
-          <div class="seg">
-            <button :class="{ active: skinChoice === 'osmium' }" :disabled="skinBusy" @click="chooseSkin('osmium')">{{ t('setup.skinOsmium') }}</button>
-            <button :class="{ active: skinChoice === 'material' }" :disabled="skinBusy" @click="chooseSkin('material')">{{ t('setup.skinMaterial') }}</button>
-          </div>
-          <p v-if="skinBusy" class="muted">{{ skinMsg }}</p>
-          <div v-if="skinError" class="msg err">{{ skinError }}</div>
-          <p class="item"><a :href="lmsUrl" target="_blank">{{ t('setup.openLyrion') }}</a></p>
-        </template>
-      </template>
+      <p v-if="!lmsServers.length" class="muted">{{ lmsBusy ? t('setup.lyrionSearching') : t('setup.lyrionNoneFound') }}</p>
+      <label>{{ t('setup.lyrionServerIp') }}</label>
+      <input v-model="lmsHost" placeholder="192.168.1.10 / nas.local" />
+      <div class="row" style="margin-top: 10px;">
+        <button class="secondary" :disabled="lmsBusy" @click="discoverLms">{{ t('setup.lyrionSearch') }}</button>
+        <button :disabled="lmsBusy || !lmsHost" @click="useExternalLms">{{ t('setup.lyrionUseExternal') }}</button>
+      </div>
+      <div v-if="lyrionError" class="msg err">{{ lyrionError }}</div>
     </div>
     <div class="card">
       <h3><span class="dot"></span>{{ t('setup.musicTitle') }}</h3>

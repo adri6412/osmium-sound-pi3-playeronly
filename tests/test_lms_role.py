@@ -1,7 +1,9 @@
-"""Tests for the Lyrion server role in api_server.py: which host squeezelite
-is pointed at, and — the part owners actually notice — that the device's own
-Lyrion is stopped and disabled while it follows an external server, so a later
-boot cannot come up on the local one.
+"""Tests for the Lyrion server role in api_server.py (player-only fork).
+
+This device never runs its own Lyrion: the only valid role is "follow" an
+external server. These tests check which host squeezelite is pointed at, that
+the old "local" mode is refused, and that this box is never accepted as its own
+server to follow.
 
 Run with:  python tests/test_lms_role.py
 """
@@ -63,7 +65,7 @@ class LmsRoleTestCase(unittest.TestCase):
         return [c for c in self.calls
                 if c and c[0] == 'systemctl' and c[-1] == unit]
 
-    # ── follow: point at the other server, switch our own off ────────
+    # ── follow: point squeezelite at the external server ─────────────
 
     def test_follow_points_squeezelite_at_the_other_server(self):
         result = api_server.set_lms_role('follow', '192.168.1.50')
@@ -71,40 +73,30 @@ class LmsRoleTestCase(unittest.TestCase):
         self.assertEqual(result['host'], '192.168.1.50')
         self.assertIn('-s 192.168.1.50', self._args())
 
-    def test_follow_stops_and_disables_the_local_lyrion(self):
+    def test_follow_touches_no_lyrion_unit(self):
+        # There is no bundled Lyrion on this fork: the role change must not try
+        # to start, stop, enable or disable one.
         api_server.set_lms_role('follow', '192.168.1.50')
-        self.assertEqual(self._systemctl(api_server.LYRION_UNIT),
-                         [['systemctl', 'disable', '--now', api_server.LYRION_UNIT]])
-
-    def test_local_lyrion_is_stopped_before_squeezelite_restarts(self):
-        # Otherwise the player can reconnect while the local server is still
-        # answering on loopback.
-        api_server.set_lms_role('follow', '192.168.1.50')
-        names = [' '.join(c) for c in self.calls]
-        self.assertLess(names.index('systemctl disable --now ' + api_server.LYRION_UNIT),
-                        names.index('systemctl restart squeezelite'))
-
-    # ── local: our own server comes back ─────────────────────────────
-
-    def test_local_restores_loopback_and_starts_the_local_lyrion(self):
-        api_server.set_lms_role('follow', '192.168.1.50')
-        self.calls = []
-        result = api_server.set_lms_role('local', None)
-        self.assertTrue(result['success'])
-        self.assertIsNone(result['host'])
-        self.assertIn('-s 127.0.0.1', self._args())
-        # reset-failed first: the setup stops and starts Lyrion often enough
-        # to hit the unit's start limit, which would refuse this start
-        self.assertEqual(self._systemctl(api_server.LYRION_UNIT),
-                         [['systemctl', 'reset-failed', api_server.LYRION_UNIT],
-                          ['systemctl', 'enable', '--now', api_server.LYRION_UNIT]])
+        self.assertEqual(self._systemctl(api_server.LYRION_UNIT), [])
 
     def test_role_survives_a_reread(self):
         api_server.set_lms_role('follow', '192.168.1.50')
         self.assertEqual(api_server.get_lms_role(),
                          {'mode': 'follow', 'host': '192.168.1.50'})
-        api_server.set_lms_role('local', None)
-        self.assertEqual(api_server.get_lms_role(), {'mode': 'local', 'host': None})
+
+    def test_unconfigured_device_reports_follow_without_host(self):
+        # The shipped placeholder is 127.0.0.1; with no external server chosen
+        # yet, the role reads as follow/None so the setup flow asks for one.
+        self.assertEqual(api_server.get_lms_role(), {'mode': 'follow', 'host': None})
+
+    # ── "local" (internal Lyrion) is gone ────────────────────────────
+
+    def test_local_mode_is_refused(self):
+        result = api_server.set_lms_role('local', None)
+        self.assertFalse(result['success'])
+        self.assertEqual(result['code'], 'lms.noInternalServer')
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self._args(), DEFAULT_ARGS)
 
     # ── refusals leave both the args and the service alone ───────────
 
@@ -127,7 +119,7 @@ class LmsRoleTestCase(unittest.TestCase):
     def test_localhost_name_refused(self):
         result = api_server.set_lms_role('follow', 'localhost')
         self.assertFalse(result['success'])
-        self.assertEqual(result['code'], 'lms.useLocalMode')
+        self.assertEqual(result['code'], 'lms.noInternalServer')
         self.assertEqual(self.calls, [])
 
     # ── a DNS name instead of an IP ──────────────────────────────────
@@ -149,8 +141,7 @@ class LmsRoleTestCase(unittest.TestCase):
     # ── this box itself is never a server to follow ──────────────────
 
     def test_own_lan_address_refused(self):
-        # Discovery lists the local Lyrion too; following it switched the
-        # local server off and left nothing to play from.
+        # Discovery lists this box too; it has no Lyrion to play from.
         result = api_server.set_lms_role('follow', '192.168.1.133')
         self.assertFalse(result['success'])
         self.assertEqual(result['code'], 'lms.ownAddress')
@@ -178,7 +169,7 @@ class LmsRoleTestCase(unittest.TestCase):
     def test_other_loopback_addresses_refused(self):
         result = api_server.set_lms_role('follow', '127.0.1.1')
         self.assertFalse(result['success'])
-        self.assertEqual(result['code'], 'lms.useLocalMode')
+        self.assertEqual(result['code'], 'lms.noInternalServer')
 
     def test_discovery_leaves_this_box_out(self):
         answers = [(b'E' + b'NAME' + bytes([4]) + b'self', ('192.168.1.133', 3483)),
@@ -210,6 +201,7 @@ class LmsRoleTestCase(unittest.TestCase):
     def test_invalid_mode_refused(self):
         result = api_server.set_lms_role('bogus', None)
         self.assertFalse(result['success'])
+        self.assertEqual(result['code'], 'lms.invalidMode')
         self.assertEqual(self.calls, [])
 
     # ── a boot without the data partition cannot keep the choice ─────
@@ -224,17 +216,17 @@ class LmsRoleTestCase(unittest.TestCase):
 
     def test_normal_boot_message_carries_no_warning(self):
         self._patch('_data_partition_mounted', lambda: True)
-        result = api_server.set_lms_role('local', None)
+        result = api_server.set_lms_role('follow', '192.168.1.50')
         self.assertNotIn(' — ', result['message'])
 
-    # ── a unit that cannot be acted on is not a failed role change ───
+    # ── a squeezelite restart that fails is not a failed role change ─
 
-    def test_systemctl_failure_does_not_fail_the_role_change(self):
+    def test_restart_failure_does_not_fail_the_role_change(self):
         def failing(cmd, timeout=20):
             self.calls.append(list(cmd))
-            rc = 1 if cmd[-1] == api_server.LYRION_UNIT else 0
+            rc = 1 if cmd[:2] == ['systemctl', 'restart'] else 0
             return subprocess.CompletedProcess(args=cmd, returncode=rc,
-                                               stdout='', stderr='Unit not found.')
+                                               stdout='', stderr='restart failed')
         self._patch('_run', failing)
         result = api_server.set_lms_role('follow', '192.168.1.50')
         self.assertTrue(result['success'])
