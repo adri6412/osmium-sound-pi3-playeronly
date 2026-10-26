@@ -474,6 +474,11 @@ Item {
         Ui.settings.openSection("playback", which)
     }
 
+    // Scalda gli shader pesanti all'avvio, dietro lo splash, cosi' la prima
+    // navigazione non paga la compilazione delle pipeline (si distrugge da solo
+    // dopo qualche fotogramma). Vedi Prewarm.qml.
+    Prewarm {}
+
     MainScreen {
         id: mainScreen
         anchors.fill: parent
