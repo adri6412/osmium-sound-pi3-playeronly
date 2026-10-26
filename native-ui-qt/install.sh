@@ -52,6 +52,13 @@ WorkingDirectory=$DEST
 Environment=QT_QPA_PLATFORM=eglfs
 Environment=QT_QPA_EGLFS_ALWAYS_SET_MODE=1
 Environment=QT_LOGGING_RULES=qt.qpa.input=false
+# Persist Qt's compiled-QML cache on /data (writable); without it the service's
+# read-only root $HOME forces a full QML recompile on every boot. See the
+# shipped unit for the full rationale.
+Environment=HOME=/data/hifi-qt-home
+Environment=XDG_CACHE_HOME=/data/hifi-qt-home/.cache
+Environment=QML_DISK_CACHE_PATH=/data/hifi-qt-home/.cache/qmlc
+ExecStartPre=-/bin/mkdir -p /data/hifi-qt-home/.cache/qmlc
 ExecStartPre=/usr/bin/chvt 1
 ExecStart=$DEST/hifi-qt --assets $ASSETS --locales $LOCALES
 Restart=on-failure

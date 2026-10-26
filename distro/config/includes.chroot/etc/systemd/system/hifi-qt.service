@@ -39,6 +39,21 @@ WorkingDirectory=/opt/hifi-qt
 Environment=QT_QPA_PLATFORM=eglfs
 Environment=QT_QPA_EGLFS_ALWAYS_SET_MODE=1
 Environment=QT_LOGGING_RULES=qt.qpa.input=false
+# Persist Qt's compiled-QML (QV4 bytecode) cache across boots. The payload in
+# /opt/hifi-qt ships plain .qml text on a read-only squashfs, and the service
+# runs as root whose $HOME (/root) is read-only too, so with no writable cache
+# dir Qt recompiled every .qml on every boot (measured ~1s on the Pi3 vc4, of
+# which a persistent cache saves ~0.5s, and it also makes a Loader page's
+# first-visit compile instant on later boots). /data is the writable data
+# partition (mounted by the initramfs before systemd), so point HOME and the
+# QML disk cache there. The cache keys on the Qt version and each .qml's mtime,
+# so an OTA that changes the payload invalidates and rebuilds it once — no
+# staleness. (This caches the QML bytecode only; vc4 GLES2 cannot reuse GL
+# program binaries across runs, so Qt's separate qtpipelinecache stays
+# ineffective and the first-use shader/pipeline cost is paid once per boot.)
+Environment=HOME=/data/hifi-qt-home
+Environment=XDG_CACHE_HOME=/data/hifi-qt-home/.cache
+Environment=QML_DISK_CACHE_PATH=/data/hifi-qt-home/.cache/qmlc
 # Bring terminal 1 to the front, or the screen keeps showing whichever was
 # active before (usually the one lightdm left behind) while this interface
 # draws on one nobody can see.
@@ -50,6 +65,9 @@ Environment=QT_LOGGING_RULES=qt.qpa.input=false
 # for devices that do not have it yet.
 ExecStartPre=-/usr/bin/plymouth quit --retain-splash
 ExecStartPre=-/usr/bin/chvt 1
+# Make the writable cache dir before the interface starts; the leading dash
+# keeps a failure (e.g. /data not yet mounted) from blocking the UI.
+ExecStartPre=-/bin/mkdir -p /data/hifi-qt-home/.cache/qmlc
 ExecStart=/opt/hifi-qt/hifi-qt --assets /opt/hifi-qt/assets --locales /opt/hifi-qt/locales
 Restart=on-failure
 RestartSec=3
