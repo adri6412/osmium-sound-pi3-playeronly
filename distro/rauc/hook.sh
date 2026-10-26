@@ -15,8 +15,31 @@ install-check)
         echo "Image for '${RAUC_MF_COMPATIBLE:-?}', device '${RAUC_SYSTEM_COMPATIBLE:-?}'" >&2
         exit 10
     fi
-    if [ ! -e /dev/disk/by-partlabel/hifi-data ] && [ ! -e /dev/disk/by-partlabel/hifi-data-grow ]; then
-        echo "Data partition (hifi-data) missing: device is not on the A/B layout" >&2
+    # The A/B layout needs the data partition (p4). On this fork the table is
+    # MBR (the Pi3 GPU bootrom reads only MBR), so there are no GPT PARTLABELs to
+    # test for: resolve the root disk and check it has a 4th partition. Done
+    # inline (no sourcing hifi-ab-lib.sh) to stay self-contained in RAUC's
+    # minimal install-check environment.
+    root=$(findmnt -no SOURCE / 2>/dev/null || true)
+    case "$root" in
+    /dev/*)
+        rn=${root#/dev/}
+        disk=$(basename "$(readlink -f "/sys/class/block/$rn/.." 2>/dev/null)" 2>/dev/null || true)
+        ;;
+    *) disk= ;;
+    esac
+    have_data=
+    if [ -n "$disk" ]; then
+        for s in /sys/class/block/"$disk"*; do
+            [ -f "$s/partition" ] || continue
+            if [ "$(cat "$s/partition" 2>/dev/null)" = 4 ]; then
+                have_data=1
+                break
+            fi
+        done
+    fi
+    if [ -z "$have_data" ]; then
+        echo "Data partition (p4) missing: device is not on the A/B layout" >&2
         exit 11
     fi
     ;;

@@ -129,18 +129,26 @@ ab_disk() {
     printf '/dev/%s\n' "$(basename "$_p")"
 }
 
-# Partizione del disco di root con un dato nome GPT: ab_part_by_name hifi-data
-# -> /dev/mmcblk0p5. Si legge la GPT con blkid (PARTLABEL): l'uevent del kernel
-# non porta PARTNAME per le partizioni aggiunte con partx, e i symlink udev
-# by-partlabel non distinguono il disco.
+# Partizione del disco di root dato il nome logico dello slot. La tabella è MBR
+# (il bootrom della GPU del Pi3 legge solo MBR), che non ha i PARTLABEL GPT:
+# quindi la mappa è per NUMERO fisso, nell'ordine in cui build-image-pi3.sh
+# scrive la tabella — boot=1, root-a=2, root-b=3, data=4. È lo stesso
+# ordinamento della vecchia GPT, perciò vale anche sui dischi già partizionati.
+# ab_part_by_name hifi-data -> /dev/mmcblk0p4.
 ab_part_by_name() {
+    case "$1" in
+        hifi-boot)                _want=1 ;;
+        hifi-root-a)              _want=2 ;;
+        hifi-root-b)              _want=3 ;;
+        hifi-data|hifi-data-grow) _want=4 ;;
+        *)                        return 1 ;;
+    esac
     _disk=$(ab_disk) || return 1
     _dn=${_disk#/dev/}
     for _s in /sys/class/block/"$_dn"*; do
         [ -f "$_s/partition" ] || continue
-        _dev="/dev/$(basename "$_s")"
-        if [ "$(blkid -o value -s PARTLABEL "$_dev" 2>/dev/null)" = "$1" ]; then
-            printf '%s\n' "$_dev"
+        if [ "$(cat "$_s/partition" 2>/dev/null)" = "$_want" ]; then
+            printf '/dev/%s\n' "$(basename "$_s")"
             return 0
         fi
     done
@@ -176,26 +184,10 @@ ab_booted_slot() {
 }
 
 # Monta la ESP e /data se non lo sono già (idempotente).
-# La ESP di questo disco. Prima per etichetta, come la scrive il nostro
-# installer da sempre; poi per TIPO di partizione GPT, che è uno standard e non
-# dipende da chi ha partizionato — un apparecchio installato con il vecchio
-# Debian Installer non ha etichette e verrebbe altrimenti escluso dalla
-# conversione senza una vera ragione.
+# La partizione FAT di boot (la "ESP" del fork Pi): nel layout MBR è sempre la
+# p1 del disco di root, risolta per numero fisso da ab_part_by_name hifi-boot.
 ab_esp_dev() {
-    # Pi fork: the boot/firmware partition carries PARTLABEL hifi-boot.
-    ab_part_by_name "$AB_BOOT_PARTLABEL" 2>/dev/null && return 0
-    ab_part_by_name "EFI System" 2>/dev/null && return 0
-    _dk=$(ab_disk 2>/dev/null) || return 1
-    _dn=${_dk#/dev/}
-    for _s in /sys/class/block/"$_dn"*; do
-        [ -f "$_s/partition" ] || continue
-        _d="/dev/$(basename "$_s")"
-        case "$(blkid -o value -s PARTTYPE "$_d" 2>/dev/null)" in
-            c12a7328-f81f-11d2-ba4b-00a0c93ec93b|C12A7328-F81F-11D2-BA4B-00A0C93EC93B)
-                printf '%s\n' "$_d"; return 0 ;;
-        esac
-    done
-    return 1
+    ab_part_by_name "$AB_BOOT_PARTLABEL"
 }
 
 ab_mount_esp() {

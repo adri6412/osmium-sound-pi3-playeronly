@@ -8,24 +8,26 @@
 #                             --out osmium-pi3-2.6.0-pi.1.img
 #
 # What comes out (write it with dd / Raspberry Pi Imager / Etcher):
-#   p1  FAT32  "hifi-boot"       Pi GPU firmware + u-boot.bin + config.txt +
-#                                boot.scr + uboot.env + vmlinuz-A/initramfs-A +
-#                                the board DTB. Debian mounts it at /boot/firmware.
-#   p2  raw    "hifi-root-a"     slot A: the rootfs.squashfs, block for block.
-#   p3  raw    "hifi-root-b"     slot B: empty, filled by the first RAUC update.
-#   p4  ext4*  "hifi-data-grow"  16 MiB seed; the initramfs grows it to fill the
-#                                card, formats it and renames it "hifi-data".
+#   p1  FAT32  (boot)   Pi GPU firmware + u-boot.bin + config.txt + boot.scr +
+#                       uboot.env + vmlinuz-A/initramfs-A + the board DTB.
+#                       Debian mounts it at /boot/firmware.
+#   p2  raw    (root-a) slot A: the rootfs.squashfs, block for block.
+#   p3  raw    (root-b) slot B: empty, filled by the first RAUC update.
+#   p4  ext4*  (data)   16 MiB seed; the initramfs grows it to fill the card and
+#                       formats it as ext4 "hifi-data".
 #
 # The GPU firmware reads config.txt and loads u-boot.bin as the "kernel"; U-Boot
 # runs boot.scr (compiled from distro/uboot/boot.cmd), reads BOOT_ORDER /
 # BOOT_<slot>_LEFT from uboot.env and boots the chosen slot with rauc.slot=<A|B>
 # (see boot.cmd). On a good boot `rauc status mark-good` resets the counter.
 #
-# 🚨 GPT on the Pi3: this mirrors the x86 partlabel layout so the RAUC u-boot
-# backend and the by-partlabel lookups work unchanged. The Pi3 GPU firmware must
-# find the FAT partition through the protective MBR — verify on real hardware;
-# if an old firmware cannot, the fallback is an MBR (msdos) table with the FAT
-# as the first primary partition. Not yet tested on a board.
+# 🚨 MBR (msdos), not GPT: the Pi1/2/3 GPU bootrom reads only an MBR partition
+# table. On a GPT disk it sees just the protective-MBR 0xEE entry, finds no FAT
+# and never boots (red LED, no ACT); it is also why Windows hides a GPT ESP-type
+# p1 from Explorer. So p1 is a primary FAT32-LBA (type 0x0c, bootable) and the
+# partitions carry no GPT names — the runtime resolves them by their fixed
+# number on the root disk (hifi-ab-lib.sh: boot=p1, root-a=p2, root-b=p3,
+# data=p4). GPT would only be safe on a Pi4 (recent EEPROM) or Pi5.
 #
 # Needs root; host tools: sfdisk, losetup (partscan), mkfs.vfat (dosfstools),
 # mkimage + mkenvimage (u-boot-tools), unsquashfs or mount for squashfs.
@@ -80,17 +82,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ── 1. the empty disk and its GPT ────────────────────────────────────────
-# 1 MiB alignment in front, room for the backup GPT behind (moved to the real
-# end at first boot). hifi-data-grow is the 16 MiB seed, grown on first boot.
+# ── 1. the empty disk and its MBR ────────────────────────────────────────
+# 1 MiB alignment in front, 1 MiB slack behind. hifi-data (p4) is a 16 MiB seed
+# grown to fill the card on first boot. An MBR (msdos) table, NOT GPT: the Pi3
+# GPU bootrom reads only MBR (see the header). p1 is a bootable FAT32-LBA
+# (type 0x0c) primary so the firmware finds it and Windows mounts it; p2/p3/p4
+# are Linux (type 0x83). A fixed disk id keeps PARTUUIDs stable across builds.
 total_mib=$(( 1 + BOOT_MIB + AB_SLOT_B_MIB * 2 + DATA_SEED_MIB + 1 ))
 log "disk image: ${total_mib} MiB (boot ${BOOT_MIB}, slots ${AB_SLOT_B_MIB} each, system image $(( img_bytes / 1048576 )) MiB)"
 rm -f "$OUT"
 truncate -s "${total_mib}M" "$OUT"
-_efi="C12A7328-F81F-11D2-BA4B-00A0C93EC93B"   # ESP type: the Pi firmware looks for a FAT here
-_lin="0FC63DAF-8483-4772-8E79-3D69D8477DE4"
-printf 'label: gpt\nsize=%sMiB, type=%s, name="hifi-boot"\nsize=%sMiB, type=%s, name="hifi-root-a"\nsize=%sMiB, type=%s, name="hifi-root-b"\nsize=%sMiB, type=%s, name="hifi-data-grow"\n' \
-    "$BOOT_MIB" "$_efi" "$AB_SLOT_B_MIB" "$_lin" "$AB_SLOT_B_MIB" "$_lin" "$DATA_SEED_MIB" "$_lin" \
+printf 'label: dos\nlabel-id: 0x0a5e0501\nsize=%sMiB, type=0c, bootable\nsize=%sMiB, type=83\nsize=%sMiB, type=83\nsize=%sMiB, type=83\n' \
+    "$BOOT_MIB" "$AB_SLOT_B_MIB" "$AB_SLOT_B_MIB" "$DATA_SEED_MIB" \
     | sfdisk --quiet "$OUT" || die "sfdisk failed"
 
 # ── 2. attach as a loop device, partitions included ──────────────────────
@@ -164,8 +167,11 @@ umount "$MNT_BOOT"
 umount "$MNT_SQ"
 losetup -d "$LOOP"; LOOP=""
 
-# ── 6. sanity: the partition names, in order ─────────────────────────────
-names=$(sfdisk --json "$OUT" | sed -n 's/.*"name": *"\([^"]*\)".*/\1/p' | tr '\n' ',')
-[ "$names" = "hifi-boot,hifi-root-a,hifi-root-b,hifi-data-grow," ] \
-    || die "unexpected partition table: $names"
+# ── 6. sanity: the MBR partition types, in order ─────────────────────────
+# MBR has no partition names; check the four partitions are there in order with
+# the right types: p1 FAT32-LBA (c), p2/p3/p4 Linux (83). sfdisk -d lists them
+# in on-disk order, one "... : ... type=<hex> ..." line each.
+types=$(sfdisk -d "$OUT" | sed -n 's/.*: .*type=\([0-9A-Fa-f]\{1,2\}\).*/\1/p' | tr 'A-F' 'a-f' | tr '\n' ',')
+[ "$types" = "c,83,83,83," ] \
+    || die "unexpected MBR partition table: $types (want c,83,83,83,)"
 log "DONE ✓  $OUT ($img_ver, ${total_mib} MiB)"
