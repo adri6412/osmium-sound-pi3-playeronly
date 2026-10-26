@@ -9,7 +9,10 @@ kernel=u-boot.bin
 
 # Serial console on the GPIO header, for bring-up and for reading U-Boot. Costs
 # nothing in production and is the only way to see the boot on a headless unit.
+# core_freq=250 pins the core clock so the Pi3 mini-UART baud stays stable
+# (recommended for the 3 B+); it does not affect the boot path.
 enable_uart=1
+core_freq=250
 
 # KMS/DRM for the Qt kiosk (eglfs on the vc4 scanout + v3d render node). The
 # Pi3 GPU (VideoCore IV) is weak — see the memory on heavy animations — but the

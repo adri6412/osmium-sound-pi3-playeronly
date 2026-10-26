@@ -40,7 +40,15 @@ ROOTFS=""
 OUT=""
 DATA_SEED_MIB=16
 BOOT_MIB=512
-DTB_NAME="bcm2837-rpi-3-b.dtb"
+# The whole Pi3 DTB family ships on the FAT (3-b, 3-b-plus, 3-a-plus): the board
+# model is not known at build time and the 3B+ needs its own DTB (USB/LAN hub,
+# power GPIO expander, different Wi-Fi/BT) — the plain 3B DTB hangs it. Each is
+# also copied under the downstream name the GPU firmware / U-Boot auto-load by
+# board revision (bcm2837-rpi-3-* → bcm2710-rpi-3-*), the same alias the Debian
+# raspi-firmware package creates. Mainline kernel DTB glob and the alias prefix:
+DTB_GLOB="bcm2837-rpi-3-*.dtb"
+DTB_ALIAS_FROM="bcm2837-rpi-3-"
+DTB_ALIAS_TO="bcm2710-rpi-3-"
 
 log() { printf '\033[1;36m[hifi-pi3-image]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[hifi-pi3-image ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
@@ -129,9 +137,11 @@ UBOOT_BIN="$MNT_SQ/usr/lib/u-boot/rpi_arm64/u-boot.bin"
 [ -f "$UBOOT_BIN" ] || die "u-boot.bin not found in slot A (u-boot-rpi not installed?)"
 FW_DIR="$MNT_SQ/usr/lib/raspi-firmware"
 [ -d "$FW_DIR" ] || die "Pi GPU firmware (raspi-firmware) not found in slot A"
-DTB_SRC="$MNT_SQ/usr/lib/linux-image-$kver/broadcom/$DTB_NAME"
-[ -f "$DTB_SRC" ] || DTB_SRC="$MNT_SQ/boot/$DTB_NAME"
-[ -f "$DTB_SRC" ] || die "board DTB $DTB_NAME not found in slot A"
+DTB_DIR="$MNT_SQ/usr/lib/linux-image-$kver/broadcom"
+[ -d "$DTB_DIR" ] || DTB_DIR="$MNT_SQ/boot"
+# shellcheck disable=SC2086
+set -- "$DTB_DIR"/$DTB_GLOB
+[ -f "$1" ] || die "no Pi3 DTB ($DTB_GLOB) found in slot A under $DTB_DIR"
 log "image $img_ver, kernel $kver"
 
 # ── 5. the FAT boot partition ────────────────────────────────────────────
@@ -152,7 +162,17 @@ mkimage -A arm64 -O linux -T script -C none -n "Osmium A/B" \
 # are written by the RAUC post-install hook when the first update lands there.
 install -m 0644 "$MNT_SQ/boot/vmlinuz-$kver"    "$MNT_BOOT/vmlinuz-A"
 install -m 0644 "$MNT_SQ/boot/initrd.img-$kver" "$MNT_BOOT/initramfs-A"
-install -m 0644 "$DTB_SRC" "$MNT_BOOT/$DTB_NAME"
+# Every Pi3 DTB, under its own name and under the downstream alias the firmware
+# auto-loads by board revision. start.elf then builds the FDT for the real board
+# (3B / 3B+ / 3A+) and hands it to U-Boot, which boots with it (see boot.cmd).
+# shellcheck disable=SC2086
+for dtb in "$DTB_DIR"/$DTB_GLOB; do
+    base=$(basename "$dtb")
+    install -m 0644 "$dtb" "$MNT_BOOT/$base"
+    alias_name="${base/#$DTB_ALIAS_FROM/$DTB_ALIAS_TO}"
+    [ "$alias_name" = "$base" ] || install -m 0644 "$dtb" "$MNT_BOOT/$alias_name"
+    log "DTB $base (+ alias $alias_name)"
+done
 
 # The initial U-Boot environment. 🚨 This must be a COMPLETE env, not just the
 # RAUC counters: rpi_arm64 u-boot is CONFIG_ENV_IS_IN_FAT and reads this file,

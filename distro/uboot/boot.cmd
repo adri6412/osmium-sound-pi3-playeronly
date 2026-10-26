@@ -50,6 +50,19 @@ for bootslot in ${BOOT_ORDER}; do
     if fatload mmc 0:1 ${kernel_addr_r} vmlinuz-${load_slot}; then
       if fatload mmc 0:1 ${ramdisk_addr_r} initramfs-${load_slot}; then
         setenv ramdisk_size ${filesize}
+        # Prefer the FDT the GPU firmware already built for THIS board (3B /
+        # 3B+ / 3A+): it carries the firmware's runtime fixups (USB/LAN hub
+        # power on the 3B+, memory size, serials) that a hand-loaded DTB would
+        # lose. ${fdt_addr} is set by rpi_arm64 U-Boot from the firmware
+        # hand-off. booti does not return on success, so each block below is a
+        # fallback: the firmware FDT, then the board DTB by its firmware name
+        # (${fdtfile}), then the plain 3B DTB as a last resort.
+        if test -n "${fdt_addr}"; then
+          booti ${kernel_addr_r} ${ramdisk_addr_r}:${ramdisk_size} ${fdt_addr}
+        fi
+        if fatload mmc 0:1 ${fdt_addr_r} ${fdtfile}; then
+          booti ${kernel_addr_r} ${ramdisk_addr_r}:${ramdisk_size} ${fdt_addr_r}
+        fi
         if fatload mmc 0:1 ${fdt_addr_r} bcm2837-rpi-3-b.dtb; then
           booti ${kernel_addr_r} ${ramdisk_addr_r}:${ramdisk_size} ${fdt_addr_r}
         fi
