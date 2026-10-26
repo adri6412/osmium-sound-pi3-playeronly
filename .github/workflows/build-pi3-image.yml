@@ -35,9 +35,16 @@ on:
         required: false
         type: boolean
         default: true
+      publish:
+        description: 'Publish a GitHub Release for OTA (tick only to ship an update; needs sign=true). Off = artifacts only, no tag.'
+        required: false
+        type: boolean
+        default: false
 
+# contents: write is needed by the optional "Publish GitHub Release" step
+# (gh release create); it is harmless when publish=false (that step is skipped).
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   # 🚨 On the bare arm64 runner, not in a container: it builds the Qt interface
@@ -231,3 +238,27 @@ jobs:
           path: /mnt/pi3-out/osmium-pi3-*.img.xz*
           retention-days: 14
           if-no-files-found: error
+
+      # OTA: publish a plain GitHub Release carrying the signed RAUC bundle so a
+      # device on this channel can update itself (api_server.py reads the fork's
+      # releases straight from the GitHub API — no Pages/R2). Opt-in: runs only
+      # when the operator ticks `publish` AND `sign` (an unsigned .raucb is no use
+      # for OTA). NOT a prerelease, so the default 'prod' channel picks it up.
+      # 🚨 This is the only step that creates a tag/Release; it never runs on a
+      # plain build, so no tag is cut without the operator explicitly asking.
+      - name: Publish GitHub Release (OTA)
+        if: ${{ inputs.publish && inputs.sign }}
+        uses: softprops/action-gh-release@v2.2.1
+        with:
+          tag_name: ${{ inputs.version }}
+          name: ${{ inputs.version }}
+          body: "Osmium Sound Pi3 player-only image ${{ inputs.version }} (RAUC A/B bundle for OTA, plus the flashable SD-card image)."
+          prerelease: false
+          make_latest: 'true'
+          fail_on_unmatched_files: true
+          files: |
+            /mnt/pi3-out/osmium-pi3-${{ inputs.version }}.raucb
+            /mnt/pi3-out/osmium-pi3-${{ inputs.version }}.raucb.sha256
+            /mnt/pi3-out/osmium-pi3-${{ inputs.version }}.img.xz
+            /mnt/pi3-out/osmium-pi3-${{ inputs.version }}.img.xz.sha256
+            /mnt/pi3-out/osmium-pi3-${{ inputs.version }}.info.txt

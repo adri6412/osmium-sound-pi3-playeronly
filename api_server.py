@@ -78,33 +78,19 @@ def _lang():
 #  The actual download/swap/restart is done as root by the helper
 #  script; here we only check GitHub Releases and kick it off.
 # ──────────────────────────────────────────────────────────────────
-OTA_REPO = os.environ.get('HIFI_OTA_REPO', 'adri6412/hifi-media-player')
-# Static release manifest published to a CDN (NOT subject to the
-# api.github.com 60-req/hour rate limit). The release workflow writes
-# `ota/latest-<channel>.json` mirroring the GitHub release object to the
-# `gh-pages` branch. The device reads this first and only falls back to the
-# REST API if it's unreachable, so normal update checks never touch the
-# rate-limited API.
-#
-# Cloudflare Pages, watching that same `gh-pages` branch, NOT GitHub Pages:
-# the custom domain (osmiumsound.qd.je) got stuck with GitHub Pages' ACME
-# cert provisioning permanently wedged ("bad_authz", would not clear even
-# after repeated re-adds) and the DNS host for that subdomain doesn't
-# support the records needed to fix it any other way. Safe to change the
-# default here with no fleet migration dance: every existing device already
-# falls back to the GitHub REST API whenever this URL is unreachable (which
-# it has been) -- they'll pick up whatever release carries this change via
-# that fallback, then use the fast path again from then on.
-OTA_MANIFEST_BASE = os.environ.get('HIFI_OTA_MANIFEST_BASE',
-                                   'https://osmium-sound.pages.dev/ota')
-# Releases are served from file.osmiumsound.it (Cloudflare R2, the host the
-# ISO and the flasher come from) and the release workflow drops a copy of each
-# channel's manifest next to the payloads (ota/latest-<channel>.json). Read
-# that copy when Pages is unreachable, before resorting to the rate-limited
-# GitHub API. Stable releases since 2.5.24, every channel since 2.5.25; the
-# name stays for the HIFI_OTA_PROD_MIRROR_BASE override.
-OTA_PROD_MIRROR_BASE = os.environ.get('HIFI_OTA_PROD_MIRROR_BASE',
-                                      'https://file.osmiumsound.it/ota')
+OTA_REPO = os.environ.get('HIFI_OTA_REPO', 'adri6412/osmium-sound-pi3-playeronly')
+# 🚨 Pi3 player-only fork: updates are published as plain GitHub Releases on
+# the fork repo and nothing else — no Cloudflare Pages, no R2 mirror (unlike
+# the x86 appliance). The device therefore reads releases straight from the
+# GitHub REST API (_fetch_github_api_release). These two manifest bases are
+# deliberately EMPTY so the x86 CDN manifests can never shadow the fork's
+# release: _fetch_release_chain() returns the first source with a tag_name,
+# and the x86 Pages/mirror manifests carry x86 releases. With the bases empty
+# the chain skips straight to the API. (The HIFI_OTA_MANIFEST_BASE /
+# HIFI_OTA_PROD_MIRROR_BASE overrides remain, in case a fast non-rate-limited
+# mirror is ever wired up for the fork too.)
+OTA_MANIFEST_BASE = os.environ.get('HIFI_OTA_MANIFEST_BASE', '')
+OTA_PROD_MIRROR_BASE = os.environ.get('HIFI_OTA_PROD_MIRROR_BASE', '')
 # OTA release channel: 'prod' tracks GitHub's /releases/latest (stable releases
 # only); 'dev' tracks the newest release including prereleases (vX.Y.Z-dev.N).
 # 'alpha' tracks the newest release of ANY kind, including private test tags cut
@@ -163,7 +149,7 @@ OS_PREFIX = 'hifi-os-'
 # sistema + OS; hifi-image-update.sh lo scarica intero su /data e lo fa
 # installare a RAUC nello slot inattivo, oppure lo fa leggere a RAUC in
 # streaming dall'asset della Release quando su /data non c'è posto.
-IMAGE_PREFIX = 'hifi-image-'
+IMAGE_PREFIX = 'osmium-pi3-'
 IMAGE_STATUS_FILE = '/run/hifi-image-status.json'
 IMAGE_SCRIPT = '/usr/local/sbin/hifi-image-update.sh'
 
@@ -8918,7 +8904,8 @@ def _fetch_release_chain(channel):
         raise OSError('update sources do not resolve: no network or no DNS')
 
     # 1. Preferred: static manifest on Pages (a CDN, not rate-limited).
-    if pages_host in reachable:
+    #    Empty base (the Pi3 fork's default) → skip straight to the API.
+    if pages_host and pages_host in reachable:
         try:
             release = _fetch_pages_manifest(channel)
             if release:
@@ -8929,7 +8916,8 @@ def _fetch_release_chain(channel):
 
     # 2. The copy of the manifest next to the payloads on
     #    file.osmiumsound.it (same host the download comes from anyway).
-    if mirror_host in reachable:
+    #    Empty base (the Pi3 fork's default) → skip straight to the API.
+    if mirror_host and mirror_host in reachable:
         try:
             release = _fetch_pages_manifest(channel, OTA_PROD_MIRROR_BASE)
             if release:
