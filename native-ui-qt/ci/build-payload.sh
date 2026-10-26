@@ -13,8 +13,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
+# The binary is built natively inside the container, so its architecture is the
+# container's. On an arm64 runner `debian:trixie` is arm64 and produces the Pi
+# binary with no extra step. To cross-build from an x86 host, set
+# DOCKER_PLATFORM=linux/arm64 (needs qemu-user-static + binfmt registered).
+DOCKER_PLATFORM="${DOCKER_PLATFORM:-}"
+
 set -e
-docker run --rm -v "$PWD:/w" -w /w debian:trixie bash -eu -c '
+docker run --rm ${DOCKER_PLATFORM:+--platform="$DOCKER_PLATFORM"} \
+  -v "$PWD:/w" -w /w debian:trixie bash -eu -c '
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   apt-get install -y --no-install-recommends \

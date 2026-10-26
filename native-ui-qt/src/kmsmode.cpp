@@ -1,8 +1,10 @@
 #include "kmsmode.h"
+#include <QDir>
 #include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QtDebug>
+#include <algorithm>
 #include <fcntl.h>
 #include <unistd.h>
 #include <xf86drm.h>
@@ -202,12 +204,19 @@ QJsonObject kmsPlan(const QList<KmsOutput> &outputs, const QString &resolutionPr
     return root;
 }
 
-QString kmsConfigFor(const QString &pref, const QString &screens, const QString &card) {
+// Legge le uscite collegate di UN nodo DRM. Ritorna true se e' un nodo con
+// modeset (connettori E CRTC): un nodo di solo rendering (il v3d del Pi) non lo
+// e' e non va aperto da eglfs. `hasConnectors` distingue "nodo display senza
+// monitor collegato" da "nodo di rendering".
+static bool outputsFromCard(const QString &card, QList<KmsOutput> &outs, bool &hasConnectors) {
+    outs.clear();
+    hasConnectors = false;
     int fd = open(card.toLocal8Bit().constData(), O_RDWR | O_CLOEXEC);
-    if (fd < 0) return QString();
+    if (fd < 0) return false;
     drmModeRes *res = drmModeGetResources(fd);
-    if (!res) { close(fd); return QString(); }
-    QList<KmsOutput> outs;
+    if (!res) { close(fd); return false; }
+    const bool kms = res->count_connectors > 0 && res->count_crtcs > 0;
+    hasConnectors = res->count_connectors > 0;
     for (int i = 0; i < res->count_connectors; i++) {
         drmModeConnector *c = drmModeGetConnector(fd, res->connectors[i]);
         if (!c) continue;
@@ -228,8 +237,48 @@ QString kmsConfigFor(const QString &pref, const QString &screens, const QString 
     }
     drmModeFreeResources(res);
     close(fd);
+    return kms;
+}
 
-    const QJsonObject plan = kmsPlan(outs, pref, screens, card);
+// Il nodo DRM che pilota lo schermo. Su x86 (una GPU sola) e' /dev/dri/card0,
+// com'era. Sul Pi (vc4-kms-v3d) ci sono due nodi — lo scanout vc4 e il nodo di
+// solo rendering v3d — e il loro ordine card0/card1 NON e' garantito: aprire
+// quello sbagliato lascia lo schermo nero. Si scorrono i nodi e si prende
+// quello che fa modeset, preferendo uno con un monitor gia' collegato.
+QString kmsPickCard() {
+    QDir dri("/dev/dri");
+    QStringList cards = dri.entryList(QStringList() << "card*", QDir::System, QDir::Name);
+    std::sort(cards.begin(), cards.end(), [](const QString &a, const QString &b) {
+        return a.mid(4).toInt() < b.mid(4).toInt();  // card2 before card10
+    });
+    QString firstKms;
+    for (const QString &name : cards) {
+        const QString path = "/dev/dri/" + name;
+        QList<KmsOutput> outs;
+        bool hc = false;
+        if (!outputsFromCard(path, outs, hc)) continue;  // render-only node, skip
+        if (!outs.isEmpty()) return path;                // a display is connected here
+        if (firstKms.isEmpty()) firstKms = path;         // modeset node, nothing plugged yet
+    }
+    return firstKms.isEmpty() ? QStringLiteral("/dev/dri/card0") : firstKms;
+}
+
+QString kmsConfigFor(const QString &pref, const QString &screens, const QString &card) {
+    QString dev = card;
+    QList<KmsOutput> outs;
+    bool hasConnectors = false;
+    // If the given node is not a usable modeset device, or has no connected
+    // output, look for the right one (the Pi's vc4 scanout node).
+    if (!outputsFromCard(dev, outs, hasConnectors) || outs.isEmpty()) {
+        const QString better = kmsPickCard();
+        if (better != dev) {
+            dev = better;
+            outputsFromCard(dev, outs, hasConnectors);
+            qInfo("kms: using DRM node %s", qPrintable(dev));
+        }
+    }
+
+    const QJsonObject plan = kmsPlan(outs, pref, screens, dev);
     if (plan.isEmpty()) return QString();
     QFile f("/tmp/hifi-qt-kms.json");
     if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return QString();

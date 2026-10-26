@@ -29,6 +29,13 @@ QString kmsOutputName(uint32_t connectorType, uint32_t typeId);
 QJsonObject kmsPlan(const QList<KmsOutput> &outputs, const QString &resolutionPref,
                     const QString &screensPref, const QString &card = "/dev/dri/card0");
 
+// Il nodo DRM che fa da scanout (ha connettori + CRTC). Su una GPU sola e'
+// /dev/dri/card0; sul Pi (vc4/v3d) salta il nodo di solo rendering. Scorre
+// /dev/dri/card* e preferisce un nodo con un monitor collegato.
+QString kmsPickCard();
+
 // Ritorna il percorso del file JSON scritto, o vuoto se si lascia fare a Qt.
+// Se `card` non e' un nodo di modeset utilizzabile (o non ha monitor), sceglie
+// il nodo giusto con kmsPickCard().
 QString kmsConfigFor(const QString &pref, const QString &screens = "mirror",
                      const QString &card = "/dev/dri/card0");
