@@ -251,6 +251,19 @@ KVER=$(find "$CH/boot" -maxdepth 1 -name 'vmlinuz-*' | sed 's|.*/vmlinuz-||' | s
 in_chroot dpkg-query -W -f='${Package}\t${Version}\n' | sort > "$CH/usr/lib/osmium/packages.txt"
 cp "$CH/var/lib/dpkg/status" "$CH/usr/lib/osmium/dpkg-status"
 
+# SYSEXT_LEVEL pins an add-on to this exact image: hifi-ext.sh writes it into an
+# add-on's extension-release, and systemd-sysext merges the extension only when
+# the host os-release declares the SAME SYSEXT_LEVEL. Debian's own os-release has
+# no SYSEXT_LEVEL, only VERSION_ID=13; without this line systemd falls back to
+# matching VERSION_ID, which the extension lacks, and REFUSES the merge
+# ("does not contain VERSION_ID ... requested to match '13'") — the add-on is
+# built and reported active but /usr is never layered, so its binary is missing.
+if grep -q '^SYSEXT_LEVEL=' "$CH/usr/lib/os-release" 2>/dev/null; then
+    sed -i "s|^SYSEXT_LEVEL=.*|SYSEXT_LEVEL=$VERSION|" "$CH/usr/lib/os-release"
+else
+    printf 'SYSEXT_LEVEL=%s\n' "$VERSION" >> "$CH/usr/lib/os-release"
+fi
+
 # The interface must be present and must be Qt (no Electron on this fork).
 mkdir -p "$CH/etc/hifi-player"
 printf 'qt\n' > "$CH/etc/hifi-player/ui-engine"
