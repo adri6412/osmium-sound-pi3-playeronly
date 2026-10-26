@@ -412,13 +412,19 @@ void Remote::rescan() {
         const bool nav = hifiSysfsBit(key, KEY_UP) && hifiSysfsBit(key, KEY_DOWN)
                       && hifiSysfsBit(key, KEY_LEFT) && hifiSysfsBit(key, KEY_RIGHT)
                       && (hifiSysfsBit(key, KEY_ENTER) || hifiSysfsBit(key, KEY_OK) || hifiSysfsBit(key, KEY_SELECT));
-        if (!media && !(nav && !fullKeyboard) && !(model && anyKey)) continue;
-
-        // 🚨 niente presa esclusiva su chi e' anche puntatore o tastiera: il
-        // puntatore si fermerebbe e non si scriverebbe piu'. A known model is
-        // a remote even when it declares a whole keyboard (the Fire TV and the
-        // G20S do): we know every one of its keys.
+        // 🚨 Pi3/vc4: a relative pointer (a mouse, or an air-mouse's gyro node)
+        // that reaches Qt makes it draw a cursor and hover highlights, and the
+        // vc4 GL driver then crashes the render thread (SIGSEGV in
+        // vc4_write_uniforms). So on this board we keep the pointer node too, to
+        // take it exclusively and drop it, rather than leaving it to Qt. The keys
+        // of the same remote arrive on its other node and are unaffected.
         const bool pointer = hifiSysfsBit(rel, REL_X) && hifiSysfsBit(rel, REL_Y);
+        if (!pointer && !media && !(nav && !fullKeyboard) && !(model && anyKey)) continue;
+
+        // 🚨 niente presa esclusiva su chi e' anche tastiera: si fermerebbe e non
+        // si scriverebbe piu'. A known model is a remote even when it declares a
+        // whole keyboard (the Fire TV and the G20S do): we know every one of its
+        // keys. Un puntatore relativo, invece, qui lo prendiamo apposta.
         const bool tablet = hifiSysfsBit(abs, ABS_X) || hifiSysfsBit(abs, ABS_MT_POSITION_X);
         const bool audio = !model && usbAudio(dir);
         const bool isRemote = (!fullKeyboard || model) && !pointer && !tablet && !audio;
@@ -434,10 +440,13 @@ void Remote::rescan() {
         dev.group = groupKey(dir, dev.name);
         dev.remote = isRemote;
         dev.audio = audio;
+        dev.pointer = pointer && !isRemote;
         dev.model = model ? int(model - kModels) : -1;
         dev.chosen = isChosen(dev);
         if (model) m_modelOf.insert(dev.name, dev.model);
-        if (isRemote && ioctl(dev.fd, EVIOCGRAB, 1) == 0) dev.grabbed = true;
+        // take the remote exclusively, and the bare pointer too (to keep it from
+        // Qt — see the vc4 note above); the pointer's events are then swallowed.
+        if ((isRemote || dev.pointer) && ioctl(dev.fd, EVIOCGRAB, 1) == 0) dev.grabbed = true;
         qInfo("remote: %s (%s%s%s) on %s", qPrintable(dev.name), qPrintable(dev.bus),
               dev.grabbed ? ", taken exclusively" : isRemote ? ", not taken exclusively" : audio ? ", keys of a sound card" : ", media keys only",
               model ? qPrintable(QStringLiteral(", model %1").arg(QLatin1String(model->label))) : "",
@@ -552,6 +561,9 @@ void Remote::readFrom(const QString &path) {
         }
         if (ev.type != EV_KEY) continue;
         if (!m_open.contains(path)) return;
+        // a bare pointer node is grabbed only to keep it away from Qt (vc4
+        // crash): drain its events, map none of them.
+        if (m_open[path].pointer) continue;
         onKey(m_open[path], ev.code, ev.value);
     }
 }

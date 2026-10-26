@@ -140,6 +140,10 @@ private:
         bool audio = false;
         bool chosen = false;       // l'utente ha detto che e' il suo telecomando
         bool grabbed = false;      // presa esclusiva ottenuta
+        // 🚨 Pi3/vc4: a relative-pointer node (a mouse, or an air-mouse's gyro
+        // node) is grabbed only to keep it away from Qt — its cursor/hover makes
+        // the vc4 GL driver crash the render thread. We swallow its events.
+        bool pointer = false;
         int model = -1;            // one of the known remotes (kModels), or -1
         int fd = -1;
         QSocketNotifier *notifier = nullptr;
