@@ -154,10 +154,29 @@ install -m 0644 "$MNT_SQ/boot/vmlinuz-$kver"    "$MNT_BOOT/vmlinuz-A"
 install -m 0644 "$MNT_SQ/boot/initrd.img-$kver" "$MNT_BOOT/initramfs-A"
 install -m 0644 "$DTB_SRC" "$MNT_BOOT/$DTB_NAME"
 
-# The initial U-Boot environment: boot A first, three attempts each. fw_setenv /
-# RAUC rewrite this at runtime. 🚨 The 0x4000 size must match fw_env.config and
-# the U-Boot build's CONFIG_ENV_SIZE.
-printf 'BOOT_ORDER=A B\nBOOT_A_LEFT=3\nBOOT_B_LEFT=3\n' > "$WORK/uboot.env.txt"
+# The initial U-Boot environment. 🚨 This must be a COMPLETE env, not just the
+# RAUC counters: rpi_arm64 u-boot is CONFIG_ENV_IS_IN_FAT and reads this file,
+# and a saved env REPLACES u-boot's built-in default env wholesale. With only
+# BOOT_* in it, u-boot would have no `bootcmd` (autoboot runs nothing — the GPU
+# rainbow splash never clears) and none of the load addresses boot.cmd needs
+# (fatload/booti would get empty ${kernel_addr_r} etc.). So we seed bootcmd
+# (which sources boot.scr, the A/B selector), the standard Pi load addresses,
+# and the counters. fw_setenv / RAUC rewrite BOOT_ORDER / BOOT_<slot>_LEFT at
+# runtime; boot.cmd's `saveenv` preserves the rest.
+# 🚨 The 0x4000 size must match fw_env.config and the U-Boot CONFIG_ENV_SIZE.
+cat > "$WORK/uboot.env.txt" <<'ENV'
+bootdelay=0
+scriptaddr=0x02400000
+kernel_addr_r=0x00080000
+ramdisk_addr_r=0x02700000
+fdt_addr_r=0x02600000
+fdt_high=0xffffffffffffffff
+initrd_high=0xffffffffffffffff
+bootcmd=fatload mmc 0:1 ${scriptaddr} boot.scr && source ${scriptaddr}
+BOOT_ORDER=A B
+BOOT_A_LEFT=3
+BOOT_B_LEFT=3
+ENV
 mkenvimage -s 0x4000 -o "$MNT_BOOT/uboot.env" "$WORK/uboot.env.txt" || die "mkenvimage failed"
 
 sync
