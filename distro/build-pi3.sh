@@ -164,6 +164,27 @@ log "overlaying config/includes.chroot"
 # bits are reasserted below (same as hook 0300 / build-image.sh §6).
 tar -C "$CONFIG/includes.chroot" -cf - . | tar -C "$CH" -xf -
 
+# The Python daemons live at the repo root (single source of truth, where the
+# player-only edits are made) and are injected into /usr/local/bin here, exactly
+# as the x86 build-distro.sh does into includes.chroot. Without this the units
+# (hifi-api/hifi-webui/hifi-sources/hifi-vumeter) point at /usr/local/bin/*.py
+# files that never got shipped, so every service fails on boot: no setup wizard,
+# "the APIs don't respond". Bare `import hifi_*` means every shared module must
+# sit beside them in the same dir.
+log "injecting python daemons → /usr/local/bin"
+BIN_DEST="$CH/usr/local/bin"
+mkdir -p "$BIN_DEST"
+for py in api_server.py vu_meter_daemon.py sources_server.py webui_server.py \
+          hifi_logging.py hifi_backup.py hifi_i18n.py hifi_metadata.py \
+          hifi_tags.py hifi_squeezelite.py hifi_cdrip.py hifi_signal_path.py \
+          hifi_diskguard.py; do
+    [ -f "$REPO_ROOT/$py" ] || die "python daemon missing from repo root: $py"
+    cp -f "$REPO_ROOT/$py" "$BIN_DEST/$py"
+    sed -i 's/\r$//' "$BIN_DEST/$py"
+done
+chmod +x "$BIN_DEST/api_server.py" "$BIN_DEST/vu_meter_daemon.py" \
+         "$BIN_DEST/sources_server.py" "$BIN_DEST/webui_server.py"
+
 # ── 4. chroot hooks — a Pi-safe ALLOWLIST ─────────────────────────────────
 # Only the arch-neutral, player-relevant hooks run. Deliberately skipped:
 #   0200-hidden-boot        GRUB/x86 boot finalisation (no GRUB on the Pi)
