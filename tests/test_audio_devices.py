@@ -89,6 +89,78 @@ class DeviceListTests(unittest.TestCase):
         self.assertEqual(a.list_audio_devices()['devices'][0]['id'], 'default')
 
 
+PI_APLAY_L = """**** List of PLAYBACK Hardware Devices ****
+card 0: vc4hdmi [vc4-hdmi], device 0: MAI PCM i2s-hifi-0 [MAI PCM i2s-hifi-0]
+  Subdevices: 1/1
+card 1: Headphones [bcm2835 Headphones], device 0: bcm2835 Headphones [bcm2835 Headphones]
+  Subdevices: 8/8
+"""
+
+PI_CARDS = (" 0 [vc4hdmi        ]: vc4-hdmi - vc4-hdmi\n"
+            "                      vc4-hdmi\n"
+            " 1 [Headphones     ]: bcm2835 Headphones - bcm2835 Headphones\n"
+            "                      bcm2835 Headphones\n")
+
+
+class HdmiEldTests(unittest.TestCase):
+    """On the Pi3, the vc4 HDMI card only carries audio when its sink reports an
+    ELD. A monitor with no HDMI audio must not appear as a selectable output
+    (squeezelite would loop on alsa_open), and must reappear once a sink with
+    audio is connected (an ELD file shows up)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = self.tmp.name
+        with open(os.path.join(root, 'cards'), 'w') as f:
+            f.write(PI_CARDS)
+        for n, cid in ((0, 'vc4hdmi'), (1, 'Headphones')):
+            os.makedirs(os.path.join(root, f'card{n}', 'pcm0p'))
+            with open(os.path.join(root, f'card{n}', 'pcm0p', 'info'), 'w') as f:
+                f.write(f'card: {n}\ndevice: 0\nstream: PLAYBACK\nid: {cid}\nname: {cid}\n')
+            os.symlink(f'card{n}', os.path.join(root, cid))
+
+        self._saved = {}
+        self._patch('PROC_ASOUND', root)
+        self._patch('_run', lambda cmd, timeout=20: subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout=PI_APLAY_L, stderr=''))
+        self._patch('_current_real_dac', lambda: 'default')
+        self._patch('_lang', lambda: 'it')
+        self._sq_proc = sq.PROC_ASOUND
+        sq.PROC_ASOUND = root
+        self._sq_probe = sq.probe
+        sq.probe = lambda dev, proc_asound=None: sq.PCM_ONLY
+
+    def tearDown(self):
+        for name, value in self._saved.items():
+            setattr(a, name, value)
+        sq.PROC_ASOUND = self._sq_proc
+        sq.probe = self._sq_probe
+        self.tmp.cleanup()
+
+    def _patch(self, name, value):
+        self._saved[name] = getattr(a, name)
+        setattr(a, name, value)
+
+    def _add_eld(self):
+        with open(os.path.join(self.tmp.name, 'vc4hdmi', 'eld#0.0'), 'w') as f:
+            f.write('monitor_present\t\t1\neld_valid\t\t1\n')
+
+    def test_hdmi_without_audio_is_hidden(self):
+        ids = [d['id'] for d in a.list_audio_devices()['devices']]
+        self.assertNotIn('hw:CARD=vc4hdmi,DEV=0', ids)
+        self.assertIn('hw:CARD=Headphones,DEV=0', ids)
+
+    def test_hdmi_with_audio_is_listed(self):
+        self._add_eld()
+        ids = [d['id'] for d in a.list_audio_devices()['devices']]
+        self.assertIn('hw:CARD=vc4hdmi,DEV=0', ids)
+
+    def test_a_hidden_hdmi_is_not_a_valid_target(self):
+        res = a.set_audio_device('hw:CARD=vc4hdmi,DEV=0')
+        self.assertFalse(res['success'])
+        self.assertEqual(res['code'], 'audio.invalidDevice')
+
+
 class AudioSnapshotTests(unittest.TestCase):
     """The bundle's audio.txt now carries aplay -l and the mixer state."""
 

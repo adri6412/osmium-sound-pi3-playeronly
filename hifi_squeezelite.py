@@ -837,7 +837,7 @@ def derived_mac(machine_id_path=MACHINE_ID):
 
 def apply(conf_path=CONF, default_path=DEFAULT, dsp_target_path=DSP_TARGET_FILE,
           probe_fn=None, out=None, machine_id_path=MACHINE_ID, lock_timeout=LOCK_TIMEOUT,
-          player_conf_path=None):
+          player_conf_path=None, proc_asound=None):
     """Load (importing the file once if needed), render, write. Returns
     (model, args, changed). Under the model's lock like update(); a lock that
     cannot be had (a stuck writer, a read-only /etc) does not stop it: the
@@ -850,14 +850,14 @@ def apply(conf_path=CONF, default_path=DEFAULT, dsp_target_path=DSP_TARGET_FILE,
             print(f'hifi_squeezelite: going on without the lock: {e}', file=out)
     try:
         return _apply(conf_path, default_path, dsp_target_path, probe_fn, out, machine_id_path,
-                      player_conf_path)
+                      player_conf_path, proc_asound)
     finally:
         if fd is not None:
             os.close(fd)
 
 
 def _apply(conf_path, default_path, dsp_target_path, probe_fn, out, machine_id_path,
-           player_conf_path=None):
+           player_conf_path=None, proc_asound=None):
     model, imported = load(conf_path, default_path, dsp_target_path)
     new_mac = False
     if not model['mac']:
@@ -877,6 +877,21 @@ def _apply(conf_path, default_path, dsp_target_path, probe_fn, out, machine_id_p
         except OSError as e:
             if out is not None:
                 print(f'hifi_squeezelite: could not save {conf_path}: {e}', file=out)
+    # Resolve the output to one squeezelite can actually open (see
+    # resolve_output): a dead HDMI (no sink audio) or an unplugged DAC must not
+    # send it looping on alsa_open. Only this run's ARGS and the player side use
+    # the resolved device; the saved model keeps the user's choice, so it comes
+    # back by itself when its sink reappears, and 'default' stays "automatic".
+    eff = resolve_output(model['output'], proc_asound)
+    if eff != model['output']:
+        if out is not None:
+            if model['output'] == 'default':
+                print(f'hifi_squeezelite: output auto-selected {eff}', file=out)
+            else:
+                print(f'hifi_squeezelite: output {model["output"]} not openable, '
+                      f'using {eff}', file=out)
+        model = dict(model)
+        model['output'] = eff
     args = render(model, probe_fn)
     changed = write_default(args, default_path)
     if out is not None and changed:
@@ -1004,6 +1019,107 @@ def card_present(output, proc_asound=None):
         return False
     root = os.path.realpath(proc_asound or PROC_ASOUND)
     return _card_dir(root, card) is not None
+
+
+# ── Output device resolution ────────────────────────────────────────
+# squeezelite opens one -o device, and a dead one makes it loop forever on
+# `alsa_open:435 unable to open audio device with any supported format`: a card
+# that is gone, or an HDMI connector whose sink carries no audio. The built-in
+# player's output is resolved to one that can actually be opened before it is
+# handed to squeezelite (see resolve_output / _apply). Zones are not resolved:
+# a zone is bound to a named DAC and waits for it with card_present.
+def _list_card_ids(proc_asound=None):
+    """[(index, id)] from /proc/asound/cards:
+    ' 0 [vc4hdmi  ]: ...' -> (0, 'vc4hdmi'). In the kernel's probe order, which
+    pick_output walks."""
+    root = os.path.realpath(proc_asound or PROC_ASOUND)
+    try:
+        with open(os.path.join(root, 'cards'), encoding='utf-8', errors='replace') as f:
+            text = f.read()
+    except OSError:
+        return []
+    return [(int(m.group(1)), m.group(2).strip())
+            for m in re.finditer(r'^\s*(\d+)\s+\[([^\]]+)\]', text, re.M)]
+
+
+def _is_hdmi(card):
+    """True for an HDMI/DisplayPort card (vc4 'vc4hdmi', Intel 'HDMI', ...). Its
+    audio only works when the attached sink advertises it (see hdmi_has_audio);
+    other cards are always openable when present."""
+    return bool(card) and 'hdmi' in card.lower()
+
+
+def hdmi_has_audio(card, proc_asound=None):
+    """True when an HDMI card's sink carries audio: the driver writes a non-empty
+    `eld#*` file under the card only once it has read an ELD (the EDID audio
+    block) from the connected sink. A monitor with no audio, or nothing plugged
+    in, leaves no ELD, so the PCM opens no format at all."""
+    root = os.path.realpath(proc_asound or PROC_ASOUND)
+    card_dir = _card_dir(root, card)
+    if card_dir is None:
+        return False
+    for eld in glob.glob(os.path.join(card_dir, 'eld#*')):
+        try:
+            if os.path.getsize(eld) > 0:
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def output_openable(output, proc_asound=None):
+    """True when squeezelite could open `output` right now: the card is present
+    and, for an HDMI card, its sink carries audio. 'default' and the numbered /
+    unparsable forms are not judged here — resolve_output handles 'default'."""
+    card, _ = parse_device(output)
+    if card is None:
+        return False
+    if not card_present(output, proc_asound):
+        return False
+    if _is_hdmi(card) and not hdmi_has_audio(card, proc_asound):
+        return False
+    return True
+
+
+def pick_output(proc_asound=None):
+    """The best openable output, preferring a real DAC: a USB DAC first, then any
+    non-HDMI card (the onboard analog jack), then an HDMI card whose sink carries
+    audio. 'default' as a last resort (let ALSA decide) when nothing usable is
+    found."""
+    root = os.path.realpath(proc_asound or PROC_ASOUND)
+    usb, analog, hdmi = [], [], []
+    for _, cid in _list_card_ids(root):
+        if cid == 'Loopback':
+            continue
+        card_dir = _card_dir(root, cid)
+        if card_dir is None:
+            continue
+        dev = f'hw:CARD={cid},DEV=0'
+        if is_usb_card(card_dir):
+            usb.append(dev)
+        elif _is_hdmi(cid):
+            if hdmi_has_audio(cid, root):
+                hdmi.append(dev)
+        else:
+            analog.append(dev)
+    for group in (usb, analog, hdmi):
+        if group:
+            return group[0]
+    return 'default'
+
+
+def resolve_output(output, proc_asound=None):
+    """The -o device to actually hand squeezelite for `output`: the saved choice
+    when it can be opened, otherwise the best available one. 'default' means
+    "pick automatically" — on this board the ALSA `default` PCM is the (often
+    dead) HDMI card, so it is never used literally. The fallback is not
+    persisted: a sink that reappears (a USB DAC plugged in, an HDMI TV switched
+    on) is picked up again at the next start."""
+    if output == 'default':
+        return pick_output(proc_asound)
+    if output_openable(output, proc_asound):
+        return output
+    return pick_output(proc_asound)
 
 
 # ── PCM → DSD: Lyrion's side ──────────────────────────────────────────

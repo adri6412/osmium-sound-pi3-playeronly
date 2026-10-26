@@ -2112,6 +2112,12 @@ def list_audio_devices():
                 # DSP engine, not a real output the user should pick directly.
                 if cid == 'Loopback':
                     continue
+                # Hide an HDMI card whose sink carries no audio (no ELD): it
+                # cannot be opened, so it must not be selectable. It reappears
+                # on its own when a TV/AVR with audio is connected. See
+                # hifi_squeezelite.hdmi_has_audio.
+                if sq._is_hdmi(cid) and not sq.hdmi_has_audio(cid, PROC_ASOUND):
+                    continue
                 dev_id = f'hw:CARD={cid},DEV={dev}'
                 # 'dsd': how DSD would reach this output — 'native' when the
                 # kernel lists a DSD_U32/U16 format for it, 'dop' otherwise.
@@ -2135,6 +2141,8 @@ def list_audio_devices():
         for idx, cid, dev, pname in _alsa_playback_devices(PROC_ASOUND):
             dev_id = f'hw:CARD={cid},DEV={dev}'
             if dev_id in have:
+                continue
+            if sq._is_hdmi(cid) and not sq.hdmi_has_audio(cid, PROC_ASOUND):
                 continue
             dsd_fmt = sq.probe(dev_id)
             devices.append({

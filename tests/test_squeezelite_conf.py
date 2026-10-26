@@ -382,7 +382,8 @@ class TestDsdAuto(unittest.TestCase):
         # the line a device in the field had: imported as `auto`, rendered without -D
         self.sb.write_default('-o hw:CARD=PCH,DEV=3 -D -v -C 5 -s 127.0.0.1 -n OsmiumSound -M Osmium')
         model, args, changed = sq.apply(self.sb.conf, self.sb.default, self.sb.dsp_target, self.sb.probe,
-                                        None, os.path.join(self.sb.dir, 'no-machine-id'))
+                                        None, os.path.join(self.sb.dir, 'no-machine-id'),
+                                        proc_asound=self.sb.asound)
         self.assertEqual(model['dsd'], 'auto')
         self.assertEqual(args, '-o hw:CARD=PCH,DEV=3 -v -C 5 -s 127.0.0.1 -n OsmiumSound -M Osmium')
 
@@ -399,7 +400,8 @@ def _apply_loop(conf, default, asound, count):
     """The ExecStartPre of a crash-looping squeezelite, sped up."""
     for _ in range(count):
         sq.apply(conf, default, os.path.join(os.path.dirname(conf), 'no-dsp-target'),
-                 lambda d: sq.probe(d, asound), None, '/nonexistent-machine-id')
+                 lambda d: sq.probe(d, asound), None, '/nonexistent-machine-id',
+                 proc_asound=asound)
 
 
 class TestConcurrency(unittest.TestCase):
@@ -463,7 +465,8 @@ class TestConcurrency(unittest.TestCase):
             # the ExecStartPre still renders: the player must get its line
             out = io.StringIO()
             model, args, _ = sq.apply(self.sb.conf, self.sb.default, self.sb.dsp_target, self.sb.probe,
-                                      out, '/nonexistent-machine-id', lock_timeout=0.1)
+                                      out, '/nonexistent-machine-id', lock_timeout=0.1,
+                                      proc_asound=self.sb.asound)
             self.assertIn('without the lock', out.getvalue())
             self.assertEqual(self.sb.args(), args)
         self.assertEqual(self.sb.conf_json()['name'], 'OsmiumSound')
@@ -474,7 +477,7 @@ class TestConcurrency(unittest.TestCase):
 
     def test_a_refused_change_writes_nothing(self):
         sq.apply(self.sb.conf, self.sb.default, self.sb.dsp_target, self.sb.probe, None,
-                 '/nonexistent-machine-id')
+                 '/nonexistent-machine-id', proc_asound=self.sb.asound)
         before = (self.sb.read_default(), self.sb.conf_json())
         with self.assertRaises(sq.InvalidField):
             sq.update(lambda m: sq.set_fields(m, {'dsd': 'nope'}), self.sb.conf, self.sb.default,
@@ -488,9 +491,13 @@ class TestFiles(unittest.TestCase):
         self.sb = Sandbox()
         self.sb.card('D50s', STREAM_NATIVE_BE)
 
-    def apply(self, out=None, machine_id=None):
+    def apply(self, out=None, machine_id=None, proc_asound=None):
+        # Resolve the output against the sandbox's /proc/asound (D50s present),
+        # not the host's: _apply now picks an openable device. Tests about the
+        # bare default line pass an empty asound so 'default' stays literal.
         return sq.apply(self.sb.conf, self.sb.default, self.sb.dsp_target, self.sb.probe, out,
-                        machine_id or os.path.join(self.sb.dir, 'no-machine-id'))
+                        machine_id or os.path.join(self.sb.dir, 'no-machine-id'),
+                        proc_asound=proc_asound or self.sb.asound)
 
     def test_a_missing_mac_is_derived_from_the_machine_id_once(self):
         mid = os.path.join(self.sb.dir, 'machine-id')
@@ -528,7 +535,11 @@ class TestFiles(unittest.TestCase):
         self.assertFalse(self.apply()[2])
 
     def test_no_file_no_json_gives_defaults(self):
-        model, args, changed = self.apply()
+        # No hardware either: with nothing to auto-pick, the output stays the
+        # literal ALSA `default`.
+        empty = os.path.join(self.sb.dir, 'empty-asound')
+        os.makedirs(empty, exist_ok=True)
+        model, args, changed = self.apply(proc_asound=empty)
         self.assertTrue(changed)
         self.assertEqual(args, "-o default -v -C 5 -s 127.0.0.1 -n OsmiumSound -M Osmium")
 
@@ -731,6 +742,88 @@ class TestApiServer(unittest.TestCase):
             self.api._apply_dsp_off()
         self.assertEqual(self.sb.args(), LEGACY.replace('-D', '-D :u32be') + ' -r 192000')
         self.assertEqual(self.api._current_audio_device(), 'hw:CARD=D50s,DEV=0')
+
+
+class TestOutputResolution(unittest.TestCase):
+    """squeezelite opens one -o device; a dead one loops on alsa_open. The
+    built-in player's output is resolved to one that can be opened, preferring a
+    USB DAC, with a non-persisted fallback (Pi3: a monitor with no HDMI audio)."""
+
+    def setUp(self):
+        self.sb = Sandbox()
+        # card0 vc4hdmi (HDMI), card1 Headphones (analog jack), card2 D50s (USB).
+        self.sb.hda('vc4hdmi', 0, {0: 'MAI PCM i2s-hifi-0'})
+        self.sb.hda('Headphones', 1, {0: 'bcm2835 Headphones'})
+        self.sb.card('D50s', STREAM_NATIVE_BE)
+        self._write_cards(['vc4hdmi', 'Headphones', 'D50s'])
+
+    def _write_cards(self, ids):
+        with open(os.path.join(self.sb.asound, 'cards'), 'w') as f:
+            for i, cid in enumerate(ids):
+                f.write(f' {i} [{cid:<14}]: {cid} - {cid}\n'
+                        f'                      {cid}\n')
+
+    def _eld(self, card='vc4hdmi'):
+        """Give an HDMI card a non-empty ELD: a sink that carries audio."""
+        with open(os.path.join(self.sb.asound, card, 'eld#0.0'), 'w') as f:
+            f.write('monitor_present\t\t1\neld_valid\t\t1\n')
+
+    def R(self):
+        return self.sb.asound
+
+    def test_hdmi_without_eld_is_not_openable(self):
+        self.assertFalse(sq.output_openable('hw:CARD=vc4hdmi,DEV=0', self.R()))
+        self._eld()
+        self.assertTrue(sq.output_openable('hw:CARD=vc4hdmi,DEV=0', self.R()))
+
+    def test_analog_and_usb_are_openable_missing_is_not(self):
+        self.assertTrue(sq.output_openable('hw:CARD=Headphones,DEV=0', self.R()))
+        self.assertTrue(sq.output_openable('hw:CARD=D50s,DEV=0', self.R()))
+        self.assertFalse(sq.output_openable('hw:CARD=Missing,DEV=0', self.R()))
+
+    def test_pick_prefers_usb(self):
+        self.assertEqual(sq.pick_output(self.R()), 'hw:CARD=D50s,DEV=0')
+
+    def test_pick_falls_to_analog_without_usb(self):
+        os.unlink(os.path.join(self.sb.asound, 'D50s', 'usbid'))
+        os.unlink(os.path.join(self.sb.asound, 'D50s', 'stream0'))
+        self._write_cards(['vc4hdmi', 'Headphones'])
+        self.assertEqual(sq.pick_output(self.R()), 'hw:CARD=Headphones,DEV=0')
+
+    def test_pick_uses_hdmi_only_with_eld(self):
+        self._write_cards(['vc4hdmi'])
+        self.assertEqual(sq.pick_output(self.R()), 'default')
+        self._eld()
+        self.assertEqual(sq.pick_output(self.R()), 'hw:CARD=vc4hdmi,DEV=0')
+
+    def test_resolve_default_auto_picks_a_real_dac(self):
+        self.assertEqual(sq.resolve_output('default', self.R()), 'hw:CARD=D50s,DEV=0')
+
+    def test_resolve_honours_an_openable_choice(self):
+        self.assertEqual(sq.resolve_output('hw:CARD=Headphones,DEV=0', self.R()),
+                         'hw:CARD=Headphones,DEV=0')
+
+    def test_resolve_falls_back_from_a_dead_hdmi(self):
+        # vc4hdmi has no ELD: the chosen device cannot open, pick the analog jack
+        # (no USB DAC here). The choice is not rewritten.
+        self._write_cards(['vc4hdmi', 'Headphones'])
+        self.assertEqual(sq.resolve_output('hw:CARD=vc4hdmi,DEV=0', self.R()),
+                         'hw:CARD=Headphones,DEV=0')
+
+    def test_apply_renders_a_fallback_and_keeps_the_choice(self):
+        # The saved output is the audio-less HDMI; _apply must render -o on an
+        # openable device and log it, without rewriting the stored choice.
+        self.sb.write_default('-o hw:CARD=vc4hdmi,DEV=0 -v -C 5 '
+                              '-s 127.0.0.1 -n OsmiumSound -M Osmium')
+        out = io.StringIO()
+        model, args, _ = sq.apply(self.sb.conf, self.sb.default, self.sb.dsp_target,
+                                  self.sb.probe, out, os.path.join(self.sb.dir, 'no-machine-id'),
+                                  proc_asound=self.sb.asound)
+        self.assertIn('-o hw:CARD=D50s,DEV=0 ', args)
+        self.assertNotIn('vc4hdmi', args)
+        self.assertIn('not openable', out.getvalue())
+        # the user's choice survives for when the sink comes back
+        self.assertEqual(self.sb.conf_json()['output'], 'hw:CARD=vc4hdmi,DEV=0')
 
 
 if __name__ == '__main__':
