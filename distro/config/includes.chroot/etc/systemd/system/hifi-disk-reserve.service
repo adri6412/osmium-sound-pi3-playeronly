@@ -4,7 +4,7 @@
 # a group added to a user only counts for the processes started after it.
 Description=Osmium Sound - system disk reserve for Lyrion
 After=local-fs.target
-Before=lyrionmusicserver.service hifi-qt.service smbd.service
+Before=hifi-qt.service smbd.service
 
 [Service]
 Type=oneshot

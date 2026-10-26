@@ -90,7 +90,8 @@ xdg-utils
 # Audio
 alsa-utils
 
-# Audio CD support (Lyrion "CD Player" plugin reads the optical drive via these)
+# Audio CD support — this player has no local Lyrion "CD Player" plugin; the
+# optical drive is read locally only to rip CDs into the library (hifi-rip-cd.py)
 cdparanoia
 libcdio-utils
 icedax
@@ -100,11 +101,9 @@ flac
 cd-discid
 eject
 
-# Lyrion Music Server transcoding helpers (convert.conf shells out to these;
-# it does NOT reuse squeezelite's playback libraries). Without them, Lyrion
-# can only pass formats through untouched — in practice only FLAC played.
-lame
-faad
+# Audio tooling used locally (transcoding to a local Lyrion is gone on this
+# fork — an external server does that): sox + ffmpeg for CD ripping and the
+# (deferred, Pi-unlikely) PCM to DSD / DSP path, wavpack for tag reading.
 sox
 wavpack
 ffmpeg
@@ -131,10 +130,9 @@ bluez-alsa-utils
 libasound2-plugin-bluez
 
 # NOTE: network audio receivers (AirPlay, UPnP/DLNA, Spotify Connect) are NOT
-# system packages — they are Lyrion plugins (ShairTunes2 / UPnP-DLNA / Spotty)
-# that route through Lyrion/squeezelite. Installed one-click from the Lyrion web
-# UI → Settings → Plugins (the device has internet). This avoids extra ALSA
-# contention and keeps a single audio path.
+# system packages — they are plugins of the EXTERNAL Lyrion (ShairTunes2 /
+# UPnP-DLNA / Spotty), installed one-click from that server's own web UI →
+# Settings → Plugins. Nothing to install on this player.
 
 # Python services (api_server.py + vu_meter_daemon.py + sources_server.py)
 python3
@@ -195,10 +193,9 @@ avahi-utils
 # postinst adds mdns4_minimal to /etc/nsswitch.conf.
 libnss-mdns
 
-# Lyrion Music Server runtime dependencies (the .deb is installed via hook 0050)
-perl
-libio-socket-ssl-perl
-libcrypt-openssl-rsa-perl
+# Process utilities used by the A/B and maintenance scripts (killall/fuser from
+# psmisc, pgrep/ps from procps). The local Lyrion perl runtime is gone on this
+# fork, so perl and its SSL/RSA libs are no longer pulled in here.
 psmisc
 procps
 

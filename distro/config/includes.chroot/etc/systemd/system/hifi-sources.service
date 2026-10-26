@@ -1,6 +1,6 @@
 [Unit]
 Description=HiFi Player - Music Sources manager (SMB mount + Lyrion mediadirs)
-After=network-online.target lyrionmusicserver.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]

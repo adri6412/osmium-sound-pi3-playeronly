@@ -8,7 +8,6 @@
 # its hifi-zone@<id> unit started.
 Description=Osmium Sound - audio zones and PCM to DSD rules
 After=local-fs.target sound.target
-Before=lyrionmusicserver.service
 
 [Service]
 Type=oneshot

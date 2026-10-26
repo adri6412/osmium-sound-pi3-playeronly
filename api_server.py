@@ -257,24 +257,10 @@ _SAFE_SHA_RE = re.compile(r'^[0-9a-fA-F]{64}$')
 #  downloads.lms-community.org/ now 301s here; the .deb files still
 #  live on the old host, which is what the parser matches.
 # ──────────────────────────────────────────────────────────────────
-LYRION_DOWNLOADS_PAGE = os.environ.get('HIFI_LYRION_PAGE', 'https://lyrion.org/downloads')
-LYRION_PKG = 'lyrionmusicserver'
+# Player-only fork: there is no bundled Lyrion server to install, update or
+# track a channel for. Only the unit name is kept, so the role/restart paths
+# and the tests can still name the (absent) service without special-casing.
 LYRION_UNIT = 'lyrionmusicserver'
-LYRION_SCRIPT = '/usr/local/sbin/hifi-lyrion-update.sh'
-LYRION_STATUS_FILE = '/run/hifi-lyrion-status.json'
-LYRION_CHANNEL_FILE = '/etc/hifi-player/lyrion-channel'
-# Separate from LYRION_CHANNEL_FILE on purpose: the Settings UI persists the
-# *picked* channel the moment the owner taps it (so the choice survives a page
-# reload before they hit Install), well before apply_lyrion_update() runs. If
-# "switching" were detected by diffing against that same file, it would always
-# read as "no change" by the time apply runs and a same-version channel swap
-# (e.g. nightly -> release when release is not newer than what's installed)
-# would be refused as "already up to date" instead of reinstalling. This file
-# is only written once a build actually starts installing, so it always
-# reflects what's actually running (or about to run).
-LYRION_INSTALLED_CHANNEL_FILE = '/etc/hifi-player/lyrion-installed-channel'
-LYRION_CHANNELS = ('release', 'nightly', 'dev')
-LYRION_DEFAULT_CHANNEL = 'release'
 
 # Mitigation for a kernel panic seen in the DesignWare DMA driver
 # (dw_dmac_core: dw_shutdown -> do_dw_dma_disable) during device_shutdown()
@@ -8651,7 +8637,6 @@ def get_remote_report():
 # Il marcatore sta fuori da /etc di proposito (l'upper dell'overlay potrebbe
 # ombreggiare qualunque cosa sotto /etc).
 IMAGE_VERSION_FILE = '/usr/lib/osmium/IMAGE_VERSION'
-LYRION_DATA_VERSION_FILE = '/data/lyrion/current/VERSION'
 AB_STATE_FILE = '/boot/efi/EFI/debian/abconvert.state'
 AB_PRECHECK_FILE = '/run/hifi-ab-precheck.json'
 AB_PRECHECK_SCRIPT = '/usr/local/sbin/hifi-ab-precheck.sh'
@@ -9952,207 +9937,6 @@ def wizard_update_apply(channel):
     set_ota_channel(channel)
     return apply_all_updates()
 
-# ──────────────────────────────────────────────────────────────────
-#  Lyrion Music Server update helpers
-# ──────────────────────────────────────────────────────────────────
-
-def _lyrion_installed_version():
-    if _image_mode():
-        # su /data, scompattato da hifi-lyrion-update.sh: niente dpkg
-        return _read_version_file(LYRION_DATA_VERSION_FILE)
-    try:
-        r = _run(['dpkg-query', '-W', '-f=${Version}', LYRION_PKG])
-        if r.returncode == 0 and r.stdout.strip():
-            return r.stdout.strip()
-    except Exception:
-        pass
-    return 'unknown'
-
-def get_lyrion_channel():
-    """Return the persisted Lyrion channel. Mirrors get_ota_channel(), but this
-    is a *separate* setting: the appliance's own dev channel says nothing about
-    which music-server build the owner wants."""
-    try:
-        with open(LYRION_CHANNEL_FILE) as f:
-            ch = f.read().strip()
-        if ch in LYRION_CHANNELS:
-            return ch
-    except Exception:
-        pass
-    return LYRION_DEFAULT_CHANNEL
-
-def set_lyrion_channel(channel):
-    if channel not in LYRION_CHANNELS:
-        return {'success': False, 'code': 'lyrion.badChannel',
-                'message': _t('lyrion.badChannel', _lang()), 'channel': get_lyrion_channel()}
-    try:
-        os.makedirs(os.path.dirname(LYRION_CHANNEL_FILE), exist_ok=True)
-        tmp = LYRION_CHANNEL_FILE + '.tmp'
-        with open(tmp, 'w') as f:
-            f.write(channel + '\n')
-        os.replace(tmp, LYRION_CHANNEL_FILE)
-    except Exception:
-        log.exception("set_lyrion_channel failed")
-        return {'success': False, 'code': 'lyrion.channelSaveFailed',
-                'message': _t('lyrion.channelSaveFailed', _lang()), 'channel': get_lyrion_channel()}
-    return {'success': True, 'channel': channel}
-
-def get_lyrion_installed_channel():
-    """Which channel actually produced the build currently installed (or
-    being installed). None if never tracked yet — every device is in this
-    state the first time it runs code that knows about this file, since it
-    didn't exist before. Deliberately does NOT fall back to the preference
-    file (get_lyrion_channel()): that file is what the Settings UI already
-    overwrites the instant the owner picks a channel, before Install is even
-    pressed, which is the exact bug this split was meant to fix — falling
-    back to it here would silently reintroduce it on every device's first
-    switch after upgrading. None compares unequal to any real channel, so
-    apply_lyrion_update() treats an untracked device as "always switching",
-    which is the safe default (worst case: one redundant reinstall)."""
-    try:
-        with open(LYRION_INSTALLED_CHANNEL_FILE) as f:
-            ch = f.read().strip()
-        if ch in LYRION_CHANNELS:
-            return ch
-    except Exception:
-        pass
-    return None
-
-def _set_lyrion_installed_channel(channel):
-    try:
-        os.makedirs(os.path.dirname(LYRION_INSTALLED_CHANNEL_FILE), exist_ok=True)
-        tmp = LYRION_INSTALLED_CHANNEL_FILE + '.tmp'
-        with open(tmp, 'w') as f:
-            f.write(channel + '\n')
-        os.replace(tmp, LYRION_INSTALLED_CHANNEL_FILE)
-    except Exception:
-        log.exception("set_lyrion_installed_channel failed")
-
-def _parse_lyrion_channels(html):
-    """Pull one .deb per channel out of the downloads page.
-
-    Release builds live under /LyrionMusicServer_v<X.Y.Z>/, both the stable
-    nightly and the development build under /nightly/ with a '~<timestamp>'
-    suffix. The two nightly streams are told apart by version: the higher
-    minor is the development branch, the lower one the bugfix stream for the
-    current release. We keep the '_all.deb' flavour, which is what the image
-    installs today — switching to _amd64 would be an arch change, not an
-    update."""
-    out = {}
-    releases = re.findall(
-        r'https://downloads\.lms-community\.org/LyrionMusicServer_v(\d+\.\d+\.\d+)/'
-        r'lyrionmusicserver_\1_all\.deb', html)
-    if releases:
-        latest = max(set(releases), key=_semver_key)
-        out['release'] = {
-            'version': latest,
-            'url': (f'https://downloads.lms-community.org/LyrionMusicServer_v{latest}/'
-                    f'lyrionmusicserver_{latest}_all.deb'),
-        }
-
-    nightlies = sorted(
-        set(re.findall(
-            r'https://downloads\.lms-community\.org/nightly/'
-            r'lyrionmusicserver_(\d+\.\d+\.\d+~\d+)_all\.deb', html)),
-        key=_semver_key)
-    if nightlies:
-        # Highest = development branch; the next one down = stable nightly.
-        # With only one nightly published, treat it as the development build.
-        out['dev'] = {
-            'version': nightlies[-1],
-            'url': ('https://downloads.lms-community.org/nightly/'
-                    f'lyrionmusicserver_{nightlies[-1]}_all.deb'),
-        }
-        if len(nightlies) > 1:
-            out['nightly'] = {
-                'version': nightlies[-2],
-                'url': ('https://downloads.lms-community.org/nightly/'
-                        f'lyrionmusicserver_{nightlies[-2]}_all.deb'),
-            }
-    return out
-
-def check_lyrion_update(channel=None):
-    current = _lyrion_installed_version()
-    channel = channel if channel in LYRION_CHANNELS else get_lyrion_channel()
-    req = urllib.request.Request(LYRION_DOWNLOADS_PAGE,
-                                 headers={'User-Agent': 'hifi-player-ota'})
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            html = resp.read().decode('utf-8', 'replace')
-    except Exception:
-        log.exception("lyrion update check failed")
-        return {'code': 'lyrion.checkFailed',
-                'error': _t('lyrion.checkFailed', _lang()),
-                'current': current, 'channel': channel, 'channels': {}}
-
-    channels = _parse_lyrion_channels(html)
-    if not channels:
-        return {'code': 'lyrion.noBuildFound',
-                'error': _t('lyrion.noBuildFound', _lang()),
-                'current': current, 'channel': channel, 'channels': {}}
-
-    # An unavailable channel falls back to the release build rather than
-    # reporting nothing — the page is the only source we have.
-    sel = channels.get(channel) or channels.get('release') or next(iter(channels.values()))
-    return {
-        'current': current,
-        'channel': channel,
-        'channels': channels,
-        'latest': sel['version'],
-        'update_available': _is_newer(sel['version'], current),
-        'asset_url': sel['url'],
-    }
-
-def apply_lyrion_update(channel=None):
-    """Install the selected channel's build.
-
-    A channel *switch* is applied even when it is a downgrade (moving from the
-    development build back to the release is exactly that); only a no-op within
-    the same channel is refused. hifi-lyrion-update.sh already passes
-    --allow-downgrades to apt.
-
-    "Switch" is detected against the *installed* channel, not the preference
-    file the Settings UI writes the instant the owner taps a channel option
-    (well before Install is pressed) — otherwise this always sees "no change"
-    and a same-or-older-version channel swap gets wrongly refused as up to
-    date. See LYRION_INSTALLED_CHANNEL_FILE."""
-    switching = channel in LYRION_CHANNELS and channel != get_lyrion_installed_channel()
-    info = check_lyrion_update(channel)
-    if info.get('error'):
-        return {'started': False, 'code': info.get('code'), 'message': info['error']}
-    if not info.get('update_available') and not switching:
-        return {'started': False, 'code': 'lyrion.upToDate',
-                'message': _t('lyrion.upToDate', _lang())}
-    if switching:
-        set_lyrion_channel(channel)
-
-    cmd = [
-        'systemd-run', '--no-block', '--collect', '--unit=hifi-lyrion-update',
-        LYRION_SCRIPT, info['asset_url'], info['latest'],
-    ]
-    try:
-        subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=True)
-    except FileNotFoundError:
-        subprocess.Popen([LYRION_SCRIPT, info['asset_url'], info['latest']],
-                         start_new_session=True)
-    except subprocess.CalledProcessError:
-        log.exception("update: apply command failed")
-        return {'started': False, 'code': 'lyrion.startFailed',
-                'message': _t('lyrion.startFailed', _lang())}
-    except Exception:
-        log.exception("update: apply failed")
-        return {'started': False, 'code': 'lyrion.startFailed',
-                'message': _t('lyrion.startFailed', _lang())}
-    _set_lyrion_installed_channel(channel)
-    return {'started': True, 'version': info['latest'], 'channel': info['channel']}
-
-def lyrion_update_status():
-    try:
-        with open(LYRION_STATUS_FILE) as f:
-            return json.load(f)
-    except Exception:
-        return {'state': 'idle'}
-
 # Funzione per mostrare la tastiera virtuale globale
 def show_global_keyboard():
     try:
@@ -10415,28 +10199,6 @@ def api_wizard_update_apply():
     data = request.get_json(silent=True) or {}
     return jsonify(wizard_update_apply(data.get('channel')))
 
-@app.route('/lyrion_update/check', methods=['GET'])
-def api_lyrion_update_check():
-    return jsonify(check_lyrion_update(request.args.get('channel')))
-
-@app.route('/lyrion_update/apply', methods=['POST'])
-def api_lyrion_update_apply():
-    data = request.get_json(silent=True) or {}
-    return jsonify(apply_lyrion_update(data.get('channel')))
-
-@app.route('/lyrion_channel', methods=['GET'])
-def api_lyrion_channel():
-    return jsonify({'channel': get_lyrion_channel(), 'channels': list(LYRION_CHANNELS)})
-
-@app.route('/lyrion_channel', methods=['POST'])
-def api_set_lyrion_channel():
-    data = request.get_json(silent=True) or {}
-    return jsonify(set_lyrion_channel((data.get('channel') or '').strip()))
-
-@app.route('/lyrion_update/status', methods=['GET'])
-def api_lyrion_update_status():
-    return jsonify(lyrion_update_status())
-
 @app.route('/reboot', methods=['POST'])
 def api_reboot():
     result = reboot_device()
@@ -10474,10 +10236,7 @@ def get_credits():
         pkgs = {}
     packages = pkgs.get('packages')
     notices = load(THIRD_PARTY_FILE, [])
-    try:
-        lyrion_version = _lyrion_installed_version() or None
-    except Exception:
-        lyrion_version = None
+    lyrion_version = None  # player-only fork: no bundled Lyrion server
     return {
         'project': {
             'name': 'Osmium Sound',

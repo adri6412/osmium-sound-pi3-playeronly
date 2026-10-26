@@ -18,7 +18,7 @@ echo "I: [hifi] ensuring python services are executable"
 chmod +x /usr/local/bin/vu_meter_daemon.py /usr/local/bin/api_server.py 2>/dev/null || true
 
 echo "I: [hifi] making OTA update scripts executable"
-chmod +x /usr/local/sbin/hifi-ota-update.sh /usr/local/sbin/hifi-lyrion-update.sh \
+chmod +x /usr/local/sbin/hifi-ota-update.sh \
          /usr/local/sbin/hifi-system-update.sh /usr/local/sbin/hifi-os-update.sh \
          /usr/local/sbin/hifi-update-stage-runner.sh /usr/local/sbin/hifi-update-apply-runner.sh \
          /usr/local/sbin/hifi-ota-enroll-key.sh /usr/local/sbin/hifi-ota-alpha-toggle.sh \

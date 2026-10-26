@@ -200,22 +200,11 @@ rm -f "$CH/etc/hifi-player/OS_VERSION" "$CH/etc/hifi-player/SYSTEM_VERSION" "$CH
       "$CH/etc/hifi-player/provisioning-pending"
 rm -f "$CH/etc/rauc/system.conf"
 
-# ── 3. Lyrion: symlink verso /data/lyrion/current, unità con condizione ──
-log "Lyrion: symlink verso /data/lyrion/current"
-mkdir -p "$CH/usr/share/perl5" "$CH/data" "$CH/boot/efi"
-lyrion_links=(
-    "usr/share/squeezeboxserver" "usr/share/perl5/Slim"
-    "usr/sbin/squeezeboxserver" "usr/sbin/squeezeboxserver_safe" "usr/sbin/squeezeboxserver-scanner"
-    "usr/sbin/squeezeboxserver-resized" "usr/sbin/squeezeboxserver-cleanup"
-    "etc/squeezeboxserver" "etc/default/lyrionmusicserver"
-)
-for rel in "${lyrion_links[@]}"; do
-    rm -rf "${CH:?}/$rel"
-    ln -sfn "/data/lyrion/current/$rel" "$CH/$rel"
-done
-install -m 0644 "$SHARE/lyrionmusicserver.service" "$CH/usr/lib/systemd/system/lyrionmusicserver.service"
-install -m 0644 "$SHARE/hifi-lyrion-ensure.service" "$CH/usr/lib/systemd/system/hifi-lyrion-ensure.service"
-in_chroot systemctl enable lyrionmusicserver.service hifi-lyrion-ensure.service >/dev/null 2>&1
+# ── 3. Player-only: no bundled Lyrion server ──────────────────────────────
+# This fork plays from an EXTERNAL Lyrion, so there is no local server to
+# symlink from /data/lyrion or to enable. squeezelite + the A/B boot units are
+# enabled below; the external server is chosen in the setup wizard.
+mkdir -p "$CH/data"
 in_chroot systemctl enable hifi-rauc-config.service hifi-boot-health.service hifi-boot-watchdog.timer hifi-ab-firstboot.service >/dev/null 2>&1
 in_chroot systemctl disable hifi-ab-finish.service >/dev/null 2>&1 || true
 
