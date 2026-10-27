@@ -26,7 +26,14 @@ test -n "${BOOT_B_LEFT}" || setenv BOOT_B_LEFT 3
 
 # Common cmdline: quiet boot handed over to Plymouth, no console cursor. Kept in
 # step with @CMDLINE@ in build-image.sh / slot-grub.cfg.tmpl.
-setenv cmdline_common "ro rootfstype=squashfs rootwait panic=10 quiet splash loglevel=0 systemd.show_status=0 rd.systemd.show_status=0 vt.global_cursor_default=0"
+# cma=256M: the vc4-kms-v3d full-KMS driver allocates every GPU buffer object
+# (scanout framebuffers, textures, FBOs, V3D binner/render) from the CMA pool.
+# The arm64 kernel default is 64 MB, too small for the 1080p Qt/QML kiosk: it
+# exhausts CMA on screen changes ("Failed to allocate from GEM DMA helper" ->
+# SIGSEGV, crash-loop). The vc4-kms-v3d,cma-256 overlay param is NOT honoured on
+# this firmware-FDT + U-Boot boot path (CmaTotal stayed 64 MB), so the pool is
+# sized here on the kernel cmdline, which always wins.
+setenv cmdline_common "ro rootfstype=squashfs rootwait panic=10 quiet splash loglevel=0 systemd.show_status=0 rd.systemd.show_status=0 vt.global_cursor_default=0 cma=256M"
 
 setenv load_slot
 for bootslot in ${BOOT_ORDER}; do
