@@ -33,7 +33,13 @@ test -n "${BOOT_B_LEFT}" || setenv BOOT_B_LEFT 3
 # SIGSEGV, crash-loop). The vc4-kms-v3d,cma-256 overlay param is NOT honoured on
 # this firmware-FDT + U-Boot boot path (CmaTotal stayed 64 MB), so the pool is
 # sized here on the kernel cmdline, which always wins.
-setenv cmdline_common "ro rootfstype=squashfs rootwait panic=10 quiet splash loglevel=0 systemd.show_status=0 rd.systemd.show_status=0 vt.global_cursor_default=0 cma=256M"
+# plymouth.ignore-serial-consoles: enable_uart=1 (kept for 3B+ boot debug) leaves
+# the mini-UART as an active serial console (ttyS1). Plymouth, seeing a serial
+# console, otherwise forces text "details" mode and skips the graphical DRM
+# renderer on the HDMI display (renderer type NONE) -> the branded splash never
+# shows. This flag tells Plymouth to ignore serial consoles and still drive the
+# DRM renderer; the kernel keeps logging to the serial line for debugging.
+setenv cmdline_common "ro rootfstype=squashfs rootwait panic=10 quiet splash plymouth.ignore-serial-consoles loglevel=0 systemd.show_status=0 rd.systemd.show_status=0 vt.global_cursor_default=0 cma=256M"
 
 setenv load_slot
 for bootslot in ${BOOT_ORDER}; do
