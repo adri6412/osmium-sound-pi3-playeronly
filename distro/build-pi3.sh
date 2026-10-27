@@ -182,7 +182,12 @@ for py in api_server.py vu_meter_daemon.py sources_server.py webui_server.py \
     cp -f "$REPO_ROOT/$py" "$BIN_DEST/$py"
     sed -i 's/\r$//' "$BIN_DEST/$py"
 done
-chmod +x "$BIN_DEST/api_server.py" "$BIN_DEST/vu_meter_daemon.py" \
+# Explicit 0755, not `chmod +x`: under the build umask (0077) `+x` only sets the
+# owner bit, leaving the file -rwx------ root. hifi-vumeter runs vu_meter_daemon.py
+# as User=hifi, and the bare `import hifi_*` modules beside it must be readable by
+# that user too, so every injected .py must be world-readable (the chmod of all
+# /usr/local/bin/*.py below enforces this for the imported modules as well).
+chmod 0755 "$BIN_DEST/api_server.py" "$BIN_DEST/vu_meter_daemon.py" \
          "$BIN_DEST/sources_server.py" "$BIN_DEST/webui_server.py"
 
 # ── 4. chroot hooks — a Pi-safe ALLOWLIST ─────────────────────────────────
@@ -277,7 +282,9 @@ chmod +x "$CH/etc/initramfs-tools/hooks/hifi-state" \
     "$CH/etc/initramfs-tools/scripts/local-premount/hifi-data-grow" \
     "$CH/usr/local/share/hifi-ab/initramfs/hooks/hifi-ab" \
     "$CH/usr/local/share/hifi-ab/initramfs/scripts/local-premount/hifi-ab-convert" 2>/dev/null || true
-chmod +x "$CH"/usr/local/sbin/hifi-*.sh "$CH"/usr/local/sbin/hifi-*.py "$CH"/usr/local/bin/*.py 2>/dev/null || true
+# 0755 (world-readable), not `chmod +x`: see the injection block above — `+x`
+# under umask 0077 yields -rwx------ root, which User=hifi services cannot read.
+chmod 0755 "$CH"/usr/local/sbin/hifi-*.sh "$CH"/usr/local/sbin/hifi-*.py "$CH"/usr/local/bin/*.py 2>/dev/null || true
 chmod +x "$CH/usr/local/bin/apt" 2>/dev/null || true
 mkdir -p "$CH/etc/initramfs-tools/conf.d"
 cat > "$CH/etc/initramfs-tools/conf.d/hifi-image.conf" <<'CONF'
