@@ -15,7 +15,6 @@ if [ -x /opt/hifi-qt/hifi-qt ]; then
     mkdir -p /etc/hifi-player
     printf 'qt\n' > /etc/hifi-player/ui-engine
     systemctl enable hifi-qt.service || true
-    systemctl disable lightdm || true
 else
     echo "E: [hifi] /opt/hifi-qt/hifi-qt is missing or not executable: no on-screen interface. Aborting." >&2
     exit 1
@@ -83,11 +82,13 @@ systemctl enable systemd-timesyncd.service || true
 echo "I: [hifi] SSH installed but OFF by default (user enables it from Settings)"
 systemctl disable ssh.service || true
 
-echo "I: [hifi] Samba installed but OFF by default (enabled when an internal disk is adopted)"
-systemctl disable smbd.service nmbd.service || true
-# Same for the WS-Discovery/LLMNR responder that makes those shares show up in
-# Windows' "Network": sources_server.py turns it on together with smbd.
-systemctl disable wsdd2.service || true
+echo "I: [hifi] No Samba on this player-only fork (packages removed); nothing to disable."
+
+echo "I: [hifi] Masking background apt machinery (read-only RAUC rootfs; OTA updates)"
+# A squashfs rootfs cannot take apt upgrades, so these only waste wake-ups and RAM.
+systemctl mask apt-daily.timer apt-daily-upgrade.timer || true
+systemctl mask apt-daily.service apt-daily-upgrade.service || true
+systemctl mask unattended-upgrades.service || true
 
 echo "I: [hifi] Bluetooth speakers: supervisor ON, everything else OFF by default"
 # 🚨 hifi-bt-out.service is the ONLY Bluetooth unit enabled here, and that is
