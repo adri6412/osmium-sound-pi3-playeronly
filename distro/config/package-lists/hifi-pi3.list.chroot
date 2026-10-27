@@ -38,17 +38,9 @@ firmware-atheros
 wireless-regdb
 wpasupplicant
 
-# Xorg + minimal display stack (no desktop environment) — kept as-is for now.
-xserver-xorg-core
-xserver-xorg-video-all
-xserver-xorg-input-all
-x11-xserver-utils
-xinit
-lightdm
-unclutter
-labwc
-wlr-randr
-xwayland
+# No X11/Wayland stack: the kiosk runs Qt eglfs straight on vc4/KMS
+# (native-ui-qt/src/kmsmode.cpp), so Xorg/lightdm/labwc/xwayland are dead weight.
+# Qt's own libx11-6/libxkbcommon* come in as library deps and are left untouched.
 
 # Mesa userspace for the Pi GPU (vc4 scanout + v3d render), for Qt eglfs/KMS:
 # the DRI drivers, EGL and GLES, and libinput for touch/keyboard under eglfs.
@@ -109,13 +101,12 @@ python3-yaml
 python3-numpy
 python3-mutagen
 
-# Network shares (SMB mounting for music sources + serving internal disks)
+# Network shares: cifs-utils mounts an external SMB source; exfat/ntfs mount USB
+# disks. No Samba server/smbclient/wsdd2 on this player-only fork: music lives on
+# the external Lyrion server and the device never serves or manages local shares.
 cifs-utils
-samba
-smbclient
 exfatprogs
 ntfs-3g
-wsdd2
 
 # Image build helpers also used on-device (unsquashfs, mkfs.vfat)
 squashfs-tools
@@ -147,8 +138,8 @@ network-manager
 dnsmasq-base
 locales
 
-# Automatic security updates (config in /etc/apt/apt.conf.d/52hifi-unattended).
-unattended-upgrades
+# No unattended-upgrades: the rootfs is a read-only RAUC squashfs, so background
+# apt upgrades cannot apply and would only wake the device. Updates come via OTA.
 
 # Rotates /var/log/hifi/*.log (config in /etc/logrotate.d/hifi).
 logrotate
