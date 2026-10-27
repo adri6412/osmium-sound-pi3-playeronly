@@ -25,6 +25,15 @@ u-boot-rpi
 libubootenv-tool
 u-boot-tools
 
+# Init system. debootstrap --variant=minbase (build-pi3.sh) installs ONLY
+# priority:required; systemd-sysv is priority:important, so it is NOT pulled in
+# by the base and must be listed explicitly. It ships the /sbin/init symlink to
+# /usr/lib/systemd/systemd — the `systemd` package alone ships the binary but
+# NOT that symlink, so without systemd-sysv the kernel mounts the root slot and
+# panics with "No init found" at switch_root. (Until a16c17a the dropped
+# X11/lightdm stack happened to pull it transitively; never rely on that again.)
+systemd-sysv
+
 # Network time — a separate package since Debian 12, NOT part of systemd.
 systemd-timesyncd
 
