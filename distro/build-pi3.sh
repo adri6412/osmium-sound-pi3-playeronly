@@ -352,12 +352,16 @@ log "image content: ${used_mib} MiB"
 # weak and gzip costs the least to decompress at runtime (same reasoning as the
 # x86 image; there is no GRUB squash4 constraint here). U-Boot never reads the
 # squashfs — it loads vmlinuz/initramfs from the FAT boot partition.
-log "mksquashfs (zstd -19, 256K blocks)"
+log "mksquashfs (gzip -9, 256K blocks)"
 SQ="$WORK/rootfs.squashfs"; rm -f "$SQ"
-# zstd over gzip: smaller rootfs AND much faster decompression on the A53, so the
-# read-only image boots quicker and OTA/delta payloads shrink. zstd is already a
-# build dep (used for the initrd) and the kernel squashfs supports it.
-SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" mksquashfs "$CH" "$SQ" -comp zstd -Xcompression-level 19 -b 256K \
+# gzip, NOT zstd. A zstd-compressed rootfs squashfs is unreadable by the factory
+# initramfs at boot: the squashfs-zstd decompressor is not pulled into the initrd,
+# so the root never mounts and the kernel panics with no /sbin/init. Observed on
+# 2.6.0-pi.13 both via OTA and on a fresh flash of the .img (the running kernel in
+# the RAUC post-install hook CAN read zstd, which masked it during install). Only
+# revisit zstd with the decompressor forced into the initramfs AND a hardware boot
+# test first.
+SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" mksquashfs "$CH" "$SQ" -comp gzip -Xcompression-level 9 -b 256K \
     -noappend -no-progress -xattrs -no-recovery >/dev/null || die "mksquashfs failed"
 sq_mib=$(du -m "$SQ" | cut -f1)
 budget=$(( SLOT_MIB * 90 / 100 ))
