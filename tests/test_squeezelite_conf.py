@@ -756,6 +756,35 @@ class TestOutputResolution(unittest.TestCase):
         self.sb.hda('Headphones', 1, {0: 'bcm2835 Headphones'})
         self.sb.card('D50s', STREAM_NATIVE_BE)
         self._write_cards(['vc4hdmi', 'Headphones', 'D50s'])
+        # An empty DRM tree by default: no connected HDMI sink advertises audio,
+        # so HDMI audio is signalled only by the ELD the tests add explicitly.
+        self._drm = tempfile.TemporaryDirectory()
+        self._saved_drm = sq.SYS_DRM
+        sq.SYS_DRM = self._drm.name
+
+    def tearDown(self):
+        sq.SYS_DRM = self._saved_drm
+        self._drm.cleanup()
+
+    def _edid_connector(self, audio=True, name='card0-HDMI-A-1'):
+        """A connected DRM HDMI connector whose EDID advertises (or not) audio,
+        the way vc4 reports it with no ELD file. Mirrors _edid_has_audio_block."""
+        d = os.path.join(self._drm.name, name)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, 'status'), 'w') as f:
+            f.write('connected\n')
+        base, ext = bytearray(128), bytearray(128)
+        ext[0], ext[1] = 0x02, 0x03               # CEA-861 extension, revision 3
+        if audio:
+            ext[2] = 8                            # DTD offset: 4 bytes of data block
+            ext[4] = (1 << 5) | 3                 # Audio Data Block, 3-byte SAD
+            ext[5], ext[6], ext[7] = 0x09, 0x07, 0x07
+        else:
+            ext[2] = 6                            # only a 2-byte Video Data Block
+            ext[4] = (2 << 5) | 1
+            ext[5] = 0x10
+        with open(os.path.join(d, 'edid'), 'wb') as f:
+            f.write(bytes(base + ext))
 
     def _write_cards(self, ids):
         with open(os.path.join(self.sb.asound, 'cards'), 'w') as f:
@@ -790,11 +819,37 @@ class TestOutputResolution(unittest.TestCase):
         self._write_cards(['vc4hdmi', 'Headphones'])
         self.assertEqual(sq.pick_output(self.R()), 'hw:CARD=Headphones,DEV=0')
 
-    def test_pick_uses_hdmi_only_with_eld(self):
+    def test_pick_uses_hdmi_only_with_audio_and_as_plughw(self):
+        # HDMI with no audio is not picked; with audio it is returned as plughw:
+        # so ALSA wraps the PCM into IEC958 for the vc4 codec.
         self._write_cards(['vc4hdmi'])
         self.assertEqual(sq.pick_output(self.R()), 'default')
         self._eld()
-        self.assertEqual(sq.pick_output(self.R()), 'hw:CARD=vc4hdmi,DEV=0')
+        self.assertEqual(sq.pick_output(self.R()), 'plughw:CARD=vc4hdmi,DEV=0')
+
+    def test_pick_prefers_hdmi_with_audio_over_usb(self):
+        # The user's choice: an HDMI sink with audio is the default output,
+        # ahead of a USB DAC and the analog jack.
+        self._eld()
+        self.assertEqual(sq.pick_output(self.R()), 'plughw:CARD=vc4hdmi,DEV=0')
+
+    def test_hdmi_audio_detected_from_edid_without_eld(self):
+        # vc4 writes no ELD; a connected sink that advertises audio in its EDID
+        # must still count as HDMI-with-audio.
+        self._edid_connector(audio=True)
+        self.assertTrue(sq.hdmi_has_audio('vc4hdmi', self.R()))
+        self.assertTrue(sq.output_openable('hw:CARD=vc4hdmi,DEV=0', self.R()))
+        self.assertEqual(sq.pick_output(self.R()), 'plughw:CARD=vc4hdmi,DEV=0')
+
+    def test_hdmi_edid_without_audio_block_is_not_audio(self):
+        self._edid_connector(audio=False)
+        self.assertFalse(sq.hdmi_has_audio('vc4hdmi', self.R()))
+
+    def test_hdmi_playable_rewrites_only_hdmi(self):
+        self.assertEqual(sq._hdmi_playable('hw:CARD=vc4hdmi,DEV=0'), 'plughw:CARD=vc4hdmi,DEV=0')
+        self.assertEqual(sq._hdmi_playable('plughw:CARD=vc4hdmi,DEV=0'), 'plughw:CARD=vc4hdmi,DEV=0')
+        self.assertEqual(sq._hdmi_playable('hw:CARD=D50s,DEV=0'), 'hw:CARD=D50s,DEV=0')
+        self.assertEqual(sq._hdmi_playable('default'), 'default')
 
     def test_resolve_default_auto_picks_a_real_dac(self):
         self.assertEqual(sq.resolve_output('default', self.R()), 'hw:CARD=D50s,DEV=0')
@@ -823,6 +878,20 @@ class TestOutputResolution(unittest.TestCase):
         self.assertNotIn('vc4hdmi', args)
         self.assertIn('not openable', out.getvalue())
         # the user's choice survives for when the sink comes back
+        self.assertEqual(self.sb.conf_json()['output'], 'hw:CARD=vc4hdmi,DEV=0')
+
+    def test_apply_renders_hdmi_with_audio_as_plughw(self):
+        # The HDMI sink carries audio (ELD present): _apply must render -o on the
+        # HDMI card as plughw: (IEC958 wrapping), while the stored choice stays
+        # the plain hw: form the UI shows.
+        self._eld()
+        self.sb.write_default('-o hw:CARD=vc4hdmi,DEV=0 -v -C 5 '
+                              '-s 127.0.0.1 -n OsmiumSound -M Osmium')
+        out = io.StringIO()
+        model, args, _ = sq.apply(self.sb.conf, self.sb.default, self.sb.dsp_target,
+                                  self.sb.probe, out, os.path.join(self.sb.dir, 'no-machine-id'),
+                                  proc_asound=self.sb.asound)
+        self.assertIn('-o plughw:CARD=vc4hdmi,DEV=0 ', args)
         self.assertEqual(self.sb.conf_json()['output'], 'hw:CARD=vc4hdmi,DEV=0')
 
 

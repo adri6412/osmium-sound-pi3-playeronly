@@ -84,6 +84,7 @@ import time
 CONF = '/etc/hifi-player/squeezelite.json'
 DEFAULT = '/etc/default/squeezelite'
 PROC_ASOUND = '/proc/asound'
+SYS_DRM = '/sys/class/drm'
 DSP_TARGET_FILE = '/var/lib/hifi-player/dsp-target'
 MACHINE_ID = '/etc/machine-id'
 LOOPBACK = 'hw:CARD=Loopback,DEV=0'
@@ -883,13 +884,16 @@ def _apply(conf_path, default_path, dsp_target_path, probe_fn, out, machine_id_p
     # the resolved device; the saved model keeps the user's choice, so it comes
     # back by itself when its sink reappears, and 'default' stays "automatic".
     eff = resolve_output(model['output'], proc_asound)
+    if out is not None and eff != model['output']:
+        if model['output'] == 'default':
+            print(f'hifi_squeezelite: output auto-selected {eff}', file=out)
+        else:
+            print(f'hifi_squeezelite: output {model["output"]} not openable, '
+                  f'using {eff}', file=out)
+    # HDMI needs plughw: so ALSA wraps the PCM into IEC958 for the vc4 codec;
+    # this transparent rewrite applies to an explicit HDMI choice too.
+    eff = _hdmi_playable(eff)
     if eff != model['output']:
-        if out is not None:
-            if model['output'] == 'default':
-                print(f'hifi_squeezelite: output auto-selected {eff}', file=out)
-            else:
-                print(f'hifi_squeezelite: output {model["output"]} not openable, '
-                      f'using {eff}', file=out)
         model = dict(model)
         model['output'] = eff
     args = render(model, probe_fn)
@@ -1049,22 +1053,74 @@ def _is_hdmi(card):
     return bool(card) and 'hdmi' in card.lower()
 
 
-def hdmi_has_audio(card, proc_asound=None):
-    """True when an HDMI card's sink carries audio: the driver writes a non-empty
-    `eld#*` file under the card only once it has read an ELD (the EDID audio
-    block) from the connected sink. A monitor with no audio, or nothing plugged
-    in, leaves no ELD, so the PCM opens no format at all."""
+def _edid_has_audio_block(edid):
+    """True when a raw EDID blob carries a CEA-861 Audio Data Block (tag 1): the
+    connected sink advertises PCM/compressed audio. The base block is 128 bytes;
+    each following 128-byte extension whose first byte is 0x02 is a CEA-861
+    block, whose data-block collection runs from offset 4 up to the DTD offset
+    (byte 2). Each entry's header byte holds tag=(b>>5)&7 and len=b&0x1f."""
+    if not edid or len(edid) < 128:
+        return False
+    for base in range(128, len(edid) - 127, 128):
+        block = edid[base:base + 128]
+        if len(block) < 4 or block[0] != 0x02:        # not a CEA-861 extension
+            continue
+        dtd_start = block[2]
+        if dtd_start < 4 or dtd_start > 127:
+            continue
+        i = 4
+        while i < dtd_start:
+            length = block[i] & 0x1f
+            tag = (block[i] >> 5) & 0x7
+            if length == 0:                           # malformed: stop this block
+                break
+            if tag == 1:                              # Audio Data Block
+                return True
+            i += 1 + length
+    return False
+
+
+def _hdmi_edid_has_audio(drm_root=None):
+    """True when a *connected* HDMI/DP output advertises audio in its EDID. vc4
+    leaves no ELD even for an audio sink, so the DRM connector's EDID (always in
+    sysfs) is the reliable signal. Scans /sys/class/drm/*-HDMI*/{status,edid}."""
+    root = drm_root or SYS_DRM
+    for conn in glob.glob(os.path.join(root, '*')):
+        name = os.path.basename(conn)
+        if 'HDMI' not in name and 'DP' not in name:
+            continue
+        try:
+            with open(os.path.join(conn, 'status'), encoding='ascii', errors='replace') as f:
+                if f.read().strip() != 'connected':
+                    continue
+        except OSError:
+            continue
+        try:
+            with open(os.path.join(conn, 'edid'), 'rb') as f:
+                edid = f.read()
+        except OSError:
+            continue
+        if _edid_has_audio_block(edid):
+            return True
+    return False
+
+
+def hdmi_has_audio(card, proc_asound=None, drm_root=None):
+    """True when an HDMI card's sink carries audio. First the driver's ELD: it
+    writes a non-empty `eld#*` file once it has read an ELD from the sink (this
+    is how x86 HDA codecs report it). vc4 never writes an ELD, so fall back to
+    the DRM connector's EDID audio data block. A monitor with no audio, or
+    nothing plugged in, has neither, so the PCM opens no format at all."""
     root = os.path.realpath(proc_asound or PROC_ASOUND)
     card_dir = _card_dir(root, card)
-    if card_dir is None:
-        return False
-    for eld in glob.glob(os.path.join(card_dir, 'eld#*')):
-        try:
-            if os.path.getsize(eld) > 0:
-                return True
-        except OSError:
-            pass
-    return False
+    if card_dir is not None:
+        for eld in glob.glob(os.path.join(card_dir, 'eld#*')):
+            try:
+                if os.path.getsize(eld) > 0:
+                    return True
+            except OSError:
+                pass
+    return _hdmi_edid_has_audio(drm_root)
 
 
 def output_openable(output, proc_asound=None):
@@ -1081,11 +1137,25 @@ def output_openable(output, proc_asound=None):
     return True
 
 
+def _hdmi_playable(device):
+    """Rewrite an HDMI `hw:` device to `plughw:` so ALSA wraps squeezelite's raw
+    PCM into the IEC958 subframe the vc4 HDMI codec requires (its hw device
+    offers only IEC958_SUBFRAME_LE). Non-HDMI devices (real USB DACs, the analog
+    jack) are left as `hw:` for bit-perfect playback; a device already `plughw:`
+    or unparsable is returned unchanged."""
+    card, _ = parse_device(device)
+    if card is None or not _is_hdmi(card):
+        return device
+    if device.startswith('hw:'):
+        return 'plug' + device
+    return device
+
+
 def pick_output(proc_asound=None):
-    """The best openable output, preferring a real DAC: a USB DAC first, then any
-    non-HDMI card (the onboard analog jack), then an HDMI card whose sink carries
-    audio. 'default' as a last resort (let ALSA decide) when nothing usable is
-    found."""
+    """The best openable output. By default HDMI-with-audio is preferred (a TV/AVR
+    plugged in is the player's speakers), then a USB DAC, then the onboard analog
+    jack. 'default' as a last resort (let ALSA decide) when nothing usable is
+    found. The HDMI device is returned as `plughw:` (see _hdmi_playable)."""
     root = os.path.realpath(proc_asound or PROC_ASOUND)
     usb, analog, hdmi = [], [], []
     for _, cid in _list_card_ids(root):
@@ -1094,15 +1164,14 @@ def pick_output(proc_asound=None):
         card_dir = _card_dir(root, cid)
         if card_dir is None:
             continue
-        dev = f'hw:CARD={cid},DEV=0'
         if is_usb_card(card_dir):
-            usb.append(dev)
+            usb.append(f'hw:CARD={cid},DEV=0')
         elif _is_hdmi(cid):
             if hdmi_has_audio(cid, root):
-                hdmi.append(dev)
+                hdmi.append(f'plughw:CARD={cid},DEV=0')
         else:
-            analog.append(dev)
-    for group in (usb, analog, hdmi):
+            analog.append(f'hw:CARD={cid},DEV=0')
+    for group in (hdmi, usb, analog):
         if group:
             return group[0]
     return 'default'

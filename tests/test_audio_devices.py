@@ -129,13 +129,21 @@ class HdmiEldTests(unittest.TestCase):
         sq.PROC_ASOUND = root
         self._sq_probe = sq.probe
         sq.probe = lambda dev, proc_asound=None: sq.PCM_ONLY
+        # Isolate from the CI host's real DRM: hdmi_has_audio() now also reads
+        # the connectors' EDID as a fallback (vc4 never writes an ELD). Point it
+        # at an empty tree so only what a test adds counts.
+        self._drm = tempfile.TemporaryDirectory()
+        self._sq_drm = sq.SYS_DRM
+        sq.SYS_DRM = self._drm.name
 
     def tearDown(self):
         for name, value in self._saved.items():
             setattr(a, name, value)
         sq.PROC_ASOUND = self._sq_proc
         sq.probe = self._sq_probe
+        sq.SYS_DRM = self._sq_drm
         self.tmp.cleanup()
+        self._drm.cleanup()
 
     def _patch(self, name, value):
         self._saved[name] = getattr(a, name)
@@ -145,6 +153,24 @@ class HdmiEldTests(unittest.TestCase):
         with open(os.path.join(self.tmp.name, 'vc4hdmi', 'eld#0.0'), 'w') as f:
             f.write('monitor_present\t\t1\neld_valid\t\t1\n')
 
+    def _add_edid_audio(self, name='card0-HDMI-A-1'):
+        # A connected HDMI connector whose EDID advertises an audio data block,
+        # but with no ELD file: this is exactly what the vc4 driver produces.
+        conn = os.path.join(self._drm.name, name)
+        os.makedirs(conn)
+        with open(os.path.join(conn, 'status'), 'w') as f:
+            f.write('connected\n')
+        base = bytes(128)
+        ext = bytearray(128)
+        ext[0] = 0x02          # CEA-861 extension tag
+        ext[1] = 0x03          # revision 3
+        ext[2] = 10            # DTD start offset
+        ext[3] = 0x00
+        ext[4] = (1 << 5) | 1  # data block: tag 1 (audio), length 1
+        ext[5] = 0x00          # one short audio descriptor byte (content unused)
+        with open(os.path.join(conn, 'edid'), 'wb') as f:
+            f.write(base + bytes(ext))
+
     def test_hdmi_without_audio_is_hidden(self):
         ids = [d['id'] for d in a.list_audio_devices()['devices']]
         self.assertNotIn('hw:CARD=vc4hdmi,DEV=0', ids)
@@ -152,6 +178,12 @@ class HdmiEldTests(unittest.TestCase):
 
     def test_hdmi_with_audio_is_listed(self):
         self._add_eld()
+        ids = [d['id'] for d in a.list_audio_devices()['devices']]
+        self.assertIn('hw:CARD=vc4hdmi,DEV=0', ids)
+
+    def test_hdmi_with_edid_audio_is_listed_without_eld(self):
+        # vc4 writes no ELD, so detection must fall back to the connector EDID.
+        self._add_edid_audio()
         ids = [d['id'] for d in a.list_audio_devices()['devices']]
         self.assertIn('hw:CARD=vc4hdmi,DEV=0', ids)
 
