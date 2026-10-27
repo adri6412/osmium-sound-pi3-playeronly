@@ -300,6 +300,11 @@ for m in overlay squashfs vfat nls_cp437 nls_ascii nls_utf8 ext4 vc4 v3d; do
     grep -qx "$m" "$CH/etc/initramfs-tools/modules" 2>/dev/null || echo "$m" >> "$CH/etc/initramfs-tools/modules"
 done
 rm -f "$CH/boot/initrd.img-$KVER"
+# Select the branded Plymouth theme BEFORE building the initrd, so update-initramfs
+# embeds the "hifi" script theme (and its script.so plugin) into the image. On x86
+# this is done by hook 0200 / the disk installer, both skipped on the Pi, so without
+# this line the splash falls back to the generic default and never shows our frames.
+in_chroot plymouth-set-default-theme hifi 2>&1 | tail -n 3 || true
 in_chroot update-initramfs -c -k "$KVER" 2>&1 | tail -n 20 || true
 [ -s "$CH/boot/initrd.img-$KVER" ] || die "initrd not produced"
 # List it from the host (lsinitramfs inside the chroot has failed on zstd in CI)
@@ -347,9 +352,12 @@ log "image content: ${used_mib} MiB"
 # weak and gzip costs the least to decompress at runtime (same reasoning as the
 # x86 image; there is no GRUB squash4 constraint here). U-Boot never reads the
 # squashfs — it loads vmlinuz/initramfs from the FAT boot partition.
-log "mksquashfs (gzip -9, 256K blocks)"
+log "mksquashfs (zstd -19, 256K blocks)"
 SQ="$WORK/rootfs.squashfs"; rm -f "$SQ"
-SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" mksquashfs "$CH" "$SQ" -comp gzip -Xcompression-level 9 -b 256K \
+# zstd over gzip: smaller rootfs AND much faster decompression on the A53, so the
+# read-only image boots quicker and OTA/delta payloads shrink. zstd is already a
+# build dep (used for the initrd) and the kernel squashfs supports it.
+SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" mksquashfs "$CH" "$SQ" -comp zstd -Xcompression-level 19 -b 256K \
     -noappend -no-progress -xattrs -no-recovery >/dev/null || die "mksquashfs failed"
 sq_mib=$(du -m "$SQ" | cut -f1)
 budget=$(( SLOT_MIB * 90 / 100 ))
